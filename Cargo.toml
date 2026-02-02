@@ -1,0 +1,53 @@
+[package]
+name = "llama-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "llama_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llama-rs"
+path = "src/main.rs"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["dep:cudarc"]
+vulkan = ["dep:ash", "dep:gpu-allocator"]
+metal = ["dep:metal", "dep:objc"]
+server = ["dep:axum", "dep:tokio", "dep:tower-http"]
+
+[dependencies]
+memmap2 = "0.9"
+bytemuck = { version = "1.14", features = ["derive"] }
+half = { version = "2.3", features = ["bytemuck"] }
+rayon = "1.8"
+thiserror = "1.0"
+tracing = "0.1"
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+cudarc = { version = "0.11", optional = true }
+ash = { version = "0.38", optional = true }
+gpu-allocator = { version = "0.25", optional = true }
+metal = { version = "0.28", optional = true }
+objc = { version = "0.2", optional = true }
+
+axum = { version = "0.7", optional = true }
+tokio = { version = "1.35", features = ["full"], optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[[bench]]
+name = "quantization"
+harness = false
