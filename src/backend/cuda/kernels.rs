@@ -14,6 +14,28 @@ pub const KERNEL_SOURCE: &str = r#"
 #define CUDART_INF_F __int_as_float(0x7f800000)
 #define MY_INFINITY CUDART_INF_F
 
+// Helper to convert f16 (as unsigned short) to f32
+__device__ __forceinline__ float half_to_float(unsigned short h) {
+    // Simple f16 to f32 conversion
+    unsigned int sign = (h >> 15) & 0x1;
+    unsigned int exp = (h >> 10) & 0x1F;
+    unsigned int mant = h & 0x3FF;
+    
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        // Denormal
+        while ((mant & 0x400) == 0) { mant <<= 1; exp--; }
+        exp++; mant &= 0x3FF;
+    } else if (exp == 31) {
+        // Inf or NaN
+        unsigned int f = (sign << 31) | 0x7F800000 | (mant << 13);
+        return __int_as_float(f);
+    }
+    
+    unsigned int f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    return __int_as_float(f);
+}
+
 extern "C" {
 
 // ============================================================================
@@ -185,6 +207,280 @@ __global__ void vec_mat_f32(const float* vec, const float* mat, float* out,
     }
 }
 
+// ============================================================================
+// RoPE (Rotary Position Embedding)
+// ============================================================================
+
+// RoPE for LLaMA-style (consecutive pairs)
+// q, k: [num_heads * head_dim] for single position
+__global__ void rope_single_pos(float* q, float* k, 
+                                 int num_heads, int head_dim,
+                                 int pos, float freq_base, float freq_scale,
+                                 int use_neox) {
+    int head = blockIdx.x;
+    int i = threadIdx.x;  // pair index
+    int half_dim = head_dim / 2;
+    
+    if (head >= num_heads || i >= half_dim) return;
+    
+    // Compute frequency
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+    float position = (float)pos / freq_scale;
+    float theta = position * freq;
+    float cos_theta = cosf(theta);
+    float sin_theta = sinf(theta);
+    
+    int base = head * head_dim;
+    int idx0, idx1;
+    
+    if (use_neox) {
+        // NeoX: (i, i + half_dim)
+        idx0 = base + i;
+        idx1 = base + i + half_dim;
+    } else {
+        // LLaMA: (2*i, 2*i+1)
+        idx0 = base + 2 * i;
+        idx1 = base + 2 * i + 1;
+    }
+    
+    // Rotate Q
+    float q0 = q[idx0];
+    float q1 = q[idx1];
+    q[idx0] = q0 * cos_theta - q1 * sin_theta;
+    q[idx1] = q0 * sin_theta + q1 * cos_theta;
+    
+    // Rotate K
+    float k0 = k[idx0];
+    float k1 = k[idx1];
+    k[idx0] = k0 * cos_theta - k1 * sin_theta;
+    k[idx1] = k0 * sin_theta + k1 * cos_theta;
+}
+
+// ============================================================================
+// Quantized Operations - Q4_K (most common for good quality/size)
+// ============================================================================
+
+// Q4_K block layout (144 bytes for 256 values):
+// - d: f16 (2 bytes) - scale
+// - dmin: f16 (2 bytes) - min scale  
+// - scales: [12] u8 - packed 6-bit scales/mins
+// - qs: [128] u8 - 256 4-bit values
+
+// Fused dequantize + vec_mat for Q4_K
+// Each thread handles one output column
+__global__ void vec_mat_q4k(const unsigned char* weight,  // [num_blocks, 144]
+                            const float* vec,              // [k]
+                            float* out,                    // [n]
+                            int k, int n) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) return;
+    
+    int num_blocks = k / 256;
+    float sum = 0.0f;
+    
+    for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+        // Pointer to this block's data for this output column
+        // Layout: blocks are stored as [num_blocks, n, 144] for coalesced access
+        const unsigned char* block = weight + (block_idx * n + col) * 144;
+        
+        // Read d and dmin (f16)
+        unsigned short d_bits = block[0] | (block[1] << 8);
+        unsigned short dmin_bits = block[2] | (block[3] << 8);
+        float d = half_to_float(d_bits);
+        float dmin = half_to_float(dmin_bits);
+        
+        // Decode scales and mins from 12 bytes
+        float scales[8], mins[8];
+        for (int j = 0; j < 4; j++) {
+            scales[j] = (float)(block[4 + j] & 0x3F);
+            mins[j] = (float)(block[4 + j + 4] & 0x3F);
+        }
+        for (int j = 4; j < 8; j++) {
+            scales[j] = (float)((block[4 + j + 4] & 0x0F) | ((block[4 + j - 4] >> 6) << 4));
+            mins[j] = (float)(((block[4 + j + 4] >> 4) & 0x0F) | ((block[4 + j] >> 6) << 4));
+        }
+        
+        // Process 256 values
+        const unsigned char* qs = block + 16;  // After d, dmin, scales
+        int vec_base = block_idx * 256;
+        int qs_idx = 0;
+        int is = 0;
+        
+        for (int group = 0; group < 4; group++) {
+            float d1 = d * scales[is];
+            float m1 = dmin * mins[is];
+            float d2 = d * scales[is + 1];
+            float m2 = dmin * mins[is + 1];
+            
+            // First 32: low nibbles
+            for (int l = 0; l < 32; l++) {
+                float q = (float)(qs[qs_idx + l] & 0x0F);
+                float val = d1 * q - m1;
+                sum += vec[vec_base] * val;
+                vec_base++;
+            }
+            
+            // Next 32: high nibbles
+            for (int l = 0; l < 32; l++) {
+                float q = (float)((qs[qs_idx + l] >> 4) & 0x0F);
+                float val = d2 * q - m2;
+                sum += vec[vec_base] * val;
+                vec_base++;
+            }
+            
+            qs_idx += 32;
+            is += 2;
+        }
+    }
+    
+    out[col] = sum;
+}
+
+// ============================================================================
+// Quantized Operations - Q8_0 (high quality)
+// ============================================================================
+
+// Q8_0 block layout (34 bytes for 32 values):
+// - d: f16 (2 bytes) - scale
+// - qs: [32] i8 - 32 signed 8-bit values
+
+__global__ void vec_mat_q8_0(const unsigned char* weight,  // [num_blocks, n, 34]
+                              const float* vec,             // [k]
+                              float* out,                   // [n]
+                              int k, int n) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) return;
+    
+    int num_blocks = k / 32;
+    float sum = 0.0f;
+    
+    for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+        const unsigned char* block = weight + (block_idx * n + col) * 34;
+        
+        // Read d (f16)
+        unsigned short d_bits = block[0] | (block[1] << 8);
+        float d = half_to_float(d_bits);
+        
+        const signed char* qs = (const signed char*)(block + 2);
+        int vec_base = block_idx * 32;
+        
+        for (int i = 0; i < 32; i++) {
+            float val = d * (float)qs[i];
+            sum += vec[vec_base + i] * val;
+        }
+    }
+    
+    out[col] = sum;
+}
+
+// ============================================================================
+// Quantized Operations - Q4_0 (legacy, smaller models)
+// ============================================================================
+
+// Q4_0 block layout (18 bytes for 32 values):
+// - d: f16 (2 bytes)
+// - qs: [16] u8 - 32 4-bit values packed
+
+__global__ void vec_mat_q4_0(const unsigned char* weight,  // [num_blocks, n, 18]
+                              const float* vec,             // [k]
+                              float* out,                   // [n]
+                              int k, int n) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) return;
+    
+    int num_blocks = k / 32;
+    float sum = 0.0f;
+    
+    for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+        const unsigned char* block = weight + (block_idx * n + col) * 18;
+        
+        unsigned short d_bits = block[0] | (block[1] << 8);
+        float d = half_to_float(d_bits);
+        
+        const unsigned char* qs = block + 2;
+        int vec_base = block_idx * 32;
+        
+        for (int i = 0; i < 16; i++) {
+            unsigned char byte = qs[i];
+            // Low nibble (first half)
+            float q_lo = (float)((byte & 0x0F) - 8);
+            // High nibble (second half)
+            float q_hi = (float)(((byte >> 4) & 0x0F) - 8);
+            
+            sum += vec[vec_base + i] * (d * q_lo);
+            sum += vec[vec_base + i + 16] * (d * q_hi);
+        }
+    }
+    
+    out[col] = sum;
+}
+
+// ============================================================================
+// Attention
+// ============================================================================
+
+// Single-head attention for one query position
+// Computes: softmax(q @ K^T / sqrt(d)) @ V
+__global__ void attention_single_head(const float* q,        // [head_dim]
+                                       const float* k_cache, // [kv_len, head_dim]
+                                       const float* v_cache, // [kv_len, head_dim]
+                                       float* out,           // [head_dim]
+                                       int head_dim, int kv_len, int q_pos,
+                                       float scale) {
+    extern __shared__ float shared[];
+    float* scores = shared;  // [kv_len]
+    
+    int tid = threadIdx.x;
+    int dim = threadIdx.y * blockDim.x + threadIdx.x;
+    
+    // Step 1: Compute attention scores (q @ K^T)
+    if (dim < kv_len) {
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q[d] * k_cache[dim * head_dim + d];
+        }
+        score *= scale;
+        
+        // Apply causal mask
+        if (dim > q_pos) {
+            score = -MY_INFINITY;
+        }
+        scores[dim] = score;
+    }
+    __syncthreads();
+    
+    // Step 2: Softmax
+    // Find max
+    if (tid == 0) {
+        float max_val = -MY_INFINITY;
+        for (int i = 0; i < kv_len; i++) {
+            max_val = fmaxf(max_val, scores[i]);
+        }
+        
+        // Exp and sum
+        float sum = 0.0f;
+        for (int i = 0; i < kv_len; i++) {
+            scores[i] = expf(scores[i] - max_val);
+            sum += scores[i];
+        }
+        
+        // Normalize
+        for (int i = 0; i < kv_len; i++) {
+            scores[i] /= sum;
+        }
+    }
+    __syncthreads();
+    
+    // Step 3: Weighted sum of values (scores @ V)
+    if (dim < head_dim) {
+        float sum = 0.0f;
+        for (int i = 0; i < kv_len; i++) {
+            sum += scores[i] * v_cache[i * head_dim + dim];
+        }
+        out[dim] = sum;
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -210,6 +506,17 @@ pub struct CudaKernels {
     
     // Matrix ops
     pub vec_mat_f32: CudaFunction,
+    
+    // RoPE
+    pub rope_single_pos: CudaFunction,
+    
+    // Quantized ops
+    pub vec_mat_q4k: CudaFunction,
+    pub vec_mat_q8_0: CudaFunction,
+    pub vec_mat_q4_0: CudaFunction,
+    
+    // Attention
+    pub attention_single_head: CudaFunction,
 }
 
 impl CudaKernels {
@@ -226,6 +533,9 @@ impl CudaKernels {
             "rms_norm_sum_sq", "rms_norm_scale",
             "softmax_max", "softmax_exp_sum", "softmax_div",
             "vec_mat_f32",
+            "rope_single_pos",
+            "vec_mat_q4k", "vec_mat_q8_0", "vec_mat_q4_0",
+            "attention_single_head",
         ]).map_err(|e| BackendError::InitializationFailed(format!("PTX load failed: {}", e)))?;
         
         // Get function handles
@@ -252,6 +562,16 @@ impl CudaKernels {
                 .ok_or_else(|| BackendError::InitializationFailed("Kernel 'softmax_div' not found".into()))?,
             vec_mat_f32: device.get_func("llama_kernels", "vec_mat_f32")
                 .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_f32' not found".into()))?,
+            rope_single_pos: device.get_func("llama_kernels", "rope_single_pos")
+                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'rope_single_pos' not found".into()))?,
+            vec_mat_q4k: device.get_func("llama_kernels", "vec_mat_q4k")
+                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_q4k' not found".into()))?,
+            vec_mat_q8_0: device.get_func("llama_kernels", "vec_mat_q8_0")
+                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_q8_0' not found".into()))?,
+            vec_mat_q4_0: device.get_func("llama_kernels", "vec_mat_q4_0")
+                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_q4_0' not found".into()))?,
+            attention_single_head: device.get_func("llama_kernels", "attention_single_head")
+                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'attention_single_head' not found".into()))?,
         })
     }
 }

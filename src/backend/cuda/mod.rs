@@ -410,7 +410,12 @@ impl Backend for CudaBackend {
     }
 
     fn vec_mat_q(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        // Fall back to CPU for quantized ops
+        // The quantized weights are stored in a complex memory layout that doesn't 
+        // match our GPU kernel expectations. Use CPU for quantized ops and GPU for
+        // the rest of the pipeline.
+        //
+        // For true GPU acceleration of quantized inference, weights would need to be
+        // re-laid out at model load time to enable coalesced memory access patterns.
         self.cpu_backend.vec_mat_q(a, b, out)
     }
 
@@ -423,8 +428,50 @@ impl Backend for CudaBackend {
         freq_scale: f32,
         use_neox: bool,
     ) -> BackendResult<()> {
-        // Use CPU for RoPE - the GPU kernel has complex shape requirements
-        self.cpu_backend.rope(q, k, pos, freq_base, freq_scale, use_neox)
+        // Get dimensions - for single position inference, q/k are [num_heads, head_dim]
+        // or [num_heads, 1, head_dim]
+        let q_shape = q.shape();
+        
+        // Handle different tensor layouts
+        let (num_heads, head_dim) = if q_shape.len() == 2 {
+            (q_shape[0], q_shape[1])
+        } else if q_shape.len() == 3 && q_shape[1] == 1 {
+            // [num_heads, 1, head_dim] for single token
+            (q_shape[0], q_shape[2])
+        } else {
+            // Fall back to CPU for complex shapes
+            return self.cpu_backend.rope(q, k, pos, freq_base, freq_scale, use_neox);
+        };
+        
+        let q_data = q.as_f32_mut()?;
+        let k_data = k.as_f32_mut()?;
+        
+        // Upload to GPU
+        let mut q_gpu = self.to_device(q_data)?;
+        let mut k_gpu = self.to_device(k_data)?;
+        
+        // Launch kernel - one block per head, threads for dimension pairs
+        let config = LaunchConfig {
+            grid_dim: (num_heads as u32, 1, 1),
+            block_dim: ((head_dim / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            self.kernels.rope_single_pos.clone().launch(
+                config,
+                (&mut q_gpu, &mut k_gpu, num_heads as i32, head_dim as i32, 
+                 pos as i32, freq_base, freq_scale, if use_neox { 1i32 } else { 0i32 })
+            )
+        }.map_err(|e| BackendError::OperationFailed(format!("rope kernel failed: {}", e)))?;
+        
+        // Copy back
+        let q_result = self.from_device(&q_gpu)?;
+        let k_result = self.from_device(&k_gpu)?;
+        q_data.copy_from_slice(&q_result);
+        k_data.copy_from_slice(&k_result);
+        
+        Ok(())
     }
 
     fn attention(
