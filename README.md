@@ -9,6 +9,7 @@ A high-performance Rust implementation of [llama.cpp](https://github.com/ggergan
 - **Quantization** - All K-quant formats (Q2_K through Q8_0) plus F16/F32
 - **HuggingFace Integration** - Download models directly from HuggingFace Hub
 - **Fast CPU Inference** - SIMD-optimized (AVX2, AVX-512, NEON)
+- **CUDA GPU Acceleration** - NVIDIA GPU support with custom CUDA kernels
 - **Grouped Query Attention** - Efficient KV cache for GQA models
 - **Streaming Output** - Token-by-token generation
 
@@ -152,6 +153,7 @@ Run Options:
       --top-p <P>            Top-p (nucleus) sampling [default: 0.9]
       --repeat-penalty <R>   Repetition penalty [default: 1.1]
   -s, --seed <SEED>          Random seed for reproducibility
+      --gpu                  Use GPU acceleration (requires CUDA build)
 ```
 
 ## Building with Features
@@ -160,12 +162,48 @@ Run Options:
 # CPU only (default)
 cargo build --release
 
+# With CUDA GPU support (requires CUDA toolkit)
+CUDA_PATH=/opt/cuda cargo build --release --features cuda
+
 # With Vulkan support (experimental)
 cargo build --release --features vulkan
 
 # With HTTP server
 cargo build --release --features server
 ```
+
+## GPU Acceleration
+
+### CUDA (NVIDIA GPUs)
+
+Enable GPU acceleration with the `--gpu` flag:
+
+```bash
+# Build with CUDA support
+CUDA_PATH=/opt/cuda cargo build --release --features cuda
+
+# Run with GPU acceleration
+llama-rs run model.gguf -p "Hello" --gpu
+```
+
+**Requirements:**
+- NVIDIA GPU with compute capability 6.0+
+- CUDA Toolkit 12.0+ installed
+- cudarc crate for CUDA bindings
+
+**Currently GPU-accelerated operations:**
+- Element-wise: add, mul, scale
+- Activations: SiLU, GELU
+- Normalization: RMS norm
+- Softmax
+- Vector-matrix multiplication (f32)
+
+**Still using CPU fallback:**
+- Quantized matrix operations (vec_mat_q)
+- Attention computation
+- RoPE positional embeddings
+
+*Note: Performance gains are currently limited as quantized operations remain on CPU. Full GPU acceleration of quantized inference is planned.*
 
 ## Performance
 
