@@ -475,10 +475,12 @@ impl Tokenizer {
                 byte_buffer.clear();
             }
 
-            // Handle space tokens (common in BPE)
+            // Handle BPE special characters
             let decoded = token_str
-                .replace("▁", " ")  // SentencePiece space
-                .replace("Ġ", " "); // GPT-2 style space
+                .replace("▁", " ")   // SentencePiece space
+                .replace("Ġ", " ")   // GPT-2 style space  
+                .replace("Ċ", "\n")  // GPT-2 style newline
+                .replace("ĉ", "\t"); // GPT-2 style tab
 
             text.push_str(&decoded);
         }

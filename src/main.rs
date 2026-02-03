@@ -838,8 +838,7 @@ fn run_inference(
     }
 
     println!();
-    eprintln!();
-    eprintln!("Generated {} tokens", tokens.len());
+    eprintln!("\nGenerated {} tokens", tokens.len());
 
     Ok(())
 }
