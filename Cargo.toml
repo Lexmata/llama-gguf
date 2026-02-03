@@ -2,6 +2,12 @@
 name = "llama-rs"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>"]
+description = "A high-performance Rust implementation of llama.cpp - LLM inference engine with full GGUF support"
+repository = "https://github.com/pegasusheavy/llama-rs"
+keywords = ["llm", "inference", "gguf", "llama", "ai"]
+categories = ["science", "algorithms"]
 
 [lib]
 name = "llama_rs"
