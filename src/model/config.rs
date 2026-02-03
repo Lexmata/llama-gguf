@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// RoPE implementation type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RopeType {
+    /// Normal/LLaMA style: consecutive pairs (x[2i], x[2i+1])
+    #[default]
+    Normal,
+    /// NeoX/Qwen2 style: first half paired with second half (x[i], x[i+d/2])
+    NeoX,
+}
+
 /// Configuration for Rotary Position Embeddings (RoPE)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RopeConfig {
@@ -15,6 +25,8 @@ pub struct RopeConfig {
     pub scaling_type: RopeScalingType,
     /// Original context length (for scaled RoPE)
     pub original_max_position_embeddings: usize,
+    /// RoPE implementation type (Normal vs NeoX)
+    pub rope_type: RopeType,
 }
 
 impl Default for RopeConfig {
@@ -25,6 +37,7 @@ impl Default for RopeConfig {
             n_dims: 0, // Will be set from head_dim
             scaling_type: RopeScalingType::None,
             original_max_position_embeddings: 2048,
+            rope_type: RopeType::Normal,
         }
     }
 }
@@ -124,6 +137,7 @@ impl ModelConfig {
                 n_dims: 128,
                 scaling_type: RopeScalingType::None,
                 original_max_position_embeddings: 2048,
+                rope_type: RopeType::Normal,
             },
             use_parallel_residual: false,
             hidden_act: ActivationType::SiLU,
@@ -159,6 +173,7 @@ impl ModelConfig {
                 n_dims: 128,
                 scaling_type: RopeScalingType::None,
                 original_max_position_embeddings: 8192,
+                rope_type: RopeType::Normal,
             },
             use_parallel_residual: false,
             hidden_act: ActivationType::SiLU,

@@ -151,6 +151,8 @@ impl Architecture {
                 | Self::DeepSeek
                 | Self::Orion
                 | Self::Olmo
+                | Self::Qwen
+                | Self::Qwen2
         )
     }
 

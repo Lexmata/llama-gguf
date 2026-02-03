@@ -80,6 +80,34 @@ impl Linear {
 
         Ok(())
     }
+
+    /// Forward pass without bias: y = x @ W
+    /// This is useful when bias needs to be applied after another operation (e.g., RoPE)
+    pub fn forward_no_bias(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        backend: &dyn Backend,
+    ) -> BackendResult<()> {
+        if self.weight.dtype().is_quantized() {
+            backend.vec_mat_q(x, &self.weight, out)?;
+        } else {
+            backend.vec_mat(x, &self.weight, out)?;
+        }
+        Ok(())
+    }
+
+    /// Apply bias to output tensor (if bias exists)
+    pub fn apply_bias(&self, out: &mut Tensor, backend: &dyn Backend) -> BackendResult<()> {
+        if let Some(ref bias) = self.bias {
+            let mut temp = Tensor::zeros(out.shape().to_vec(), DType::F32);
+            backend.add(out, bias, &mut temp)?;
+            let out_data = out.as_f32_mut()?;
+            let temp_data = temp.as_f32()?;
+            out_data.copy_from_slice(temp_data);
+        }
+        Ok(())
+    }
 }
 
 /// RMS Normalization layer
@@ -141,6 +169,8 @@ pub struct Attention {
     pub head_dim: usize,
     /// Attention scale factor (1 / sqrt(head_dim))
     pub scale: f32,
+    /// Whether to use NeoX-style RoPE (Qwen2) or normal style (LLaMA)
+    pub use_neox_rope: bool,
 }
 
 impl Attention {
@@ -154,6 +184,20 @@ impl Attention {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Self {
+        Self::with_rope_type(wq, wk, wv, wo, num_heads, num_kv_heads, head_dim, false)
+    }
+    
+    /// Create a new attention layer with explicit RoPE type
+    pub fn with_rope_type(
+        wq: Linear,
+        wk: Linear,
+        wv: Linear,
+        wo: Linear,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        use_neox_rope: bool,
+    ) -> Self {
         Self {
             wq,
             wk,
@@ -163,6 +207,7 @@ impl Attention {
             num_kv_heads,
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
+            use_neox_rope,
         }
     }
 
@@ -207,6 +252,9 @@ impl Attention {
             x.clone()
         };
 
+        // For Qwen2: apply bias BEFORE RoPE
+        // This is because Qwen2's biases encode positional information that should be rotated
+        // V doesn't use RoPE, so bias order doesn't matter for it
         self.wq.forward(&x_vec, &mut q, backend)?;
         self.wk.forward(&x_vec, &mut k, backend)?;
         self.wv.forward(&x_vec, &mut v, backend)?;
@@ -217,7 +265,7 @@ impl Attention {
         let v_reshaped = v.reshape(vec![self.num_kv_heads, 1, self.head_dim])?;
 
         // Apply RoPE to current Q and K
-        backend.rope(&mut q_reshaped, &mut k_reshaped, pos, freq_base, freq_scale)?;
+        backend.rope(&mut q_reshaped, &mut k_reshaped, pos, freq_base, freq_scale, self.use_neox_rope)?;
 
         // Get cache dimensions before mutable borrow
         let max_seq_len = k_cache.shape()[1];

@@ -7,11 +7,8 @@
 //! - Clustering and classification
 //! - Vector databases
 
-use std::sync::Arc;
 
-use crate::backend::Backend;
 use crate::model::{InferenceContext, Model, ModelConfig};
-use crate::tensor::{DType, Tensor};
 use crate::tokenizer::Tokenizer;
 
 /// Embedding extraction configuration
@@ -177,7 +174,7 @@ impl EmbeddingExtractor {
     }
 
     /// Pool token embeddings into a single embedding
-    fn pool_embeddings(&self, embeddings: &[Vec<f32>], seq_len: usize) -> Vec<f32> {
+    fn pool_embeddings(&self, embeddings: &[Vec<f32>], _seq_len: usize) -> Vec<f32> {
         if embeddings.is_empty() {
             return vec![0.0; self.hidden_dim];
         }

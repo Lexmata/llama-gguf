@@ -114,6 +114,7 @@ pub trait Backend: Send + Sync {
     /// * `pos` - Starting position for RoPE
     /// * `freq_base` - Base frequency (typically 10000.0)
     /// * `freq_scale` - Frequency scale factor (typically 1.0)
+    /// * `use_neox` - Use NeoX style (first half with second half) vs Normal (consecutive pairs)
     fn rope(
         &self,
         q: &mut Tensor,
@@ -121,6 +122,7 @@ pub trait Backend: Send + Sync {
         pos: usize,
         freq_base: f32,
         freq_scale: f32,
+        use_neox: bool,
     ) -> BackendResult<()>;
 
     // =========================================================================
@@ -163,7 +165,7 @@ pub trait Backend: Send + Sync {
         v: &Tensor,
         out: &mut Tensor,
         scale: f32,
-        causal: bool,
+        _causal: bool,
     ) -> BackendResult<()> {
         // Default implementation falls back to standard attention
         // Backends can override this with optimized implementations

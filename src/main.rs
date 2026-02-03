@@ -408,11 +408,11 @@ fn run_inference(
 
     // Encode prompt
     let prompt_text = prompt.unwrap_or("Hello");
-    eprintln!("Prompt: {}", prompt_text);
 
-    let mut tokens = tokenizer.encode(prompt_text, true)?;
-    eprintln!("Prompt tokens: {} tokens", tokens.len());
-    eprintln!();
+    // Check if we should add BOS token (some models like Qwen2 don't want BOS)
+    let add_bos = gguf.data.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(true);
+    
+    let mut tokens = tokenizer.encode(prompt_text, add_bos)?;
 
     // Print prompt
     print!("{}", prompt_text);

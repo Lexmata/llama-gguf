@@ -59,7 +59,7 @@ fn add_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn add_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
+unsafe fn add_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) { unsafe {
     use std::arch::x86_64::*;
     
     let n = a.len();
@@ -81,7 +81,7 @@ unsafe fn add_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
     for i in (chunks * 8)..n {
         *out.get_unchecked_mut(i) = *a.get_unchecked(i) + *b.get_unchecked(i);
     }
-}
+}}
 
 /// Element-wise multiplication: out = a * b
 pub fn mul(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
@@ -120,7 +120,7 @@ fn mul_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn mul_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
+unsafe fn mul_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) { unsafe {
     use std::arch::x86_64::*;
     
     let n = a.len();
@@ -141,7 +141,7 @@ unsafe fn mul_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
     for i in (chunks * 8)..n {
         *out.get_unchecked_mut(i) = *a.get_unchecked(i) * *b.get_unchecked(i);
     }
-}
+}}
 
 /// Scale by scalar: out = a * scalar
 pub fn scale(a: &Tensor, scalar: f32, out: &mut Tensor) -> BackendResult<()> {
@@ -178,7 +178,7 @@ fn scale_f32_simd(a: &[f32], scalar: f32, out: &mut [f32]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scale_f32_avx2(a: &[f32], scalar: f32, out: &mut [f32]) {
+unsafe fn scale_f32_avx2(a: &[f32], scalar: f32, out: &mut [f32]) { unsafe {
     use std::arch::x86_64::*;
     
     let n = a.len();
@@ -198,7 +198,7 @@ unsafe fn scale_f32_avx2(a: &[f32], scalar: f32, out: &mut [f32]) {
     for i in (chunks * 8)..n {
         *out.get_unchecked_mut(i) = *a.get_unchecked(i) * scalar;
     }
-}
+}}
 
 // =============================================================================
 // Activation Functions
@@ -378,7 +378,7 @@ pub fn matmul(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
 }
 
 /// Simple parallel matmul for small matrices
-fn matmul_simple(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+fn matmul_simple(a: &[f32], b: &[f32], c: &mut [f32], _m: usize, k: usize, n: usize) {
     c.par_chunks_mut(n)
         .enumerate()
         .for_each(|(i, row_out)| {
@@ -396,7 +396,7 @@ fn matmul_simple(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
 }
 
 /// Tiled matrix multiplication for better cache utilization (large matrices)
-fn matmul_tiled(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+fn matmul_tiled(a: &[f32], b: &[f32], c: &mut [f32], _m: usize, k: usize, n: usize) {
     // Tile sizes tuned for L2 cache (~256KB)
     const TILE_M: usize = 32;
     const TILE_N: usize = 256;
@@ -434,6 +434,11 @@ fn matmul_tiled(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
 }
 
 /// Matrix-vector multiplication: out = a @ b where b is 1D (SIMD-optimized)
+/// 
+/// Computes y = A @ x where A is [m, k] and x is [k], giving y [m]
+///
+/// Uses row-major storage (standard Rust/C convention).
+/// For shape [m, k], element (i, j) is at index i * k + j.
 pub fn matvec(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
     check_dtype(a, DType::F32)?;
     check_dtype(b, DType::F32)?;
@@ -822,7 +827,9 @@ pub fn matvec_q(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
 /// Vector-matrix multiplication: out = a @ b where a is 1D, b is 2D
 /// 
 /// Computes y = x @ W where x is [k] and W is [k, n], giving y [n]
-/// This is the GGUF convention where weights are stored as [in_features, out_features]
+/// 
+/// GGUF stores matrices in column-major order (ne[0] is contiguous).
+/// For shape [k, n], element (i, j) is at index i + j * k.
 pub fn vec_mat(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
     check_dtype(a, DType::F32)?;
     check_dtype(b, DType::F32)?;
@@ -856,11 +863,11 @@ pub fn vec_mat(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
     let out_data = out.as_f32_mut()?;
 
     // Compute y[j] = sum_i x[i] * W[i,j] for each j
-    // Parallel over columns
+    // GGUF column-major: W[i,j] is at index i + j * k
     out_data.par_iter_mut().enumerate().for_each(|(j, o)| {
         let mut sum = 0.0f32;
         for i in 0..k {
-            sum += a_data[i] * b_data[i * n + j];
+            sum += a_data[i] * b_data[i + j * k];
         }
         *o = sum;
     });
@@ -901,6 +908,7 @@ pub fn rope(
     pos: usize,
     freq_base: f32,
     freq_scale: f32,
+    use_neox: bool,
 ) -> BackendResult<()> {
     check_dtype(q, DType::F32)?;
     check_dtype(k, DType::F32)?;
@@ -924,19 +932,25 @@ pub fn rope(
     // Apply RoPE to Q
     {
         let q_data = q.as_f32_mut()?;
-        apply_rope_to_tensor(q_data, q_num_heads, q_seq_len, q_head_dim, pos, freq_base, freq_scale);
+        apply_rope_to_tensor(q_data, q_num_heads, q_seq_len, q_head_dim, pos, freq_base, freq_scale, use_neox);
     }
 
     // Apply RoPE to K
     {
         let k_data = k.as_f32_mut()?;
-        apply_rope_to_tensor(k_data, k_num_kv_heads, k_seq_len, k_head_dim, pos, freq_base, freq_scale);
+        apply_rope_to_tensor(k_data, k_num_kv_heads, k_seq_len, k_head_dim, pos, freq_base, freq_scale, use_neox);
     }
 
     Ok(())
 }
 
 /// Internal function to apply RoPE to a tensor
+/// 
+/// Supports two RoPE styles:
+/// - LLaMA/Standard (GGML_ROPE_TYPE_NORMAL): consecutive pairs (x[2i], x[2i+1])
+/// - NeoX (GGML_ROPE_TYPE_NEOX): first half paired with second half (x[i], x[i+d/2])
+///
+/// Qwen2 uses NeoX style RoPE.
 fn apply_rope_to_tensor(
     data: &mut [f32],
     num_heads: usize,
@@ -945,36 +959,48 @@ fn apply_rope_to_tensor(
     pos: usize,
     freq_base: f32,
     freq_scale: f32,
+    use_neox: bool,
 ) {
-    // RoPE rotates pairs of dimensions
-    // For position p and dimension pair (2i, 2i+1):
-    //   theta = p / (freq_base ^ (2i / head_dim))
-    //   x'[2i]   = x[2i] * cos(theta) - x[2i+1] * sin(theta)
-    //   x'[2i+1] = x[2i] * sin(theta) + x[2i+1] * cos(theta)
-
     let half_dim = head_dim / 2;
 
     for head in 0..num_heads {
         for s in 0..seq_len {
-            let position = (pos + s) as f32 * freq_scale;
+            // For linear scaling, positions are divided by the scale factor
+            // (e.g., if scale_linear=4.0, position 4 becomes 1)
+            let position = (pos + s) as f32 / freq_scale;
             let head_offset = head * seq_len * head_dim + s * head_dim;
 
             for i in 0..half_dim {
-                // Compute the rotation frequency for this dimension pair
+                // Compute the rotation frequency for this dimension
+                // Frequency decreases as dimension index increases
                 let freq = 1.0 / freq_base.powf((2 * i) as f32 / head_dim as f32);
                 let theta = position * freq;
                 let cos_theta = theta.cos();
                 let sin_theta = theta.sin();
 
-                let idx0 = head_offset + i;
-                let idx1 = head_offset + i + half_dim;
+                if use_neox {
+                    // NeoX style: pairs are (i, i+half_dim)
+                    let idx0 = head_offset + i;
+                    let idx1 = head_offset + i + half_dim;
 
-                let x0 = data[idx0];
-                let x1 = data[idx1];
+                    let x0 = data[idx0];
+                    let x1 = data[idx1];
 
-                // Apply rotation
-                data[idx0] = x0 * cos_theta - x1 * sin_theta;
-                data[idx1] = x0 * sin_theta + x1 * cos_theta;
+                    // Apply rotation
+                    data[idx0] = x0 * cos_theta - x1 * sin_theta;
+                    data[idx1] = x0 * sin_theta + x1 * cos_theta;
+                } else {
+                    // Normal/LLaMA style: consecutive pairs (2i, 2i+1)
+                    let idx0 = head_offset + 2 * i;
+                    let idx1 = head_offset + 2 * i + 1;
+
+                    let x0 = data[idx0];
+                    let x1 = data[idx1];
+
+                    // Apply rotation
+                    data[idx0] = x0 * cos_theta - x1 * sin_theta;
+                    data[idx1] = x0 * sin_theta + x1 * cos_theta;
+                }
             }
         }
     }
@@ -1035,6 +1061,7 @@ pub fn attention(
     let k_data = k.as_f32()?;
     let v_data = v.as_f32()?;
     let out_data = out.as_f32_mut()?;
+
 
     // Process each head
     for head in 0..num_heads {
@@ -1256,8 +1283,8 @@ mod tests {
         let mut q = Tensor::from_f32(&q_data, vec![2, 1, 4]).unwrap();
         let mut k = Tensor::from_f32(&k_data, vec![2, 1, 4]).unwrap();
 
-        // Apply RoPE at position 0
-        rope(&mut q, &mut k, 0, 10000.0, 1.0).unwrap();
+        // Apply RoPE at position 0 (use NeoX style for this test)
+        rope(&mut q, &mut k, 0, 10000.0, 1.0, true).unwrap();
 
         // At position 0, rotation is by angle 0 for all dimensions
         // cos(0) = 1, sin(0) = 0, so values should be unchanged
@@ -1275,14 +1302,51 @@ mod tests {
         let mut q = Tensor::from_f32(&q_data, vec![1, 1, 4]).unwrap();
         let mut k = Tensor::from_f32(&k_data, vec![1, 1, 4]).unwrap();
 
-        // Apply RoPE at position 1
-        rope(&mut q, &mut k, 1, 10000.0, 1.0).unwrap();
+        // Apply RoPE at position 1 (use Normal/LLaMA style for this test)
+        rope(&mut q, &mut k, 1, 10000.0, 1.0, false).unwrap();
 
         let q_result = q.as_f32().unwrap();
         // At position 1, there should be some rotation
-        // The first pair (dims 0,2) rotate by theta = 1 / 10000^0 = 1
-        // x'[0] = cos(1) ≈ 0.54
+        // For consecutive pairing (LLaMA style): pairs are (0,1) and (2,3)
+        // theta = 1 / 10000^0 = 1 for the first pair
+        // x'[0] = x[0]*cos(1) - x[1]*sin(1) = 1*cos(1) - 0*sin(1) = cos(1) ≈ 0.54
         assert!((q_result[0] - 0.54).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_rope_consecutive_pairing() {
+        // Test that RoPE uses consecutive pairing (LLaMA style)
+        // Input: [1, 2, 3, 4] for head_dim=4
+        // With NeoX pairing: pairs are (0,2) and (1,3) (first half paired with second half)
+        // At position 1:
+        //   theta_0 = 1 / 10000^0 = 1
+        //   theta_1 = 1 / 10000^(2/4) = 1/100 = 0.01
+        // 
+        // With x = [1, 2, 3, 4]:
+        //   x'[0] = x[0]*cos(1) - x[2]*sin(1) = 1*0.5403 - 3*0.8415 ≈ -1.98
+        //   x'[2] = x[0]*sin(1) + x[2]*cos(1) = 1*0.8415 + 3*0.5403 ≈ 2.46
+        //   x'[1] = x[1]*cos(0.01) - x[3]*sin(0.01) = 2*1 - 4*0.01 ≈ 1.96
+        //   x'[3] = x[1]*sin(0.01) + x[3]*cos(0.01) = 2*0.01 + 4*1 ≈ 4.02
+        
+        let q_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let k_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+
+        let mut q = Tensor::from_f32(&q_data, vec![1, 1, 4]).unwrap();
+        let mut k = Tensor::from_f32(&k_data, vec![1, 1, 4]).unwrap();
+
+        // Use NeoX style RoPE for this test
+        rope(&mut q, &mut k, 1, 10000.0, 1.0, true).unwrap();
+
+        let q_result = q.as_f32().unwrap();
+        
+        // Verify NeoX pairing behavior
+        // First pair (0,2): significant rotation (theta=1)
+        assert!((q_result[0] - (-1.98)).abs() < 0.05, "q[0]={} expected ~-1.98", q_result[0]);
+        assert!((q_result[2] - 2.46).abs() < 0.05, "q[2]={} expected ~2.46", q_result[2]);
+        
+        // Second pair (1,3): minimal rotation (theta=0.01)
+        assert!((q_result[1] - 1.96).abs() < 0.05, "q[1]={} expected ~1.96", q_result[1]);
+        assert!((q_result[3] - 4.02).abs() < 0.05, "q[3]={} expected ~4.02", q_result[3]);
     }
 
     #[test]
@@ -1316,5 +1380,62 @@ mod tests {
         // Should complete without error (GQA handled correctly)
         let result = out.as_f32().unwrap();
         assert!(result.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_vec_mat_gguf_layout() {
+        // Test vec_mat with GGUF-style memory layout
+        // 
+        // Simulates a PyTorch Linear layer with:
+        //   - in_features = 3
+        //   - out_features = 2
+        //   - PyTorch weight shape: [out_features, in_features] = [2, 3]
+        //   - PyTorch weight (row-major):
+        //       W = [[1, 2, 3],    <- weights for output 0
+        //            [4, 5, 6]]   <- weights for output 1
+        //     Flat: [1, 2, 3, 4, 5, 6]
+        //
+        // After GGUF conversion (dimensions reversed, data unchanged):
+        //   - GGUF dims: [in_features, out_features] = [3, 2]
+        //   - Data still: [1, 2, 3, 4, 5, 6]
+        //
+        // For input x = [1, 1, 1]:
+        //   y[0] = 1*1 + 2*1 + 3*1 = 6  (output 0)
+        //   y[1] = 4*1 + 5*1 + 6*1 = 15 (output 1)
+        
+        // GGUF weight: shape [3, 2], data is PyTorch row-major
+        let weight_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weight = Tensor::from_f32(&weight_data, vec![3, 2]).unwrap();
+        
+        let x = Tensor::from_f32(&[1.0, 1.0, 1.0], vec![3]).unwrap();
+        let mut out = Tensor::zeros(vec![2], DType::F32);
+        
+        vec_mat(&x, &weight, &mut out).unwrap();
+        
+        let result = out.as_f32().unwrap();
+        // y[j] = sum_i x[i] * W[i + j * k]
+        // j=0: x[0]*W[0] + x[1]*W[1] + x[2]*W[2] = 1*1 + 1*2 + 1*3 = 6
+        // j=1: x[0]*W[3] + x[1]*W[4] + x[2]*W[5] = 1*4 + 1*5 + 1*6 = 15
+        assert_eq!(result, &[6.0, 15.0]);
+    }
+
+    #[test]
+    fn test_vec_mat_identity_pattern() {
+        // Test that vec_mat produces correct results for identity-like weights
+        // PyTorch: W = [[1,0,0], [0,1,0]] (2 outputs, 3 inputs), selects first 2 inputs
+        // Flat (row-major): [1, 0, 0, 0, 1, 0]
+        // GGUF shape: [3, 2]
+        
+        let weight_data = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let weight = Tensor::from_f32(&weight_data, vec![3, 2]).unwrap();
+        
+        let x = Tensor::from_f32(&[7.0, 8.0, 9.0], vec![3]).unwrap();
+        let mut out = Tensor::zeros(vec![2], DType::F32);
+        
+        vec_mat(&x, &weight, &mut out).unwrap();
+        
+        let result = out.as_f32().unwrap();
+        // Should select first two inputs: [7, 8]
+        assert_eq!(result, &[7.0, 8.0]);
     }
 }

@@ -10,7 +10,6 @@
 //! - Qwen MoE
 //! - DeepSeek MoE
 
-use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::tensor::{DType, Tensor};

@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::gguf::{GgufFile, MetadataValue};
 use crate::tensor::{DType, Tensor};
 
-use super::config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType};
+use super::config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType, RopeType};
 use super::error::{ModelError, ModelResult};
 use super::layers::{Attention, FeedForward, Linear, RMSNorm, TransformerLayer};
 use super::llama::LlamaModel;
@@ -112,6 +112,13 @@ impl ModelLoader {
         // Parse RoPE configuration
         let freq_base = get_f32_or(&format!("{}.rope.freq_base", arch), 10000.0);
         let freq_scale = get_f32_or(&format!("{}.rope.scale_linear", arch), 1.0);
+        
+        // Determine RoPE type based on architecture
+        // Qwen2 uses NeoX style (type 2), most others use Normal style (type 0)
+        let rope_type = match architecture {
+            Architecture::Qwen2 => RopeType::NeoX,
+            _ => RopeType::Normal,
+        };
 
         let rope_config = RopeConfig {
             freq_base,
@@ -119,6 +126,7 @@ impl ModelLoader {
             n_dims: head_dim,
             scaling_type: RopeScalingType::None,
             original_max_position_embeddings: max_seq_len,
+            rope_type,
         };
 
         Ok(ModelConfig {
@@ -217,7 +225,8 @@ impl ModelLoader {
             None,
         )?;
 
-        let attention = Attention::new(
+        let use_neox_rope = matches!(self.config.rope_config.rope_type, RopeType::NeoX);
+        let attention = Attention::with_rope_type(
             wq,
             wk,
             wv,
@@ -225,6 +234,7 @@ impl ModelLoader {
             self.config.num_heads,
             self.config.num_kv_heads,
             self.config.head_dim,
+            use_neox_rope,
         );
 
         // FFN normalization

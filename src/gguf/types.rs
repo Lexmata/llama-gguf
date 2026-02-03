@@ -96,6 +96,13 @@ impl GgufData {
         }
     }
 
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.metadata.get(key)? {
+            MetadataValue::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     pub fn get_tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
     }

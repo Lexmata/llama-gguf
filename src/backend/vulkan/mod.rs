@@ -261,6 +261,7 @@ impl Backend for VulkanBackend {
         pos: usize,
         freq_base: f32,
         freq_scale: f32,
+        _use_neox: bool,
     ) -> BackendResult<()> {
         Err(BackendError::NotAvailable("Vulkan rope".to_string()))
     }

@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::gguf::GgufFile;
@@ -129,7 +128,7 @@ impl LoraAdapter {
     ///
     /// For efficiency, we compute: x @ A^T @ B^T * scaling
     /// which is equivalent to: (x @ A^T) @ B^T * scaling
-    pub fn apply(&self, x: &Tensor, backend: &dyn Backend) -> Result<Tensor, crate::backend::BackendError> {
+    pub fn apply(&self, x: &Tensor, _backend: &dyn Backend) -> Result<Tensor, crate::backend::BackendError> {
         // x: [batch, in_features] or [in_features]
         // A: [rank, in_features] -> A^T: [in_features, rank]
         // B: [out_features, rank] -> B^T: [rank, out_features]

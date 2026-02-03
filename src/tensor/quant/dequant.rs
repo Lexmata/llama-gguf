@@ -206,117 +206,143 @@ pub fn dequantize_q4_k(block: &BlockQ4K, output: &mut [f32; 256]) {
     let d = block.d.to_f32();
     let dmin = block.dmin.to_f32();
 
-    // Decode 8 groups of (scale, min) from 12 bytes
-    // Each group has a 6-bit scale and 6-bit min
+    // Decode 8 groups of (scale, min) from 12 bytes using get_scale_min_k4 logic
     let mut scales = [0u8; 8];
     let mut mins = [0u8; 8];
 
-    // First 4 groups: scales in lower 6 bits of bytes 0-3, mins in lower 6 bits of bytes 4-7
-    for i in 0..4 {
-        scales[i] = block.scales[i] & 0x3F;
-        mins[i] = block.scales[i + 4] & 0x3F;
+    // First 4 groups (j < 4): scales in lower 6 bits of bytes 0-3, mins in lower 6 bits of bytes 4-7
+    for j in 0..4 {
+        scales[j] = block.scales[j] & 0x3F;
+        mins[j] = block.scales[j + 4] & 0x3F;
     }
 
-    // Last 4 groups: encoded in bytes 8-11 with high bits from earlier bytes
-    for i in 0..4 {
-        let sh = block.scales[8 + i];
-        scales[4 + i] = (sh & 0x0F) | ((block.scales[i] >> 6) << 4);
-        mins[4 + i] = ((sh >> 4) & 0x0F) | ((block.scales[i + 4] >> 6) << 4);
+    // Last 4 groups (j >= 4): high bits from earlier bytes
+    for j in 4..8 {
+        scales[j] = (block.scales[j + 4] & 0x0F) | ((block.scales[j - 4] >> 6) << 4);
+        mins[j] = ((block.scales[j + 4] >> 4) & 0x0F) | ((block.scales[j] >> 6) << 4);
     }
 
-    // Process 8 groups of 32 values
-    for i in 0..8 {
-        let d_scale = d * scales[i] as f32;
-        let d_min = dmin * mins[i] as f32;
-        let offset = i * 32;
-        let qs_offset = i * 16;
+    // Process 256 values in 4 groups of 64
+    // Each group of 64 uses two scale/min pairs
+    // First 32 use low nibbles with scale[is], next 32 use high nibbles with scale[is+1]
+    let mut out_idx = 0;
+    let mut qs_ptr = 0;
+    let mut is = 0;
 
-        for j in 0..16 {
-            let byte = block.qs[qs_offset + j];
-            let lo = (byte & 0x0F) as f32;
-            let hi = ((byte >> 4) & 0x0F) as f32;
+    for _ in 0..4 {
+        // Get scales and mins for this group of 64
+        let d1 = d * scales[is] as f32;
+        let m1 = dmin * mins[is] as f32;
+        let d2 = d * scales[is + 1] as f32;
+        let m2 = dmin * mins[is + 1] as f32;
 
-            output[offset + j] = d_scale * lo - d_min;
-            output[offset + j + 16] = d_scale * hi - d_min;
+        // First 32 values: low nibbles
+        for l in 0..32 {
+            let q = (block.qs[qs_ptr + l] & 0x0F) as f32;
+            output[out_idx] = d1 * q - m1;
+            out_idx += 1;
         }
+
+        // Next 32 values: high nibbles
+        for l in 0..32 {
+            let q = ((block.qs[qs_ptr + l] >> 4) & 0x0F) as f32;
+            output[out_idx] = d2 * q - m2;
+            out_idx += 1;
+        }
+
+        qs_ptr += 32;
+        is += 2;
     }
 }
 
 /// Dequantize Q5_K block to f32 (256 elements)
 ///
 /// Q5_K stores 256 5-bit values. Low 4 bits in qs, high bit in qh.
+/// Layout matches llama.cpp's dequantize_row_q5_K.
 pub fn dequantize_q5_k(block: &BlockQ5K, output: &mut [f32; 256]) {
     let d = block.d.to_f32();
     let dmin = block.dmin.to_f32();
 
-    // Decode scales and mins (same as Q4_K)
+    // Decode scales and mins (same as Q4_K using get_scale_min_k4 logic)
     let mut scales = [0u8; 8];
     let mut mins = [0u8; 8];
 
-    for i in 0..4 {
-        scales[i] = block.scales[i] & 0x3F;
-        mins[i] = block.scales[i + 4] & 0x3F;
+    for j in 0..4 {
+        scales[j] = block.scales[j] & 0x3F;
+        mins[j] = block.scales[j + 4] & 0x3F;
     }
 
-    for i in 0..4 {
-        let sh = block.scales[8 + i];
-        scales[4 + i] = (sh & 0x0F) | ((block.scales[i] >> 6) << 4);
-        mins[4 + i] = ((sh >> 4) & 0x0F) | ((block.scales[i + 4] >> 6) << 4);
+    for j in 4..8 {
+        scales[j] = (block.scales[j + 4] & 0x0F) | ((block.scales[j - 4] >> 6) << 4);
+        mins[j] = ((block.scales[j + 4] >> 4) & 0x0F) | ((block.scales[j] >> 6) << 4);
     }
 
-    // Process 8 groups of 32 values
-    for i in 0..8 {
-        let d_scale = d * scales[i] as f32;
-        let d_min = dmin * mins[i] as f32;
-        let offset = i * 32;
-        let qs_offset = i * 16;
-        let qh_offset = i * 4;
+    // Process 256 values in 4 groups of 64
+    let mut out_idx = 0;
+    let mut ql_ptr = 0;
+    let mut is = 0;
+    let mut u1: u8 = 1;
+    let mut u2: u8 = 2;
 
-        for j in 0..16 {
-            let byte = block.qs[qs_offset + j];
-            let lo4 = (byte & 0x0F) as u32;
-            let hi4 = ((byte >> 4) & 0x0F) as u32;
+    for _ in 0..4 {
+        // Get scales and mins for this group of 64
+        let d1 = d * scales[is] as f32;
+        let m1 = dmin * mins[is] as f32;
+        let d2 = d * scales[is + 1] as f32;
+        let m2 = dmin * mins[is + 1] as f32;
 
-            // Get high bits from qh
-            let qh_byte = block.qh[qh_offset + j / 4];
-            let lo5 = ((qh_byte >> ((j % 4) * 2)) & 0x01) as u32;
-            let hi5 = ((qh_byte >> ((j % 4) * 2 + 1)) & 0x01) as u32;
-
-            let lo = lo4 | (lo5 << 4);
-            let hi = hi4 | (hi5 << 4);
-
-            output[offset + j] = d_scale * lo as f32 - d_min;
-            output[offset + j + 16] = d_scale * hi as f32 - d_min;
+        // First 32 values: low nibbles with u1 high bit
+        for l in 0..32 {
+            let lo4 = (block.qs[ql_ptr + l] & 0x0F) as f32;
+            let hi5 = if block.qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+            output[out_idx] = d1 * (lo4 + hi5) - m1;
+            out_idx += 1;
         }
+
+        // Next 32 values: high nibbles with u2 high bit
+        for l in 0..32 {
+            let hi4 = ((block.qs[ql_ptr + l] >> 4) & 0x0F) as f32;
+            let hi5 = if block.qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+            output[out_idx] = d2 * (hi4 + hi5) - m2;
+            out_idx += 1;
+        }
+
+        ql_ptr += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
     }
 }
 
 /// Dequantize Q6_K block to f32 (256 elements)
 ///
-/// Q6_K stores 256 6-bit values. Low 4 bits in ql, high 2 bits in qh.
+/// Q6_K stores 256 6-bit values using complex interleaved packing.
+/// Layout matches llama.cpp's dequantize_row_q6_K.
 pub fn dequantize_q6_k(block: &BlockQ6K, output: &mut [f32; 256]) {
     let d = block.d.to_f32();
 
-    // Process 16 groups of 16 values
-    for i in 0..16 {
-        let scale = d * block.scales[i] as f32;
-        let offset = i * 16;
+    // Process 256 elements in two groups of 128
+    // Each group uses 64 bytes from ql, 32 bytes from qh, 8 scales
+    for n in 0..2 {
+        let ql_base = n * 64;
+        let qh_base = n * 32;
+        let sc_base = n * 8;
+        let out_base = n * 128;
 
-        for j in 0..16 {
-            let idx = offset + j;
-            let ql_idx = idx / 2;
-            let ql_shift = (idx % 2) * 4;
-            let qh_idx = idx / 4;
-            let qh_shift = (idx % 4) * 2;
+        for l in 0..32 {
+            let is = l / 16;  // Scale group index (0 or 1)
 
-            // Low 4 bits from ql
-            let lo4 = ((block.ql[ql_idx] >> ql_shift) & 0x0F) as i32;
-            // High 2 bits from qh
-            let hi2 = ((block.qh[qh_idx] >> qh_shift) & 0x03) as i32;
+            // Extract 4 quantized values using interleaved pattern
+            let q1 = ((block.ql[ql_base + l] & 0x0F) | ((block.qh[qh_base + l] & 0x03) << 4)) as i32 - 32;
+            let q2 = ((block.ql[ql_base + l + 32] & 0x0F) | (((block.qh[qh_base + l] >> 2) & 0x03) << 4)) as i32 - 32;
+            let q3 = ((block.ql[ql_base + l] >> 4) | (((block.qh[qh_base + l] >> 4) & 0x03) << 4)) as i32 - 32;
+            let q4 = ((block.ql[ql_base + l + 32] >> 4) | (((block.qh[qh_base + l] >> 6) & 0x03) << 4)) as i32 - 32;
 
-            // Combine to 6-bit signed value
-            let q = (lo4 | (hi2 << 4)) - 32;
-            output[idx] = scale * q as f32;
+            // Apply scales with correct interleaved pattern
+            output[out_base + l] = d * block.scales[sc_base + is] as f32 * q1 as f32;
+            output[out_base + l + 32] = d * block.scales[sc_base + is + 2] as f32 * q2 as f32;
+            output[out_base + l + 64] = d * block.scales[sc_base + is + 4] as f32 * q3 as f32;
+            output[out_base + l + 96] = d * block.scales[sc_base + is + 6] as f32 * q4 as f32;
         }
     }
 }

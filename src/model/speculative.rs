@@ -7,10 +7,9 @@
 //! Reference: "Fast Inference from Transformers via Speculative Decoding"
 //! https://arxiv.org/abs/2211.17192
 
-use std::sync::Arc;
 
 use crate::model::{InferenceContext, Model};
-use crate::sampling::{Sampler, SamplerConfig};
+use crate::sampling::Sampler;
 use crate::tensor::Tensor;
 
 /// Speculative decoding configuration

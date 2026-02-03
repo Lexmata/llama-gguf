@@ -58,10 +58,31 @@ impl LlamaModel {
             architecture,
         })
     }
-
-    /// Get token embedding for given token IDs
-    fn embed_tokens(&self, tokens: &[u32], backend: &dyn Backend) -> ModelResult<Tensor> {
+    
+    /// Get model configuration
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+    
+    /// Get transformer layers
+    pub fn layers(&self) -> &[TransformerLayer] {
+        &self.layers
+    }
+    
+    /// Get final normalization layer
+    pub fn norm(&self) -> &RMSNorm {
+        &self.norm
+    }
+    
+    /// Get output projection layer  
+    pub fn output(&self) -> &Linear {
+        &self.output
+    }
+    
+    /// Get token embedding for given token IDs (public for testing)
+    pub fn embed_tokens(&self, tokens: &[u32], backend: &dyn Backend) -> ModelResult<Tensor> {
         let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
         let seq_len = tokens.len();
 
         // Handle both quantized and non-quantized embeddings
@@ -77,12 +98,16 @@ impl LlamaModel {
 
         let mut output = vec![0.0f32; seq_len * hidden_size];
 
+        // GGUF stores embeddings with shape listed as [hidden_size, vocab_size]
+        // but in GGML convention, this means the data is laid out as [vocab_size][hidden_size]
+        // i.e., each row is a token's embedding vector
+        // So embedding for token t starts at t * hidden_size
         for (i, &token) in tokens.iter().enumerate() {
             let token_idx = token as usize;
-            if token_idx >= self.config.vocab_size {
+            if token_idx >= vocab_size {
                 return Err(ModelError::InvalidMetadata {
                     key: "token".into(),
-                    message: format!("Token ID {} exceeds vocab size {}", token, self.config.vocab_size),
+                    message: format!("Token ID {} exceeds vocab size {}", token, vocab_size),
                 });
             }
 
@@ -141,27 +166,37 @@ impl Model for LlamaModel {
             });
         }
 
-        // Get embeddings
-        let mut hidden = self.embed_tokens(tokens, backend)?;
+        // Process each token sequentially to properly build KV cache
+        let mut final_hidden = None;
+        
+        for (token_offset, &token) in tokens.iter().enumerate() {
+            let current_pos = ctx.position + token_offset;
+            
+            // Get embedding for single token
+            let mut hidden = self.embed_tokens(&[token], backend)?;
 
-        // Run through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(
-                &hidden,
-                &mut ctx.kv_cache.k_cache[layer_idx],
-                &mut ctx.kv_cache.v_cache[layer_idx],
-                ctx.position,
-                self.config.rope_config.freq_base,
-                self.config.rope_config.freq_scale,
-                backend,
-            )?;
+            // Run through transformer layers
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                hidden = layer.forward(
+                    &hidden,
+                    &mut ctx.kv_cache.k_cache[layer_idx],
+                    &mut ctx.kv_cache.v_cache[layer_idx],
+                    current_pos,
+                    self.config.rope_config.freq_base,
+                    self.config.rope_config.freq_scale,
+                    backend,
+                )?;
+            }
+            
+            final_hidden = Some(hidden);
         }
 
         // Update position
         ctx.position = new_pos;
         ctx.kv_cache.seq_len = new_pos;
 
-        // Compute logits
+        // Compute logits from final hidden state
+        let hidden = final_hidden.ok_or_else(|| ModelError::ConfigError("No tokens to process".into()))?;
         self.compute_logits(&hidden, backend)
     }
 

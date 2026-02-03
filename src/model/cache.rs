@@ -8,9 +8,8 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
-use crate::tensor::{DType, Tensor};
+use crate::tensor::Tensor;
 
 /// Unique identifier for a cached prefix
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -350,6 +349,7 @@ impl PrefixSharing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::DType;
 
     #[test]
     fn test_prefix_id() {

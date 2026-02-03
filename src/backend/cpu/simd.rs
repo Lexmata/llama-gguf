@@ -408,7 +408,7 @@ pub fn softmax_inplace(x: &mut [f32]) {
 #[target_feature(enable = "avx2")]
 unsafe fn softmax_inplace_avx2(x: &mut [f32], max_val: f32) {
     let n = x.len();
-    let vmax = _mm256_set1_ps(max_val);
+    let _vmax = _mm256_set1_ps(max_val);
 
     // Compute exp(x - max)
     // Note: We use a fast exp approximation here
@@ -567,18 +567,18 @@ unsafe fn dot_q4_0_avx2(weights: &[BlockQ4_0], x: &[f32]) -> f32 {
     let mut sum = _mm256_setzero_ps();
     let mut offset = 0;
 
-    let mask_lo = _mm256_set1_epi8(0x0F);
-    let sub8 = _mm256_set1_epi8(8);
+    let _mask_lo = _mm256_set1_epi8(0x0F);
+    let _sub8 = _mm256_set1_epi8(8);
 
     for block in weights {
         let d = block.d.to_f32();
-        let vd = _mm256_set1_ps(d);
+        let _vd = _mm256_set1_ps(d);
 
         // Load 16 bytes of quantized data
         let q_bytes = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
 
         // Expand to 32 int8 values
-        let q_lo = _mm256_cvtepu8_epi16(q_bytes);
+        let _q_lo = _mm256_cvtepu8_epi16(q_bytes);
 
         // Extract low and high nibbles - this is simplified, full impl would be more complex
         // For now, use scalar for the inner loop

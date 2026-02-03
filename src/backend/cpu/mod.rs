@@ -172,8 +172,9 @@ impl Backend for CpuBackend {
         pos: usize,
         freq_base: f32,
         freq_scale: f32,
+        use_neox: bool,
     ) -> BackendResult<()> {
-        ops::rope(q, k, pos, freq_base, freq_scale)
+        ops::rope(q, k, pos, freq_base, freq_scale, use_neox)
     }
 
     fn attention(
