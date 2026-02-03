@@ -26,6 +26,7 @@
 
 pub mod backend;
 pub mod gguf;
+#[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod model;
 pub mod rag;
@@ -59,6 +60,7 @@ pub use sampling::{
 };
 pub use tensor::{DType, Tensor, TensorError, TensorStorage};
 pub use tokenizer::{Tokenizer, TokenizerError};
+#[cfg(feature = "huggingface")]
 pub use huggingface::{HfClient, HfError, HfFileInfo, format_bytes};
 #[cfg(feature = "rag")]
 pub use rag::{RagConfig, RagStore, RagError, RagResult, Document, NewDocument, RagContextBuilder, TextChunker};

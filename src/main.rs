@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use llama_gguf::gguf::{GgufFile, MetadataValue};
+#[cfg(feature = "huggingface")]
 use llama_gguf::huggingface::{format_bytes, HfClient};
 use llama_gguf::model::{InferenceContext, ModelLoader};
 use llama_gguf::sampling::{Sampler, SamplerConfig};
@@ -185,6 +186,7 @@ enum Commands {
     },
 
     /// Download a model from HuggingFace Hub
+    #[cfg(feature = "huggingface")]
     Download {
         /// HuggingFace repository (e.g., "Qwen/Qwen2.5-0.5B-Instruct-GGUF")
         repo: String,
@@ -203,6 +205,7 @@ enum Commands {
     },
 
     /// Manage local model cache
+    #[cfg(feature = "huggingface")]
     Models {
         #[command(subcommand)]
         action: ModelAction,
@@ -495,6 +498,7 @@ enum RagAction {
     },
 }
 
+#[cfg(feature = "huggingface")]
 #[derive(Subcommand)]
 enum ModelAction {
     /// List all cached models
@@ -664,6 +668,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "huggingface")]
         Commands::Download {
             repo,
             file,
@@ -675,6 +680,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "huggingface")]
         Commands::Models { action } => {
             if let Err(e) = run_models_command(action) {
                 eprintln!("Error: {}", e);
@@ -1510,6 +1516,7 @@ fn run_embed(
 }
 
 /// Download a model from HuggingFace Hub
+#[cfg(feature = "huggingface")]
 fn run_download(
     repo: &str,
     file: Option<&str>,
@@ -1580,6 +1587,7 @@ fn run_download(
 }
 
 /// Handle models subcommands
+#[cfg(feature = "huggingface")]
 fn run_models_command(action: ModelAction) -> Result<(), Box<dyn std::error::Error>> {
     let client = HfClient::new();
 

@@ -38,13 +38,25 @@ pub fn has_neon() -> bool {
     true
 }
 
+/// AVX2 is not available on aarch64
+#[cfg(target_arch = "aarch64")]
+pub fn has_avx2() -> bool {
+    false
+}
+
+/// AVX-512 is not available on aarch64
+#[cfg(target_arch = "aarch64")]
+pub fn has_avx512() -> bool {
+    false
+}
+
 /// Check if NEON is available (always false on x86_64)
 #[cfg(target_arch = "x86_64")]
 pub fn has_neon() -> bool {
     false
 }
 
-// Fallback for other architectures
+// Fallback for other architectures (not x86_64, not aarch64)
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn has_avx2() -> bool {
     false
