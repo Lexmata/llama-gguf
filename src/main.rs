@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use llama_rs::gguf::{GgufFile, MetadataValue};
+use llama_rs::huggingface::{format_bytes, HfClient};
 use llama_rs::model::{InferenceContext, ModelLoader};
 use llama_rs::sampling::{Sampler, SamplerConfig};
 use llama_rs::tokenizer::Tokenizer;
@@ -167,6 +168,62 @@ enum Commands {
         #[arg(long, default_value = "json")]
         format: String,
     },
+
+    /// Download a model from HuggingFace Hub
+    Download {
+        /// HuggingFace repository (e.g., "Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        repo: String,
+
+        /// Specific file to download (optional, lists available files if not specified)
+        #[arg(short, long)]
+        file: Option<String>,
+
+        /// Download directory (uses system cache by default)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Force re-download even if file exists
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Manage local model cache
+    Models {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// List all cached models
+    List,
+
+    /// Search for models on HuggingFace Hub
+    Search {
+        /// Search query
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Show cache information
+    CacheInfo,
+
+    /// Clear the model cache
+    ClearCache {
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// List GGUF files in a HuggingFace repository
+    ListFiles {
+        /// HuggingFace repository (e.g., "Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        repo: String,
+    },
 }
 
 fn main() {
@@ -266,6 +323,23 @@ fn main() {
             format,
         } => {
             if let Err(e) = run_embed(&model, &text, &format) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Download {
+            repo,
+            file,
+            output,
+            force,
+        } => {
+            if let Err(e) = run_download(&repo, file.as_deref(), output.as_deref(), force) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Models { action } => {
+            if let Err(e) = run_models_command(action) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -1050,6 +1124,182 @@ fn run_embed(
             eprintln!("Unknown format: {}. Using json.", format);
             // Fall back to json
             println!("{:?}", embedding);
+        }
+    }
+
+    Ok(())
+}
+
+/// Download a model from HuggingFace Hub
+fn run_download(
+    repo: &str,
+    file: Option<&str>,
+    output_dir: Option<&str>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse repository ID
+    let repo_id = HfClient::parse_repo_id(repo)?;
+    println!("Repository: {}", repo_id);
+
+    // Create client
+    let client = if let Some(dir) = output_dir {
+        HfClient::with_cache_dir(std::path::PathBuf::from(dir))
+    } else {
+        HfClient::new()
+    };
+
+    println!("Cache directory: {}", client.cache_dir().display());
+
+    // If no file specified, list available GGUF files
+    if file.is_none() {
+        println!("\nFetching available GGUF files...");
+        let files = client.list_gguf_files(&repo_id)?;
+
+        println!("\nAvailable GGUF files:");
+        println!("{:<60} {:>12}", "Filename", "Size");
+        println!("{}", "-".repeat(74));
+
+        for f in &files {
+            let size_str = f.file_size().map(format_bytes).unwrap_or_else(|| "?".to_string());
+            println!("{:<60} {:>12}", f.path, size_str);
+        }
+
+        println!("\nTo download, run:");
+        println!("  llama-rs download {} --file <filename>", repo);
+        return Ok(());
+    }
+
+    let filename = file.unwrap();
+
+    // Check if already cached (unless force flag is set)
+    if !force && client.is_cached(&repo_id, filename) {
+        let cached_path = client.get_cached_path(&repo_id, filename);
+        println!("File already downloaded: {}", cached_path.display());
+        println!("\nUse --force to re-download");
+        return Ok(());
+    }
+
+    // Delete existing file if force flag is set
+    if force {
+        let cached_path = client.get_cached_path(&repo_id, filename);
+        if cached_path.exists() {
+            std::fs::remove_file(&cached_path)?;
+            println!("Removed existing file");
+        }
+    }
+
+    // Download the file
+    println!("\nDownloading: {}", filename);
+    let path = client.download_file(&repo_id, filename, true)?;
+
+    println!("\nDownload complete!");
+    println!("Model saved to: {}", path.display());
+    println!("\nTo run inference:");
+    println!("  llama-rs run {}", path.display());
+
+    Ok(())
+}
+
+/// Handle models subcommands
+fn run_models_command(action: ModelAction) -> Result<(), Box<dyn std::error::Error>> {
+    let client = HfClient::new();
+
+    match action {
+        ModelAction::List => {
+            println!("Cached models:");
+            println!("{}", "-".repeat(80));
+
+            let cached = client.list_cached()?;
+            if cached.is_empty() {
+                println!("No models cached yet.");
+                println!("\nDownload a model with:");
+                println!("  llama-rs download <repo> --file <filename>");
+            } else {
+                for (repo, path) in &cached {
+                    let size = path.metadata().map(|m| format_bytes(m.len())).unwrap_or_default();
+                    println!("{}", repo);
+                    println!("  {} ({})", path.display(), size);
+                }
+            }
+        }
+
+        ModelAction::Search { query, limit } => {
+            println!("Searching HuggingFace Hub for: \"{}\"", query);
+            println!();
+
+            let results = client.search_models(&query, limit)?;
+
+            if results.is_empty() {
+                println!("No models found matching your query.");
+                return Ok(());
+            }
+
+            println!("{:<50} {:>10} {:>8}", "Repository", "Downloads", "Likes");
+            println!("{}", "-".repeat(70));
+
+            for model in &results {
+                let id = model.model_id.as_ref().unwrap_or(&model.id);
+                let downloads = model.downloads.map(|d| format!("{}", d)).unwrap_or_default();
+                let likes = model.likes.map(|l| format!("{}", l)).unwrap_or_default();
+                println!("{:<50} {:>10} {:>8}", id, downloads, likes);
+            }
+
+            println!("\nTo see available files:");
+            println!("  llama-rs models list-files <repo>");
+        }
+
+        ModelAction::CacheInfo => {
+            let cache_dir = client.cache_dir();
+            println!("Cache directory: {}", cache_dir.display());
+
+            let total_size = client.cache_size()?;
+            println!("Total cache size: {}", format_bytes(total_size));
+
+            let cached = client.list_cached()?;
+            println!("Cached models: {}", cached.len());
+        }
+
+        ModelAction::ClearCache { yes } => {
+            if !yes {
+                print!("Are you sure you want to clear the model cache? [y/N] ");
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            let size_before = client.cache_size()?;
+            client.clear_cache()?;
+            println!("Cache cleared. Freed {}", format_bytes(size_before));
+        }
+
+        ModelAction::ListFiles { repo } => {
+            let repo_id = HfClient::parse_repo_id(&repo)?;
+            println!("Fetching files from: {}", repo_id);
+            println!();
+
+            let files = client.list_gguf_files(&repo_id)?;
+
+            println!("{:<60} {:>12}", "Filename", "Size");
+            println!("{}", "-".repeat(74));
+
+            for f in &files {
+                let size_str = f.file_size().map(format_bytes).unwrap_or_else(|| "?".to_string());
+                let cached = if client.is_cached(&repo_id, &f.path) {
+                    " [cached]"
+                } else {
+                    ""
+                };
+                println!("{:<60} {:>12}{}", f.path, size_str, cached);
+            }
+
+            println!("\nTo download:");
+            println!("  llama-rs download {} --file <filename>", repo);
         }
     }
 

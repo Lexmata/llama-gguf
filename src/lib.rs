@@ -26,6 +26,7 @@
 
 pub mod backend;
 pub mod gguf;
+pub mod huggingface;
 pub mod model;
 pub mod sampling;
 #[cfg(feature = "server")]
@@ -57,6 +58,7 @@ pub use sampling::{
 };
 pub use tensor::{DType, Tensor, TensorError, TensorStorage};
 pub use tokenizer::{Tokenizer, TokenizerError};
+pub use huggingface::{HfClient, HfError, HfFileInfo, format_bytes};
 
 /// Library-wide error type
 #[derive(thiserror::Error, Debug)]
