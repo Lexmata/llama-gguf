@@ -49,7 +49,7 @@ tower-http = { version = "0.5", features = ["cors"], optional = true }
 futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3.10"
 
 [profile.release]
