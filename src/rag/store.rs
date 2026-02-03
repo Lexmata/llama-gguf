@@ -7,6 +7,429 @@ use serde::{Deserialize, Serialize};
 
 use super::{RagConfig, RagError, RagResult};
 
+/// Metadata filter for search queries
+/// 
+/// Filters can be combined using AND/OR logic and support various comparison operators
+/// for JSONB fields in PostgreSQL.
+/// 
+/// # Example
+/// 
+/// ```rust,ignore
+/// use llama_gguf::rag::MetadataFilter;
+/// 
+/// // Simple equality filter
+/// let filter = MetadataFilter::eq("source", "docs/readme.md");
+/// 
+/// // Combine filters with AND
+/// let filter = MetadataFilter::and(vec![
+///     MetadataFilter::eq("type", "documentation"),
+///     MetadataFilter::gte("version", 2),
+/// ]);
+/// 
+/// // Complex filter with OR
+/// let filter = MetadataFilter::or(vec![
+///     MetadataFilter::eq("category", "api"),
+///     MetadataFilter::contains("tags", "important"),
+/// ]);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum MetadataFilter {
+    /// Exact equality: metadata->>'field' = 'value'
+    Eq { field: String, value: serde_json::Value },
+    
+    /// Not equal: metadata->>'field' != 'value'
+    Ne { field: String, value: serde_json::Value },
+    
+    /// Greater than: (metadata->>'field')::numeric > value
+    Gt { field: String, value: serde_json::Value },
+    
+    /// Greater than or equal: (metadata->>'field')::numeric >= value
+    Gte { field: String, value: serde_json::Value },
+    
+    /// Less than: (metadata->>'field')::numeric < value
+    Lt { field: String, value: serde_json::Value },
+    
+    /// Less than or equal: (metadata->>'field')::numeric <= value
+    Lte { field: String, value: serde_json::Value },
+    
+    /// Field exists: metadata ? 'field'
+    Exists { field: String },
+    
+    /// Field does not exist: NOT (metadata ? 'field')
+    NotExists { field: String },
+    
+    /// String contains (case-insensitive): metadata->>'field' ILIKE '%value%'
+    Contains { field: String, value: String },
+    
+    /// String starts with: metadata->>'field' LIKE 'value%'
+    StartsWith { field: String, value: String },
+    
+    /// String ends with: metadata->>'field' LIKE '%value'
+    EndsWith { field: String, value: String },
+    
+    /// Value in array: metadata->'field' ? 'value' (for array fields)
+    InArray { field: String, value: String },
+    
+    /// Value in list: metadata->>'field' IN ('a', 'b', 'c')
+    In { field: String, values: Vec<serde_json::Value> },
+    
+    /// Value not in list: metadata->>'field' NOT IN ('a', 'b', 'c')
+    NotIn { field: String, values: Vec<serde_json::Value> },
+    
+    /// JSON path exists: metadata @? '$.field[*] ? (@ == "value")'
+    JsonPath { path: String },
+    
+    /// Logical AND of multiple filters
+    And { filters: Vec<MetadataFilter> },
+    
+    /// Logical OR of multiple filters
+    Or { filters: Vec<MetadataFilter> },
+    
+    /// Logical NOT
+    Not { filter: Box<MetadataFilter> },
+}
+
+impl MetadataFilter {
+    // Convenience constructors
+    
+    /// Create an equality filter
+    pub fn eq(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        Self::Eq { field: field.into(), value: value.into() }
+    }
+    
+    /// Create a not-equal filter
+    pub fn ne(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        Self::Ne { field: field.into(), value: value.into() }
+    }
+    
+    /// Create a greater-than filter
+    pub fn gt(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        Self::Gt { field: field.into(), value: value.into() }
+    }
+    
+    /// Create a greater-than-or-equal filter
+    pub fn gte(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        Self::Gte { field: field.into(), value: value.into() }
+    }
+    
+    /// Create a less-than filter
+    pub fn lt(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        Self::Lt { field: field.into(), value: value.into() }
+    }
+    
+    /// Create a less-than-or-equal filter
+    pub fn lte(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        Self::Lte { field: field.into(), value: value.into() }
+    }
+    
+    /// Create an exists filter
+    pub fn exists(field: impl Into<String>) -> Self {
+        Self::Exists { field: field.into() }
+    }
+    
+    /// Create a not-exists filter
+    pub fn not_exists(field: impl Into<String>) -> Self {
+        Self::NotExists { field: field.into() }
+    }
+    
+    /// Create a contains filter (case-insensitive substring match)
+    pub fn contains(field: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::Contains { field: field.into(), value: value.into() }
+    }
+    
+    /// Create a starts-with filter
+    pub fn starts_with(field: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::StartsWith { field: field.into(), value: value.into() }
+    }
+    
+    /// Create an ends-with filter
+    pub fn ends_with(field: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::EndsWith { field: field.into(), value: value.into() }
+    }
+    
+    /// Create a filter for checking if value is in a JSON array field
+    pub fn in_array(field: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::InArray { field: field.into(), value: value.into() }
+    }
+    
+    /// Create an IN filter
+    pub fn in_values(field: impl Into<String>, values: Vec<serde_json::Value>) -> Self {
+        Self::In { field: field.into(), values }
+    }
+    
+    /// Create a NOT IN filter
+    pub fn not_in(field: impl Into<String>, values: Vec<serde_json::Value>) -> Self {
+        Self::NotIn { field: field.into(), values }
+    }
+    
+    /// Create a JSON path filter
+    pub fn json_path(path: impl Into<String>) -> Self {
+        Self::JsonPath { path: path.into() }
+    }
+    
+    /// Create an AND filter combining multiple filters
+    pub fn and(filters: Vec<MetadataFilter>) -> Self {
+        Self::And { filters }
+    }
+    
+    /// Create an OR filter combining multiple filters
+    pub fn or(filters: Vec<MetadataFilter>) -> Self {
+        Self::Or { filters }
+    }
+    
+    /// Create a NOT filter
+    pub fn not(filter: MetadataFilter) -> Self {
+        Self::Not { filter: Box::new(filter) }
+    }
+    
+    /// Convert the filter to a SQL WHERE clause fragment
+    /// 
+    /// Returns the SQL string and a list of parameter values
+    pub fn to_sql(&self, param_offset: usize) -> (String, Vec<String>) {
+        let mut params = Vec::new();
+        let sql = self.to_sql_inner(param_offset, &mut params);
+        (sql, params)
+    }
+    
+    fn to_sql_inner(&self, param_offset: usize, params: &mut Vec<String>) -> String {
+        match self {
+            Self::Eq { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(json_value_to_string(value));
+                format!("metadata->>'{}' = ${}", escape_field(field), param_idx)
+            }
+            
+            Self::Ne { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(json_value_to_string(value));
+                format!("metadata->>'{}' != ${}", escape_field(field), param_idx)
+            }
+            
+            Self::Gt { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(json_value_to_string(value));
+                format!("(metadata->>'{}')::numeric > ${}::numeric", escape_field(field), param_idx)
+            }
+            
+            Self::Gte { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(json_value_to_string(value));
+                format!("(metadata->>'{}')::numeric >= ${}::numeric", escape_field(field), param_idx)
+            }
+            
+            Self::Lt { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(json_value_to_string(value));
+                format!("(metadata->>'{}')::numeric < ${}::numeric", escape_field(field), param_idx)
+            }
+            
+            Self::Lte { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(json_value_to_string(value));
+                format!("(metadata->>'{}')::numeric <= ${}::numeric", escape_field(field), param_idx)
+            }
+            
+            Self::Exists { field } => {
+                format!("metadata ? '{}'", escape_field(field))
+            }
+            
+            Self::NotExists { field } => {
+                format!("NOT (metadata ? '{}')", escape_field(field))
+            }
+            
+            Self::Contains { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(format!("%{}%", value));
+                format!("metadata->>'{}' ILIKE ${}", escape_field(field), param_idx)
+            }
+            
+            Self::StartsWith { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(format!("{}%", value));
+                format!("metadata->>'{}' LIKE ${}", escape_field(field), param_idx)
+            }
+            
+            Self::EndsWith { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(format!("%{}", value));
+                format!("metadata->>'{}' LIKE ${}", escape_field(field), param_idx)
+            }
+            
+            Self::InArray { field, value } => {
+                let param_idx = param_offset + params.len() + 1;
+                params.push(value.clone());
+                format!("metadata->'{}' ? ${}", escape_field(field), param_idx)
+            }
+            
+            Self::In { field, values } => {
+                if values.is_empty() {
+                    return "FALSE".to_string();
+                }
+                let placeholders: Vec<String> = values.iter().enumerate().map(|(i, v)| {
+                    let param_idx = param_offset + params.len() + 1 + i;
+                    format!("${}", param_idx)
+                }).collect();
+                for v in values {
+                    params.push(json_value_to_string(v));
+                }
+                format!("metadata->>'{}' IN ({})", escape_field(field), placeholders.join(", "))
+            }
+            
+            Self::NotIn { field, values } => {
+                if values.is_empty() {
+                    return "TRUE".to_string();
+                }
+                let placeholders: Vec<String> = values.iter().enumerate().map(|(i, _)| {
+                    let param_idx = param_offset + params.len() + 1 + i;
+                    format!("${}", param_idx)
+                }).collect();
+                for v in values {
+                    params.push(json_value_to_string(v));
+                }
+                format!("metadata->>'{}' NOT IN ({})", escape_field(field), placeholders.join(", "))
+            }
+            
+            Self::JsonPath { path } => {
+                format!("metadata @? '{}'", path.replace('\'', "''"))
+            }
+            
+            Self::And { filters } => {
+                if filters.is_empty() {
+                    return "TRUE".to_string();
+                }
+                let parts: Vec<String> = filters.iter().map(|f| {
+                    f.to_sql_inner(param_offset + params.len(), params)
+                }).collect();
+                format!("({})", parts.join(" AND "))
+            }
+            
+            Self::Or { filters } => {
+                if filters.is_empty() {
+                    return "FALSE".to_string();
+                }
+                let parts: Vec<String> = filters.iter().map(|f| {
+                    f.to_sql_inner(param_offset + params.len(), params)
+                }).collect();
+                format!("({})", parts.join(" OR "))
+            }
+            
+            Self::Not { filter } => {
+                let inner = filter.to_sql_inner(param_offset + params.len(), params);
+                format!("NOT ({})", inner)
+            }
+        }
+    }
+    
+    /// Parse a filter from a simple string syntax
+    /// 
+    /// Supported formats:
+    /// - `field=value` - equality
+    /// - `field!=value` - not equal
+    /// - `field>value` - greater than
+    /// - `field>=value` - greater than or equal
+    /// - `field<value` - less than
+    /// - `field<=value` - less than or equal
+    /// - `field~value` - contains (case-insensitive)
+    /// - `field^value` - starts with
+    /// - `field$value` - ends with
+    /// - `field?` - exists
+    /// - `!field?` - not exists
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        
+        // Check for exists/not exists
+        if s.ends_with('?') {
+            if s.starts_with('!') {
+                return Ok(Self::not_exists(&s[1..s.len()-1]));
+            }
+            return Ok(Self::exists(&s[..s.len()-1]));
+        }
+        
+        // Try to find operator
+        let operators = [">=", "<=", "!=", "=", ">", "<", "~", "^", "$"];
+        
+        for op in &operators {
+            if let Some(pos) = s.find(op) {
+                let field = s[..pos].trim();
+                let value = s[pos + op.len()..].trim();
+                
+                // Try to parse as number first, then as string
+                let json_value: serde_json::Value = if let Ok(n) = value.parse::<i64>() {
+                    serde_json::Value::Number(n.into())
+                } else if let Ok(n) = value.parse::<f64>() {
+                    serde_json::Number::from_f64(n)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or_else(|| serde_json::Value::String(value.to_string()))
+                } else if value == "true" {
+                    serde_json::Value::Bool(true)
+                } else if value == "false" {
+                    serde_json::Value::Bool(false)
+                } else if value == "null" {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(value.to_string())
+                };
+                
+                return Ok(match *op {
+                    "=" => Self::eq(field, json_value),
+                    "!=" => Self::ne(field, json_value),
+                    ">" => Self::gt(field, json_value),
+                    ">=" => Self::gte(field, json_value),
+                    "<" => Self::lt(field, json_value),
+                    "<=" => Self::lte(field, json_value),
+                    "~" => Self::contains(field, value),
+                    "^" => Self::starts_with(field, value),
+                    "$" => Self::ends_with(field, value),
+                    _ => unreachable!(),
+                });
+            }
+        }
+        
+        Err(format!("Invalid filter syntax: {}", s))
+    }
+    
+    /// Parse multiple filters from a string, combining with AND
+    /// 
+    /// Filters are separated by `;` or newlines
+    pub fn parse_many(s: &str) -> Result<Self, String> {
+        let filters: Result<Vec<_>, _> = s
+            .split(|c| c == ';' || c == '\n')
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(Self::parse)
+            .collect();
+        
+        let filters = filters?;
+        
+        if filters.is_empty() {
+            return Err("No filters provided".to_string());
+        }
+        
+        if filters.len() == 1 {
+            Ok(filters.into_iter().next().unwrap())
+        } else {
+            Ok(Self::and(filters))
+        }
+    }
+}
+
+/// Escape a field name for safe use in SQL
+fn escape_field(field: &str) -> String {
+    field.replace('\'', "''").replace('"', "\"\"")
+}
+
+/// Convert a JSON value to a string for use as a SQL parameter
+fn json_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        _ => value.to_string(),
+    }
+}
+
 /// A document with its embedding stored in the vector database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -159,6 +582,33 @@ impl RagStore {
     
     /// Search for similar documents using vector similarity
     pub async fn search(&self, query_embedding: &[f32], limit: Option<usize>) -> RagResult<Vec<Document>> {
+        self.search_with_filter(query_embedding, limit, None).await
+    }
+    
+    /// Search for similar documents with metadata filtering
+    /// 
+    /// # Example
+    /// 
+    /// ```rust,ignore
+    /// use llama_gguf::rag::{RagStore, MetadataFilter};
+    /// 
+    /// // Search with a simple filter
+    /// let filter = MetadataFilter::eq("type", "documentation");
+    /// let results = store.search_with_filter(&embedding, Some(10), Some(filter)).await?;
+    /// 
+    /// // Search with multiple filters
+    /// let filter = MetadataFilter::and(vec![
+    ///     MetadataFilter::eq("source", "docs"),
+    ///     MetadataFilter::gte("version", 2),
+    /// ]);
+    /// let results = store.search_with_filter(&embedding, Some(5), Some(filter)).await?;
+    /// ```
+    pub async fn search_with_filter(
+        &self,
+        query_embedding: &[f32],
+        limit: Option<usize>,
+        filter: Option<MetadataFilter>,
+    ) -> RagResult<Vec<Document>> {
         if query_embedding.len() != self.config.embedding_dim() {
             return Err(RagError::DimensionMismatch {
                 expected: self.config.embedding_dim(),
@@ -182,21 +632,38 @@ impl RagStore {
         
         let min_sim = self.config.min_similarity();
         
+        // Build the WHERE clause
+        let (filter_clause, filter_params) = if let Some(f) = filter {
+            let (sql, params) = f.to_sql(3); // Start after $1 (embedding), $2 (min_sim), $3 (limit)
+            (format!(" AND {}", sql), params)
+        } else {
+            (String::new(), Vec::new())
+        };
+        
         let query = format!(
             r#"
             SELECT id, content, metadata, {} as score
             FROM {}
-            WHERE {} >= $2
+            WHERE {} >= $2{}
             ORDER BY embedding {} $1
             LIMIT $3
             "#,
             score_expr,
             self.config.table_name(),
             score_expr,
+            filter_clause,
             operator
         );
         
-        let rows = client.query(&query, &[&embedding, &min_sim, &limit]).await
+        // Build params dynamically
+        use tokio_postgres::types::ToSql;
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&embedding, &min_sim, &limit];
+        let filter_param_refs: Vec<&str> = filter_params.iter().map(|s| s.as_str()).collect();
+        for p in &filter_param_refs {
+            params.push(p);
+        }
+        
+        let rows = client.query(&query, &params).await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
         
         let docs = rows.iter().map(|row| {
@@ -209,6 +676,81 @@ impl RagStore {
         }).collect();
         
         Ok(docs)
+    }
+    
+    /// Count documents matching a filter
+    pub async fn count_with_filter(&self, filter: Option<MetadataFilter>) -> RagResult<i64> {
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+        
+        let (filter_clause, filter_params) = if let Some(f) = filter {
+            let (sql, params) = f.to_sql(0);
+            (format!(" WHERE {}", sql), params)
+        } else {
+            (String::new(), Vec::new())
+        };
+        
+        let query = format!(
+            "SELECT COUNT(*) FROM {}{}",
+            self.config.table_name(),
+            filter_clause
+        );
+        
+        use tokio_postgres::types::ToSql;
+        let filter_param_refs: Vec<&str> = filter_params.iter().map(|s| s.as_str()).collect();
+        let params: Vec<&(dyn ToSql + Sync)> = filter_param_refs.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        
+        let row = client.query_one(&query, &params).await
+            .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+        
+        Ok(row.get(0))
+    }
+    
+    /// Delete documents matching a filter
+    pub async fn delete_with_filter(&self, filter: MetadataFilter) -> RagResult<u64> {
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+        
+        let (filter_sql, filter_params) = filter.to_sql(0);
+        
+        let query = format!(
+            "DELETE FROM {} WHERE {}",
+            self.config.table_name(),
+            filter_sql
+        );
+        
+        use tokio_postgres::types::ToSql;
+        let filter_param_refs: Vec<&str> = filter_params.iter().map(|s| s.as_str()).collect();
+        let params: Vec<&(dyn ToSql + Sync)> = filter_param_refs.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        
+        let affected = client.execute(&query, &params).await
+            .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+        
+        Ok(affected)
+    }
+    
+    /// List unique values for a metadata field
+    pub async fn list_metadata_values(&self, field: &str, limit: Option<usize>) -> RagResult<Vec<String>> {
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+        
+        let limit = limit.unwrap_or(100) as i64;
+        
+        let query = format!(
+            "SELECT DISTINCT metadata->>'{}' as val FROM {} WHERE metadata ? '{}' ORDER BY val LIMIT $1",
+            escape_field(field),
+            self.config.table_name(),
+            escape_field(field)
+        );
+        
+        let rows = client.query(&query, &[&limit]).await
+            .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+        
+        let values = rows.iter()
+            .filter_map(|row| row.get::<_, Option<String>>(0))
+            .collect();
+        
+        Ok(values)
     }
     
     /// Get a document by ID

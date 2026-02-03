@@ -274,6 +274,59 @@ enum RagAction {
         /// Number of results (overrides config file)
         #[arg(short, long)]
         limit: Option<usize>,
+
+        /// Metadata filters (can be specified multiple times)
+        /// Format: field=value, field!=value, field>value, field>=value,
+        ///         field<value, field<=value, field~value (contains),
+        ///         field^value (starts with), field$value (ends with),
+        ///         field? (exists), !field? (not exists)
+        #[arg(short = 'f', long = "filter", value_name = "FILTER")]
+        filters: Vec<String>,
+    },
+
+    /// List unique values for a metadata field
+    ListValues {
+        /// Metadata field to list values for
+        field: String,
+
+        /// Path to TOML config file
+        #[arg(short, long)]
+        config: Option<String>,
+
+        /// PostgreSQL connection string (overrides config file)
+        #[arg(long, env = "RAG_DATABASE_URL")]
+        database_url: Option<String>,
+
+        /// Embeddings table name (overrides config file)
+        #[arg(long)]
+        table: Option<String>,
+
+        /// Maximum values to return
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Delete documents matching a filter
+    Delete {
+        /// Path to TOML config file
+        #[arg(short, long)]
+        config: Option<String>,
+
+        /// PostgreSQL connection string (overrides config file)
+        #[arg(long, env = "RAG_DATABASE_URL")]
+        database_url: Option<String>,
+
+        /// Embeddings table name (overrides config file)
+        #[arg(long)]
+        table: Option<String>,
+
+        /// Metadata filters (required, can be specified multiple times)
+        #[arg(short = 'f', long = "filter", value_name = "FILTER", required = true)]
+        filters: Vec<String>,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show RAG database statistics
@@ -1571,8 +1624,10 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
             })?;
         }
         
-        RagAction::Search { query, config, database_url, table, limit } => {
+        RagAction::Search { query, config, database_url, table, limit, filters } => {
             rt.block_on(async {
+                use llama_gguf::rag::MetadataFilter;
+                
                 // Load config
                 let mut cfg = RagConfig::load(config.as_deref())?;
                 
@@ -1587,7 +1642,29 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                     cfg.search.max_results = l;
                 }
                 
+                // Parse filters
+                let filter = if filters.is_empty() {
+                    None
+                } else {
+                    let parsed: Result<Vec<MetadataFilter>, _> = filters
+                        .iter()
+                        .map(|f| MetadataFilter::parse(f))
+                        .collect();
+                    
+                    match parsed {
+                        Ok(fs) if fs.len() == 1 => Some(fs.into_iter().next().unwrap()),
+                        Ok(fs) => Some(MetadataFilter::and(fs)),
+                        Err(e) => {
+                            eprintln!("Error parsing filter: {}", e);
+                            return Err(e.into());
+                        }
+                    }
+                };
+                
                 println!("Searching for: \"{}\"", query);
+                if !filters.is_empty() {
+                    println!("Filters: {:?}", filters);
+                }
                 println!();
                 
                 let store = RagStore::connect(cfg).await?;
@@ -1595,7 +1672,7 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 // Generate query embedding (placeholder)
                 let query_embedding = vec![0.0f32; store.config().embedding_dim()];
                 
-                let results = store.search(&query_embedding, limit).await?;
+                let results = store.search_with_filter(&query_embedding, limit, filter).await?;
                 
                 if results.is_empty() {
                     println!("No results found.");
@@ -1608,9 +1685,7 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                         
                         println!("{}. [{}] {}", i + 1, score, preview);
                         if let Some(meta) = &doc.metadata {
-                            if let Some(source) = meta.get("source") {
-                                println!("   Source: {}", source);
-                            }
+                            println!("   Metadata: {}", serde_json::to_string_pretty(meta).unwrap_or_default());
                         }
                         println!();
                     }
@@ -1626,6 +1701,99 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                         println!("... (truncated)");
                     }
                 }
+                
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
+        
+        RagAction::ListValues { field, config, database_url, table, limit } => {
+            rt.block_on(async {
+                // Load config
+                let mut cfg = RagConfig::load(config.as_deref())?;
+                
+                if let Some(url) = database_url {
+                    cfg.database.connection_string = url;
+                }
+                if let Some(t) = table {
+                    cfg.embeddings.table_name = t;
+                }
+                
+                let store = RagStore::connect(cfg).await?;
+                let values = store.list_metadata_values(&field, Some(limit)).await?;
+                
+                println!("Unique values for '{}':", field);
+                println!("{}", "-".repeat(40));
+                
+                if values.is_empty() {
+                    println!("(no values found)");
+                } else {
+                    for value in &values {
+                        println!("  {}", value);
+                    }
+                    println!("\nTotal: {} unique values", values.len());
+                }
+                
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
+        
+        RagAction::Delete { config, database_url, table, filters, force } => {
+            rt.block_on(async {
+                use llama_gguf::rag::MetadataFilter;
+                
+                // Load config
+                let mut cfg = RagConfig::load(config.as_deref())?;
+                
+                if let Some(url) = database_url {
+                    cfg.database.connection_string = url;
+                }
+                if let Some(t) = table {
+                    cfg.embeddings.table_name = t;
+                }
+                
+                // Parse filters
+                let parsed: Result<Vec<MetadataFilter>, _> = filters
+                    .iter()
+                    .map(|f| MetadataFilter::parse(f))
+                    .collect();
+                
+                let filter = match parsed {
+                    Ok(fs) if fs.len() == 1 => fs.into_iter().next().unwrap(),
+                    Ok(fs) => MetadataFilter::and(fs),
+                    Err(e) => {
+                        eprintln!("Error parsing filter: {}", e);
+                        return Err(e.into());
+                    }
+                };
+                
+                let store = RagStore::connect(cfg).await?;
+                
+                // Count documents to be deleted
+                let count = store.count_with_filter(Some(filter.clone())).await?;
+                
+                if count == 0 {
+                    println!("No documents match the filter.");
+                    return Ok(());
+                }
+                
+                println!("Documents matching filter: {}", count);
+                
+                if !force {
+                    print!("Delete {} documents? [y/N] ", count);
+                    use std::io::{self, Write};
+                    io::stdout().flush()?;
+                    
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+                
+                let deleted = store.delete_with_filter(filter).await?;
+                println!("Deleted {} documents.", deleted);
                 
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
