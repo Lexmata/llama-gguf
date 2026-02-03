@@ -1,1 +1,58 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model files (large binaries)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+models/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+ENV/
+
+# Debug/test output files
+scripts/*.json
+!scripts/python_states.json
+!scripts/rust_states.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+
+# Benchmark output
+criterion/
+
+# OS files
+Thumbs.db
+.Spotlight-V100
+.Trashes
