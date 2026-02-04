@@ -189,6 +189,11 @@ impl Sampler {
         let logits_data = logits.as_f32().expect("Logits must be F32");
         let vocab_size = logits_data.len();
 
+        // Debug: show top 5 tokens before sampling
+        // let mut top5: Vec<(usize, f32)> = logits_data.iter().cloned().enumerate().collect();
+        // top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // eprintln!("Top 5 logits: {:?}", &top5[..5.min(top5.len())]);
+
         // Copy logits to work with
         let mut probs: Vec<f32> = logits_data.to_vec();
 

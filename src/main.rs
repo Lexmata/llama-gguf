@@ -792,15 +792,45 @@ fn run_inference(
     let mut sampler = Sampler::new(sampler_config, config.vocab_size);
 
     // Encode prompt
-    let prompt_text = prompt.unwrap_or("Hello");
+    let raw_prompt = prompt.unwrap_or("Hello");
+
+    // Check if model has chat template tokens and wrap prompt if needed
+    let prompt_text = if let Some(chat_template) = gguf.data.get_string("tokenizer.chat_template") {
+        // Model has a chat template - check if prompt already has chat tokens
+        if raw_prompt.contains("<|user|>") || raw_prompt.contains("<|im_start|>") || raw_prompt.contains("[INST]") {
+            // Prompt already has chat format
+            raw_prompt.to_string()
+        } else if chat_template.contains("<|user|>") {
+            // Use <|user|>/<|assistant|> format (matches llama.cpp behavior)
+            format!("<|user|>\n{}<|assistant|>\n", raw_prompt)
+        } else if chat_template.contains("<|im_start|>") {
+            // Use ChatML format (Qwen2, etc.)
+            format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", raw_prompt)
+        } else if chat_template.contains("[INST]") {
+            // Use Llama-2 format
+            format!("[INST] {} [/INST]", raw_prompt)
+        } else {
+            // Unknown template, use raw prompt
+            raw_prompt.to_string()
+        }
+    } else {
+        // No chat template, use raw prompt
+        raw_prompt.to_string()
+    };
 
     // Check if we should add BOS token (some models like Qwen2 don't want BOS)
     let add_bos = gguf.data.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(true);
     
-    let mut tokens = tokenizer.encode(prompt_text, add_bos)?;
+    let mut tokens = tokenizer.encode(&prompt_text, add_bos)?;
 
-    // Print prompt
-    print!("{}", prompt_text);
+    // Debug: show encoded tokens and decoded representation (uncomment to debug)
+    // eprintln!("Encoded {} tokens: {:?}", tokens.len(), &tokens[..tokens.len().min(50)]);
+    // if let Ok(decoded) = tokenizer.decode(&tokens) {
+    //     eprintln!("Decoded prompt: {:?}", decoded);
+    // }
+
+    // Print the original prompt (not the wrapped version)
+    print!("{}", raw_prompt);
     io::stdout().flush()?;
 
     // Generation loop

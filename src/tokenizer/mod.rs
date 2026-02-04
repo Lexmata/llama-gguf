@@ -270,7 +270,7 @@ impl Tokenizer {
         }
     }
 
-    /// Encode text to token IDs using BPE
+    /// Encode text to token IDs
     pub fn encode(&self, text: &str, add_bos: bool) -> TokenizerResult<Vec<u32>> {
         let mut tokens = Vec::new();
 
@@ -278,15 +278,89 @@ impl Tokenizer {
             tokens.push(self.special_tokens.bos_token_id);
         }
 
-        // Use BPE encoding if merges are available
+        // Use BPE encoding if merges are available, otherwise use SentencePiece greedy
         if !self.merges.is_empty() {
             tokens.extend(self.encode_bpe(text)?);
         } else {
-            // Fallback to character/byte level encoding
-            tokens.extend(self.encode_fallback(text)?);
+            // SentencePiece uses greedy longest-match algorithm
+            tokens.extend(self.encode_sentencepiece(text)?);
         }
 
         Ok(tokens)
+    }
+
+    /// SentencePiece encoding using greedy longest-match algorithm
+    fn encode_sentencepiece(&self, text: &str) -> TokenizerResult<Vec<u32>> {
+        let mut result = Vec::new();
+        
+        // Add space prefix for LLaMA-style tokenizers
+        let text_with_prefix = format!(" {}", text);
+        let chars: Vec<char> = text_with_prefix.chars().collect();
+        let mut pos = 0;
+        
+        while pos < chars.len() {
+            let mut best_len = 0;
+            let mut best_id = None;
+            
+            // Try to find the longest matching token starting at current position
+            // Try lengths from longest to shortest for efficiency
+            for end in (pos + 1..=chars.len()).rev() {
+                let substr: String = chars[pos..end].iter().collect();
+                
+                // Try with SentencePiece space marker
+                let spm_str = substr.replace(' ', "▁");
+                if let Some(&id) = self.token_to_id.get(&spm_str) {
+                    best_len = end - pos;
+                    best_id = Some(id);
+                    break; // Found longest match
+                }
+                
+                // Try original string
+                if let Some(&id) = self.token_to_id.get(&substr) {
+                    best_len = end - pos;
+                    best_id = Some(id);
+                    break; // Found longest match
+                }
+            }
+            
+            if let Some(id) = best_id {
+                result.push(id);
+                pos += best_len;
+            } else {
+                // Fallback: try single character with byte fallback
+                let ch = chars[pos];
+                let ch_str = ch.to_string();
+                
+                // Try as SentencePiece space
+                if ch == ' ' {
+                    if let Some(&id) = self.token_to_id.get("▁") {
+                        result.push(id);
+                        pos += 1;
+                        continue;
+                    }
+                }
+                
+                // Try as regular character
+                if let Some(&id) = self.token_to_id.get(&ch_str) {
+                    result.push(id);
+                    pos += 1;
+                    continue;
+                }
+                
+                // Byte-level fallback
+                for byte in ch_str.as_bytes() {
+                    let byte_token = format!("<0x{:02X}>", byte);
+                    if let Some(&id) = self.token_to_id.get(&byte_token) {
+                        result.push(id);
+                    } else if let Some(unk_id) = self.special_tokens.unk_token_id {
+                        result.push(unk_id);
+                    }
+                }
+                pos += 1;
+            }
+        }
+        
+        Ok(result)
     }
 
     /// BPE encoding algorithm
@@ -410,7 +484,8 @@ impl Tokenizer {
         Ok(tokens)
     }
 
-    /// Fallback encoding (character/byte level)
+    /// Fallback encoding (character/byte level) - kept for potential future use
+    #[allow(dead_code)]
     fn encode_fallback(&self, text: &str) -> TokenizerResult<Vec<u32>> {
         let mut tokens = Vec::new();
 
@@ -482,6 +557,9 @@ impl Tokenizer {
                 .replace("Ċ", "\n")  // GPT-2 style newline
                 .replace("ĉ", "\t"); // GPT-2 style tab
 
+            // Debug: uncomment to see token decoding
+            // eprintln!("Token {}: '{}' -> '{}' bytes:{:?}", token_id, token_str, decoded, token_str.as_bytes());
+            
             text.push_str(&decoded);
         }
 
