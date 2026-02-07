@@ -58,7 +58,11 @@ pub enum EngineError {
 // ============================================================================
 
 /// Configuration for creating an [`Engine`].
-#[derive(Debug, Clone)]
+///
+/// Can be constructed manually, from a [`Config`](crate::config::Config) TOML file,
+/// or with [`Default::default()`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EngineConfig {
     /// Path to the GGUF model file.
     pub model_path: String,
@@ -97,6 +101,30 @@ impl Default for EngineConfig {
             seed: None,
             use_gpu: false,
         }
+    }
+}
+
+impl EngineConfig {
+    /// Load an `EngineConfig` from a [`Config`](crate::config::Config) TOML file.
+    ///
+    /// This is a convenience method that loads the full config and extracts
+    /// the engine-relevant sections.
+    pub fn from_config_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::config::ConfigError> {
+        let config = crate::config::Config::from_file(path)?;
+        Ok(config.to_engine_config(None))
+    }
+
+    /// Load an `EngineConfig` using the full config precedence chain.
+    ///
+    /// Searches default config file locations, then applies environment
+    /// variable overrides.
+    pub fn from_config(
+        config_path: Option<impl AsRef<std::path::Path>>,
+    ) -> Result<Self, crate::config::ConfigError> {
+        let config = crate::config::Config::load(config_path)?;
+        Ok(config.to_engine_config(None))
     }
 }
 

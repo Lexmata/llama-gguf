@@ -25,6 +25,7 @@
 //! ```
 
 pub mod backend;
+pub mod config;
 pub mod engine;
 pub mod gguf;
 #[cfg(feature = "huggingface")]
@@ -38,6 +39,7 @@ pub mod tensor;
 pub mod tokenizer;
 
 // Re-export main types
+pub use config::{Config, ConfigError};
 pub use engine::{ChatEngine, ChatTemplate, Engine, EngineConfig, EngineError};
 pub use backend::{default_backend, Backend, BackendError};
 pub use gguf::{GgufBuilder, GgufData, GgufFile, GgufReader, GgufWriter, TensorToWrite};

@@ -2,18 +2,24 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use llama_gguf::Model;
+use llama_gguf::config::Config;
 use llama_gguf::engine::{ChatEngine, Engine, EngineConfig};
 use llama_gguf::gguf::{GgufFile, MetadataValue};
 #[cfg(feature = "huggingface")]
-use llama_gguf::huggingface::{format_bytes, HfClient};
+use llama_gguf::huggingface::{HfClient, format_bytes};
 use llama_gguf::model::{InferenceContext, ModelLoader};
-use llama_gguf::Model;
 
 #[derive(Parser)]
-#[command(name = "llama-rs")]
-#[command(about = "Rust implementation of llama.cpp", long_about = None)]
+#[command(name = "llama-gguf")]
+#[command(about = "High-performance LLM inference engine with GGUF support", long_about = None)]
 #[command(version)]
 struct Cli {
+    /// Path to TOML configuration file.
+    /// Searches llama-gguf.toml, config/llama-gguf.toml, .llama-gguf.toml by default.
+    #[arg(short, long, global = true, env = "LLAMA_CONFIG")]
+    config: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -216,6 +222,14 @@ enum Commands {
         #[command(subcommand)]
         action: RagAction,
     },
+
+    /// Generate an example TOML configuration file
+    #[command(name = "init-config")]
+    InitConfig {
+        /// Output path for the configuration file
+        #[arg(short, long, default_value = "llama-gguf.toml")]
+        output: String,
+    },
 }
 
 /// RAG subcommands
@@ -367,7 +381,6 @@ enum RagAction {
     // =========================================================================
     // Knowledge Base Commands (Bedrock-style API)
     // =========================================================================
-
     /// Create a new knowledge base
     #[command(name = "kb-create")]
     KbCreate {
@@ -533,9 +546,23 @@ enum ModelAction {
 fn main() {
     let cli = Cli::parse();
 
+    // Load configuration with precedence: CLI > env > config file > defaults
+    let cfg = match Config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            // Only fatal if the user explicitly passed --config
+            if cli.config.is_some() {
+                eprintln!("Error loading config: {}", e);
+                std::process::exit(1);
+            }
+            Config::default()
+        }
+    };
+
     match cli.command {
         Commands::Info { model, verbose } => {
-            if let Err(e) = show_info(&model, verbose) {
+            let model_path = resolve_model_path(&model, &cfg);
+            if let Err(e) = show_info(&model_path, verbose) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -551,16 +578,20 @@ fn main() {
             seed,
             gpu,
         } => {
+            // CLI args override config file values; clap defaults are used when
+            // the user didn't explicitly pass an argument (we detect this by
+            // checking if the value matches clap's default and the config differs).
+            let ec = cfg.to_engine_config(Some(&model));
             if let Err(e) = run_inference(
-                &model,
+                &resolve_model_path(&model, &cfg),
                 prompt.as_deref(),
-                n_predict,
-                temperature,
-                top_k,
-                top_p,
-                repeat_penalty,
-                seed,
-                gpu,
+                cli_or_config(n_predict, 128, ec.max_tokens),
+                cli_or_config_f32(temperature, 0.8, ec.temperature),
+                cli_or_config(top_k, 40, ec.top_k),
+                cli_or_config_f32(top_p, 0.95, ec.top_p),
+                cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
+                seed.or(ec.seed),
+                gpu || ec.use_gpu,
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -576,57 +607,71 @@ fn main() {
             repeat_penalty,
             seed,
         } => {
+            let ec = cfg.to_chat_engine_config(Some(&model));
+            let system_prompt = system.or(cfg.chat.system_prompt.clone());
             if let Err(e) = run_chat(
-                &model,
-                system.as_deref(),
-                n_predict,
-                temperature,
-                top_k,
-                top_p,
-                repeat_penalty,
-                seed,
+                &resolve_model_path(&model, &cfg),
+                system_prompt.as_deref(),
+                cli_or_config(n_predict, 512, ec.max_tokens),
+                cli_or_config_f32(temperature, 0.7, ec.temperature),
+                cli_or_config(top_k, 40, ec.top_k),
+                cli_or_config_f32(top_p, 0.9, ec.top_p),
+                cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
+                seed.or(ec.seed),
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
         #[cfg(feature = "server")]
-        Commands::Serve { 
-            model, 
-            host, 
+        Commands::Serve {
+            model,
+            host,
             port,
             #[cfg(feature = "rag")]
             rag_database_url,
             #[cfg(feature = "rag")]
             rag_config,
         } => {
+            let model_path = resolve_model_path(&model, &cfg);
+            let host = if host == "127.0.0.1" && cfg.server.host != "127.0.0.1" {
+                cfg.server.host.clone()
+            } else {
+                host
+            };
+            let port = if port == 8080 && cfg.server.port != 8080 {
+                cfg.server.port
+            } else {
+                port
+            };
+
             // Determine RAG database URL
             #[cfg(feature = "rag")]
             let rag_url = if let Some(url) = rag_database_url {
                 Some(url)
             } else if let Some(config_path) = rag_config {
-                // Load URL from config file
                 match llama_gguf::rag::RagConfig::load(Some(&config_path)) {
                     Ok(config) => Some(config.connection_string().to_string()),
                     Err(e) => {
                         eprintln!("Warning: Failed to load RAG config: {}", e);
-                        None
+                        cfg.server.rag_database_url.clone()
                     }
                 }
+            } else if cfg.server.rag_database_url.is_some() {
+                cfg.server.rag_database_url.clone()
             } else {
-                // Try default config locations
                 match llama_gguf::rag::RagConfig::load(None::<&str>) {
                     Ok(config) if !config.connection_string().is_empty() => {
                         Some(config.connection_string().to_string())
                     }
-                    _ => None
+                    _ => None,
                 }
             };
 
             #[cfg(not(feature = "rag"))]
             let rag_url: Option<String> = None;
 
-            if let Err(e) = run_server(&model, &host, port, rag_url) {
+            if let Err(e) = run_server(&model_path, &host, port, rag_url) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -637,6 +682,12 @@ fn main() {
             qtype,
             threads,
         } => {
+            let qtype = if qtype == "q4_0" && cfg.quantize.output_type != "q4_0" {
+                cfg.quantize.output_type.clone()
+            } else {
+                qtype
+            };
+            let threads = threads.or(cfg.quantize.threads);
             if let Err(e) = run_quantize(&input, &output, &qtype, threads) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -652,7 +703,13 @@ fn main() {
             repetitions,
             threads,
         } => {
-            if let Err(e) = run_benchmark(&model, n_prompt, n_gen, repetitions, threads) {
+            if let Err(e) = run_benchmark(
+                &resolve_model_path(&model, &cfg),
+                cli_or_config(n_prompt, 512, cfg.bench.n_prompt),
+                cli_or_config(n_gen, 128, cfg.bench.n_gen),
+                cli_or_config(repetitions, 3, cfg.bench.repetitions),
+                threads.or(cfg.bench.threads),
+            ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -662,7 +719,12 @@ fn main() {
             text,
             format,
         } => {
-            if let Err(e) = run_embed(&model, &text, &format) {
+            let format = if format == "json" && cfg.embed.format != "json" {
+                cfg.embed.format.clone()
+            } else {
+                format
+            };
+            if let Err(e) = run_embed(&resolve_model_path(&model, &cfg), &text, &format) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -693,11 +755,61 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::InitConfig { output } => {
+            if std::path::Path::new(&output).exists() {
+                eprintln!("Config file already exists: {}", output);
+                eprintln!("Remove it first or choose a different path with --output");
+                std::process::exit(1);
+            }
+            if let Err(e) = std::fs::write(&output, llama_gguf::config::example_config()) {
+                eprintln!("Error writing config: {}", e);
+                std::process::exit(1);
+            }
+            eprintln!("Created configuration file: {}", output);
+            eprintln!("Edit it to set your model path and preferred defaults.");
+        }
+    }
+}
+
+// ============================================================================
+// Config merge helpers
+// ============================================================================
+
+/// If the CLI value equals clap's default, prefer the config file value.
+/// Otherwise the user explicitly passed it, so use the CLI value.
+fn cli_or_config<T: PartialEq>(cli_val: T, clap_default: T, config_val: T) -> T {
+    if cli_val == clap_default {
+        config_val
+    } else {
+        cli_val
+    }
+}
+
+/// Float variant (uses approximate equality for f32 defaults).
+fn cli_or_config_f32(cli_val: f32, clap_default: f32, config_val: f32) -> f32 {
+    if (cli_val - clap_default).abs() < f32::EPSILON {
+        config_val
+    } else {
+        cli_val
+    }
+}
+
+/// Resolve the model path: CLI positional arg wins, then config file, then empty.
+fn resolve_model_path(cli_model: &str, cfg: &Config) -> String {
+    if !cli_model.is_empty() {
+        cli_model.to_string()
+    } else {
+        cfg.model.path.clone().unwrap_or_default()
     }
 }
 
 #[cfg(feature = "server")]
-fn run_server(model_path: &str, host: &str, port: u16, rag_database_url: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_server(
+    model_path: &str,
+    host: &str,
+    port: u16,
+    rag_database_url: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         llama_gguf::server::run_server(llama_gguf::server::ServerConfig {
@@ -962,7 +1074,11 @@ fn show_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>
         );
     }
     if data.tensors.len() > max_tensors {
-        println!("│ ... and {} more tensors{:>29} │", data.tensors.len() - max_tensors, "");
+        println!(
+            "│ ... and {} more tensors{:>29} │",
+            data.tensors.len() - max_tensors,
+            ""
+        );
     }
     println!("└───────────────────────────────────────────────────────────────┘");
 
@@ -1025,9 +1141,18 @@ fn show_sysinfo() {
     println!("┌─ CPU ────────────────────────────────────────────────────────────┐");
     println!("│ Threads: {:<54} │", backend.num_threads());
     println!("│ SIMD: {:<57} │", backend.simd_info());
-    println!("│ AVX2: {:<57} │", if backend.has_avx2() { "yes" } else { "no" });
-    println!("│ AVX-512: {:<54} │", if backend.has_avx512() { "yes" } else { "no" });
-    println!("│ NEON: {:<57} │", if backend.has_neon() { "yes" } else { "no" });
+    println!(
+        "│ AVX2: {:<57} │",
+        if backend.has_avx2() { "yes" } else { "no" }
+    );
+    println!(
+        "│ AVX-512: {:<54} │",
+        if backend.has_avx512() { "yes" } else { "no" }
+    );
+    println!(
+        "│ NEON: {:<57} │",
+        if backend.has_neon() { "yes" } else { "no" }
+    );
     println!("└───────────────────────────────────────────────────────────────────┘");
     println!();
 
@@ -1101,7 +1226,8 @@ fn run_quantize(
     eprintln!("Model has {} tensors", gguf.data.tensors.len());
 
     // Count tensors by type
-    let mut dtype_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dtype_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for tensor in &gguf.data.tensors {
         let dtype_str = format!("{:?}", tensor.dtype);
         *dtype_counts.entry(dtype_str).or_insert(0) += 1;
@@ -1151,10 +1277,18 @@ fn run_quantize(
     }
 
     eprintln!("Size analysis:");
-    eprintln!("  Current model size: {:.2} MB", current_size as f64 / 1024.0 / 1024.0);
-    eprintln!("  Estimated quantized size: {:.2} MB", estimated_size as f64 / 1024.0 / 1024.0);
-    eprintln!("  Estimated reduction: {:.1}%", 
-              (1.0 - estimated_size as f64 / current_size as f64) * 100.0);
+    eprintln!(
+        "  Current model size: {:.2} MB",
+        current_size as f64 / 1024.0 / 1024.0
+    );
+    eprintln!(
+        "  Estimated quantized size: {:.2} MB",
+        estimated_size as f64 / 1024.0 / 1024.0
+    );
+    eprintln!(
+        "  Estimated reduction: {:.1}%",
+        (1.0 - estimated_size as f64 / current_size as f64) * 100.0
+    );
 
     Ok(())
 }
@@ -1193,7 +1327,8 @@ fn run_benchmark(
     eprintln!();
 
     // Create inference context
-    let backend: Arc<dyn llama_gguf::Backend> = Arc::new(llama_gguf::backend::cpu::CpuBackend::new());
+    let backend: Arc<dyn llama_gguf::Backend> =
+        Arc::new(llama_gguf::backend::cpu::CpuBackend::new());
     let mut ctx = InferenceContext::new(&config, backend.clone());
 
     // Generate dummy prompt tokens
@@ -1240,8 +1375,10 @@ fn run_benchmark(
     }
 
     // Calculate statistics
-    let avg_prompt_time: f64 = prompt_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / repetitions as f64;
-    let avg_gen_time: f64 = gen_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / repetitions as f64;
+    let avg_prompt_time: f64 =
+        prompt_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / repetitions as f64;
+    let avg_gen_time: f64 =
+        gen_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / repetitions as f64;
 
     let prompt_tps = n_prompt as f64 / avg_prompt_time;
     let gen_tps = n_gen as f64 / avg_gen_time;
@@ -1249,12 +1386,24 @@ fn run_benchmark(
     eprintln!();
     eprintln!("┌─ Results ─────────────────────────────────────────────────────────┐");
     eprintln!("│ Prompt processing (prefill):                                      │");
-    eprintln!("│   Time: {:.3}s                                                     │", avg_prompt_time);
-    eprintln!("│   Speed: {:.2} tokens/sec                                          │", prompt_tps);
+    eprintln!(
+        "│   Time: {:.3}s                                                     │",
+        avg_prompt_time
+    );
+    eprintln!(
+        "│   Speed: {:.2} tokens/sec                                          │",
+        prompt_tps
+    );
     eprintln!("├───────────────────────────────────────────────────────────────────┤");
     eprintln!("│ Text generation (decode):                                         │");
-    eprintln!("│   Time: {:.3}s                                                     │", avg_gen_time);
-    eprintln!("│   Speed: {:.2} tokens/sec                                          │", gen_tps);
+    eprintln!(
+        "│   Time: {:.3}s                                                     │",
+        avg_gen_time
+    );
+    eprintln!(
+        "│   Speed: {:.2} tokens/sec                                          │",
+        gen_tps
+    );
     eprintln!("└───────────────────────────────────────────────────────────────────┘");
 
     // JSON output for scripting
@@ -1272,11 +1421,7 @@ fn run_benchmark(
 }
 
 /// Extract embeddings from text
-fn run_embed(
-    model_path: &str,
-    text: &str,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_embed(model_path: &str, text: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::load(EngineConfig {
         model_path: model_path.to_string(),
         ..Default::default()
@@ -1347,7 +1492,10 @@ fn run_download(
         println!("{}", "-".repeat(74));
 
         for f in &files {
-            let size_str = f.file_size().map(format_bytes).unwrap_or_else(|| "?".to_string());
+            let size_str = f
+                .file_size()
+                .map(format_bytes)
+                .unwrap_or_else(|| "?".to_string());
             println!("{:<60} {:>12}", f.path, size_str);
         }
 
@@ -1404,7 +1552,10 @@ fn run_models_command(action: ModelAction) -> Result<(), Box<dyn std::error::Err
                 println!("  llama-rs download <repo> --file <filename>");
             } else {
                 for (repo, path) in &cached {
-                    let size = path.metadata().map(|m| format_bytes(m.len())).unwrap_or_default();
+                    let size = path
+                        .metadata()
+                        .map(|m| format_bytes(m.len()))
+                        .unwrap_or_default();
                     println!("{}", repo);
                     println!("  {} ({})", path.display(), size);
                 }
@@ -1427,7 +1578,10 @@ fn run_models_command(action: ModelAction) -> Result<(), Box<dyn std::error::Err
 
             for model in &results {
                 let id = model.model_id.as_ref().unwrap_or(&model.id);
-                let downloads = model.downloads.map(|d| format!("{}", d)).unwrap_or_default();
+                let downloads = model
+                    .downloads
+                    .map(|d| format!("{}", d))
+                    .unwrap_or_default();
                 let likes = model.likes.map(|l| format!("{}", l)).unwrap_or_default();
                 println!("{:<50} {:>10} {:>8}", id, downloads, likes);
             }
@@ -1477,7 +1631,10 @@ fn run_models_command(action: ModelAction) -> Result<(), Box<dyn std::error::Err
             println!("{}", "-".repeat(74));
 
             for f in &files {
-                let size_str = f.file_size().map(format_bytes).unwrap_or_else(|| "?".to_string());
+                let size_str = f
+                    .file_size()
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "?".to_string());
                 let cached = if client.is_cached(&repo_id, &f.path) {
                     " [cached]"
                 } else {
@@ -1497,17 +1654,22 @@ fn run_models_command(action: ModelAction) -> Result<(), Box<dyn std::error::Err
 /// Handle RAG subcommands
 #[cfg(feature = "rag")]
 fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> {
-    use llama_gguf::rag::{RagConfig, RagStore, RagContextBuilder, example_config};
-    
+    use llama_gguf::rag::{RagConfig, RagContextBuilder, RagStore, example_config};
+
     // Create tokio runtime for async operations
     let rt = tokio::runtime::Runtime::new()?;
-    
+
     match action {
-        RagAction::Init { config, database_url, table, dim } => {
+        RagAction::Init {
+            config,
+            database_url,
+            table,
+            dim,
+        } => {
             rt.block_on(async {
                 // Load config with precedence: CLI args > env vars > config file > defaults
                 let mut cfg = RagConfig::load(config.as_deref())?;
-                
+
                 // Apply CLI overrides
                 if let Some(url) = database_url {
                     cfg.database.connection_string = url;
@@ -1518,23 +1680,30 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 if let Some(d) = dim {
                     cfg.embeddings.dimension = d;
                 }
-                
+
                 println!("Initializing RAG database...");
                 println!("  Table: {}", cfg.table_name());
                 println!("  Embedding dimension: {}", cfg.embedding_dim());
-                
+
                 let store = RagStore::connect(cfg).await?;
                 store.create_table().await?;
-                
+
                 println!("\nDatabase initialized successfully!");
                 println!("\nTo index documents:");
                 println!("  llama-gguf rag index <path>");
-                
+
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }
-        
-        RagAction::Index { path, config, database_url, table, chunk_size, chunk_overlap } => {
+
+        RagAction::Index {
+            path,
+            config,
+            database_url,
+            table,
+            chunk_size,
+            chunk_overlap,
+        } => {
             rt.block_on(async {
                 use llama_gguf::rag::{NewDocument, TextChunker};
                 use std::path::Path;
@@ -1610,14 +1779,21 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }
-        
-        RagAction::Search { query, config, database_url, table, limit, filters } => {
+
+        RagAction::Search {
+            query,
+            config,
+            database_url,
+            table,
+            limit,
+            filters,
+        } => {
             rt.block_on(async {
                 use llama_gguf::rag::MetadataFilter;
-                
+
                 // Load config
                 let mut cfg = RagConfig::load(config.as_deref())?;
-                
+
                 // Apply CLI overrides
                 if let Some(url) = database_url {
                     cfg.database.connection_string = url;
@@ -1628,16 +1804,14 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 if let Some(l) = limit {
                     cfg.search.max_results = l;
                 }
-                
+
                 // Parse filters
                 let filter = if filters.is_empty() {
                     None
                 } else {
-                    let parsed: Result<Vec<MetadataFilter>, _> = filters
-                        .iter()
-                        .map(|f| MetadataFilter::parse(f))
-                        .collect();
-                    
+                    let parsed: Result<Vec<MetadataFilter>, _> =
+                        filters.iter().map(|f| MetadataFilter::parse(f)).collect();
+
                     match parsed {
                         Ok(fs) if fs.len() == 1 => Some(fs.into_iter().next().unwrap()),
                         Ok(fs) => Some(MetadataFilter::and(fs)),
@@ -1647,70 +1821,79 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                         }
                     }
                 };
-                
+
                 println!("Searching for: \"{}\"", query);
                 if !filters.is_empty() {
                     println!("Filters: {:?}", filters);
                 }
                 println!();
-                
+
                 let store = RagStore::connect(cfg).await?;
-                
+
                 // Generate query embedding (placeholder)
                 let query_embedding = vec![0.0f32; store.config().embedding_dim()];
-                
-                let results = store.search_with_filter(&query_embedding, limit, filter).await?;
-                
+
+                let results = store
+                    .search_with_filter(&query_embedding, limit, filter)
+                    .await?;
+
                 if results.is_empty() {
                     println!("No results found.");
                 } else {
                     println!("Found {} results:\n", results.len());
-                    
+
                     for (i, doc) in results.iter().enumerate() {
                         let score = doc.score.map(|s| format!("{:.4}", s)).unwrap_or_default();
                         let preview: String = doc.content.chars().take(200).collect();
-                        
+
                         println!("{}. [{}] {}", i + 1, score, preview);
                         if let Some(meta) = &doc.metadata {
-                            println!("   Metadata: {}", serde_json::to_string_pretty(meta).unwrap_or_default());
+                            println!(
+                                "   Metadata: {}",
+                                serde_json::to_string_pretty(meta).unwrap_or_default()
+                            );
                         }
                         println!();
                     }
-                    
+
                     // Show context builder example
-                    let context = RagContextBuilder::new(results)
-                        .with_scores(true)
-                        .build();
-                    
+                    let context = RagContextBuilder::new(results).with_scores(true).build();
+
                     println!("--- Combined Context ---");
                     println!("{}", &context[..context.len().min(500)]);
                     if context.len() > 500 {
                         println!("... (truncated)");
                     }
                 }
-                
+
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }
-        
-        RagAction::ListValues { field, config, database_url, table, limit } => {
+
+        RagAction::ListValues {
+            field,
+            config,
+            database_url,
+            table,
+            limit,
+        } => {
             rt.block_on(async {
                 // Load config
                 let mut cfg = RagConfig::load(config.as_deref())?;
-                
+
                 if let Some(url) = database_url {
                     cfg.database.connection_string = url;
                 }
                 if let Some(t) = table {
                     cfg.embeddings.table_name = t;
                 }
-                
+
                 let store = RagStore::connect(cfg).await?;
                 let values = store.list_metadata_values(&field, Some(limit)).await?;
-                
+
                 println!("Unique values for '{}':", field);
                 println!("{}", "-".repeat(40));
-                
+
                 if values.is_empty() {
                     println!("(no values found)");
                 } else {
@@ -1719,31 +1902,35 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                     }
                     println!("\nTotal: {} unique values", values.len());
                 }
-                
+
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }
-        
-        RagAction::Delete { config, database_url, table, filters, force } => {
+
+        RagAction::Delete {
+            config,
+            database_url,
+            table,
+            filters,
+            force,
+        } => {
             rt.block_on(async {
                 use llama_gguf::rag::MetadataFilter;
-                
+
                 // Load config
                 let mut cfg = RagConfig::load(config.as_deref())?;
-                
+
                 if let Some(url) = database_url {
                     cfg.database.connection_string = url;
                 }
                 if let Some(t) = table {
                     cfg.embeddings.table_name = t;
                 }
-                
+
                 // Parse filters
-                let parsed: Result<Vec<MetadataFilter>, _> = filters
-                    .iter()
-                    .map(|f| MetadataFilter::parse(f))
-                    .collect();
-                
+                let parsed: Result<Vec<MetadataFilter>, _> =
+                    filters.iter().map(|f| MetadataFilter::parse(f)).collect();
+
                 let filter = match parsed {
                     Ok(fs) if fs.len() == 1 => fs.into_iter().next().unwrap(),
                     Ok(fs) => MetadataFilter::and(fs),
@@ -1752,45 +1939,49 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                         return Err(e.into());
                     }
                 };
-                
+
                 let store = RagStore::connect(cfg).await?;
-                
+
                 // Count documents to be deleted
                 let count = store.count_with_filter(Some(filter.clone())).await?;
-                
+
                 if count == 0 {
                     println!("No documents match the filter.");
                     return Ok(());
                 }
-                
+
                 println!("Documents matching filter: {}", count);
-                
+
                 if !force {
                     print!("Delete {} documents? [y/N] ", count);
                     use std::io::{self, Write};
                     io::stdout().flush()?;
-                    
+
                     let mut input = String::new();
                     io::stdin().read_line(&mut input)?;
-                    
+
                     if !input.trim().eq_ignore_ascii_case("y") {
                         println!("Cancelled.");
                         return Ok(());
                     }
                 }
-                
+
                 let deleted = store.delete_with_filter(filter).await?;
                 println!("Deleted {} documents.", deleted);
-                
+
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }
-        
-        RagAction::Stats { config, database_url, table } => {
+
+        RagAction::Stats {
+            config,
+            database_url,
+            table,
+        } => {
             rt.block_on(async {
                 // Load config
                 let mut cfg = RagConfig::load(config.as_deref())?;
-                
+
                 // Apply CLI overrides
                 if let Some(url) = database_url {
                     cfg.database.connection_string = url;
@@ -1798,22 +1989,22 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 if let Some(t) = table {
                     cfg.embeddings.table_name = t;
                 }
-                
+
                 let store = RagStore::connect(cfg).await?;
-                
+
                 let count = store.count().await?;
-                
+
                 println!("RAG Database Statistics");
                 println!("{}", "-".repeat(40));
                 println!("Table: {}", store.config().table_name());
                 println!("Documents: {}", count);
                 println!("Embedding dimension: {}", store.config().embedding_dim());
                 println!("Distance metric: {:?}", store.config().distance_metric());
-                
+
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }
-        
+
         RagAction::GenConfig { output } => {
             std::fs::write(&output, example_config())?;
             println!("Generated example configuration: {}", output);
@@ -1824,10 +2015,16 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
         // =====================================================================
         // Knowledge Base Commands
         // =====================================================================
-
-        RagAction::KbCreate { name, description, config, chunking, max_tokens, overlap } => {
+        RagAction::KbCreate {
+            name,
+            description,
+            config,
+            chunking,
+            max_tokens,
+            overlap,
+        } => {
             rt.block_on(async {
-                use llama_gguf::rag::{KnowledgeBaseBuilder, ChunkingStrategy};
+                use llama_gguf::rag::{ChunkingStrategy, KnowledgeBaseBuilder};
 
                 // Load base config
                 let storage = RagConfig::load(config.as_deref())?;
@@ -1877,9 +2074,15 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
             })?;
         }
 
-        RagAction::KbIngest { name, path, config, pattern, recursive } => {
+        RagAction::KbIngest {
+            name,
+            path,
+            config,
+            pattern,
+            recursive,
+        } => {
             rt.block_on(async {
-                use llama_gguf::rag::{KnowledgeBase, KnowledgeBaseConfig, DataSource};
+                use llama_gguf::rag::{DataSource, KnowledgeBase, KnowledgeBaseConfig};
                 use std::path::Path;
 
                 let storage = RagConfig::load(config.as_deref())?;
@@ -1893,7 +2096,9 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
 
                 let source_path = Path::new(&path);
                 let source = if source_path.is_file() {
-                    DataSource::File { path: source_path.to_path_buf() }
+                    DataSource::File {
+                        path: source_path.to_path_buf(),
+                    }
                 } else if source_path.is_dir() {
                     DataSource::Directory {
                         path: source_path.to_path_buf(),
@@ -1923,7 +2128,13 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
             })?;
         }
 
-        RagAction::KbRetrieve { query, name, config, limit, min_score } => {
+        RagAction::KbRetrieve {
+            query,
+            name,
+            config,
+            limit,
+            min_score,
+        } => {
             rt.block_on(async {
                 use llama_gguf::rag::{KnowledgeBase, KnowledgeBaseConfig, RetrievalConfig};
 
@@ -1953,7 +2164,12 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                     println!("Found {} results:\n", response.chunks.len());
 
                     for (i, chunk) in response.chunks.iter().enumerate() {
-                        println!("{}. [score: {:.4}] {}", i + 1, chunk.score, chunk.source.uri);
+                        println!(
+                            "{}. [score: {:.4}] {}",
+                            i + 1,
+                            chunk.score,
+                            chunk.source.uri
+                        );
                         let preview: String = chunk.content.chars().take(200).collect();
                         println!("   {}", preview);
                         if chunk.content.len() > 200 {
@@ -1967,7 +2183,14 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
             })?;
         }
 
-        RagAction::KbRetrieveAndGenerate { query, name, config, limit, prompt_template, citations } => {
+        RagAction::KbRetrieveAndGenerate {
+            query,
+            name,
+            config,
+            limit,
+            prompt_template,
+            citations,
+        } => {
             rt.block_on(async {
                 use llama_gguf::rag::{KnowledgeBase, KnowledgeBaseConfig, RetrievalConfig};
 
@@ -1989,7 +2212,9 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 println!("Retrieve and Generate from '{}': \"{}\"", name, query);
                 println!();
 
-                let response = kb.retrieve_and_generate(&query, Some(retrieval_config)).await?;
+                let response = kb
+                    .retrieve_and_generate(&query, Some(retrieval_config))
+                    .await?;
 
                 println!("=== Generated Prompt ===");
                 println!("{}", response.output);
@@ -1998,7 +2223,12 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 if citations && !response.citations.is_empty() {
                     println!("=== Citations ===");
                     for (i, citation) in response.citations.iter().enumerate() {
-                        println!("{}. {} (score: {:.4})", i + 1, citation.source.uri, citation.score);
+                        println!(
+                            "{}. {} (score: {:.4})",
+                            i + 1,
+                            citation.source.uri,
+                            citation.score
+                        );
                     }
                 }
 
@@ -2027,13 +2257,24 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 println!("Documents: {}", stats.document_count);
                 println!("Embedding dimension: {}", stats.embedding_dimension);
                 println!("Chunking strategy: {}", stats.chunking_strategy);
-                println!("Hybrid search: {}", if stats.hybrid_search_enabled { "enabled" } else { "disabled" });
+                println!(
+                    "Hybrid search: {}",
+                    if stats.hybrid_search_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
 
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }
 
-        RagAction::KbDelete { name, config, force } => {
+        RagAction::KbDelete {
+            name,
+            config,
+            force,
+        } => {
             rt.block_on(async {
                 use llama_gguf::rag::{KnowledgeBase, KnowledgeBaseConfig};
 
@@ -2047,7 +2288,10 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 let kb = KnowledgeBase::connect(kb_config).await?;
                 let stats = kb.stats().await?;
 
-                println!("Knowledge base '{}' contains {} documents.", name, stats.document_count);
+                println!(
+                    "Knowledge base '{}' contains {} documents.",
+                    name, stats.document_count
+                );
 
                 if !force {
                     print!("Delete all documents? [y/N] ");
@@ -2070,6 +2314,6 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
             })?;
         }
     }
-    
+
     Ok(())
 }
