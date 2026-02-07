@@ -224,6 +224,19 @@ impl Default for ServerSection {
     }
 }
 
+impl ServerSection {
+    /// Build a full URL from host and port (e.g. `http://192.168.1.4:8080`).
+    /// Returns `None` if host is localhost/default (i.e. no remote server configured).
+    pub fn host_url(&self) -> Option<String> {
+        // Only return a URL if the host is NOT localhost — a remote was explicitly configured
+        if self.host == "127.0.0.1" || self.host == "localhost" || self.host == "0.0.0.0" {
+            None
+        } else {
+            Some(format!("http://{}:{}", self.host, self.port))
+        }
+    }
+}
+
 /// Quantization settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

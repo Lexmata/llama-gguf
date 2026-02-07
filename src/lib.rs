@@ -25,6 +25,8 @@
 //! ```
 
 pub mod backend;
+#[cfg(feature = "client")]
+pub mod client;
 pub mod config;
 pub mod engine;
 pub mod gguf;

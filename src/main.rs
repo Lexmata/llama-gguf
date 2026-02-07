@@ -74,10 +74,15 @@ enum Commands {
         gpu: bool,
     },
 
-    /// Interactive chat mode
+    /// Interactive chat mode (local model or remote server)
     Chat {
-        /// Path to the GGUF model file
-        model: String,
+        /// Path to the GGUF model file (not needed when using --server)
+        model: Option<String>,
+
+        /// Connect to a remote OpenAI-compatible server instead of loading a local model.
+        /// Example: --server http://192.168.1.4:8080
+        #[arg(long, env = "LLAMA_SERVER")]
+        server: Option<String>,
 
         /// System prompt (instructions for the model)
         #[arg(long)]
@@ -599,6 +604,7 @@ fn main() {
         }
         Commands::Chat {
             model,
+            server,
             system,
             n_predict,
             temperature,
@@ -607,20 +613,55 @@ fn main() {
             repeat_penalty,
             seed,
         } => {
-            let ec = cfg.to_chat_engine_config(Some(&model));
-            let system_prompt = system.or(cfg.chat.system_prompt.clone());
-            if let Err(e) = run_chat(
-                &resolve_model_path(&model, &cfg),
-                system_prompt.as_deref(),
-                cli_or_config(n_predict, 512, ec.max_tokens),
-                cli_or_config_f32(temperature, 0.7, ec.temperature),
-                cli_or_config(top_k, 40, ec.top_k),
-                cli_or_config_f32(top_p, 0.9, ec.top_p),
-                cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
-                seed.or(ec.seed),
-            ) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+            // Determine server URL: --server flag > config file > none
+            let server_url = server.or_else(|| cfg.server.host_url());
+
+            if let Some(url) = server_url {
+                // Remote mode: connect to server
+                #[cfg(feature = "client")]
+                {
+                    let system_prompt = system.or(cfg.chat.system_prompt.clone());
+                    if let Err(e) = run_remote_chat(
+                        &url,
+                        system_prompt.as_deref(),
+                        cli_or_config(n_predict, 512, cfg.chat.max_tokens.unwrap_or(512)),
+                        cli_or_config_f32(temperature, 0.7, cfg.chat.temperature.unwrap_or(0.7)),
+                        cli_or_config_f32(top_p, 0.9, cfg.chat.top_p.unwrap_or(0.9)),
+                    ) {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                #[cfg(not(feature = "client"))]
+                {
+                    eprintln!("Error: Remote chat requires the 'client' feature.");
+                    eprintln!("Compile with: cargo build --features client");
+                    std::process::exit(1);
+                }
+            } else {
+                // Local mode: load model
+                let model = model.unwrap_or_else(|| {
+                    cfg.model.path.clone().unwrap_or_else(|| {
+                        eprintln!("Error: No model specified. Provide a model path or use --server.");
+                        eprintln!("Usage: llama-gguf chat <MODEL> or llama-gguf chat --server <URL>");
+                        std::process::exit(1);
+                    })
+                });
+                let ec = cfg.to_chat_engine_config(Some(&model));
+                let system_prompt = system.or(cfg.chat.system_prompt.clone());
+                if let Err(e) = run_chat(
+                    &resolve_model_path(&model, &cfg),
+                    system_prompt.as_deref(),
+                    cli_or_config(n_predict, 512, ec.max_tokens),
+                    cli_or_config_f32(temperature, 0.7, ec.temperature),
+                    cli_or_config(top_k, 40, ec.top_k),
+                    cli_or_config_f32(top_p, 0.9, ec.top_p),
+                    cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
+                    seed.or(ec.seed),
+                ) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
         #[cfg(feature = "server")]
@@ -972,6 +1013,109 @@ fn run_chat(
 
         println!();
         println!();
+    }
+
+    Ok(())
+}
+
+/// Remote chat mode: connect to an OpenAI-compatible server
+#[cfg(feature = "client")]
+fn run_remote_chat(
+    server_url: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use llama_gguf::client::RemoteChatClient;
+
+    let mut client = RemoteChatClient::new(server_url, system_prompt, temperature, max_tokens, top_p)?;
+
+    let system_text = client.system_prompt().to_string();
+    let model_name = client.model_name().to_string();
+
+    // Print chat header
+    eprintln!();
+    eprintln!("╭─────────────────────────────────────────────────────────────────╮");
+    eprintln!("│                 Interactive Chat Mode (Remote)                    │");
+    eprintln!("├─────────────────────────────────────────────────────────────────┤");
+    eprintln!("│ Server: {:<56}│", server_url);
+    eprintln!("│ Model:  {:<56}│", &model_name[..model_name.len().min(56)]);
+    eprintln!("├─────────────────────────────────────────────────────────────────┤");
+    eprintln!("│ Commands:                                                        │");
+    eprintln!("│   /clear  - Clear conversation history                           │");
+    eprintln!("│   /system - Show system prompt                                   │");
+    eprintln!("│   /help   - Show this help                                       │");
+    eprintln!("│   /quit   - Exit chat                                            │");
+    eprintln!("╰─────────────────────────────────────────────────────────────────╯");
+    eprintln!();
+    eprintln!("System: {}", system_text);
+    eprintln!();
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+
+    loop {
+        print!("You: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        if reader.read_line(&mut input)? == 0 {
+            break;
+        }
+        let input = input.trim();
+
+        if input.is_empty() {
+            continue;
+        }
+
+        // Handle commands
+        if input.starts_with('/') {
+            match input.to_lowercase().as_str() {
+                "/quit" | "/exit" | "/q" => {
+                    eprintln!("Goodbye!");
+                    break;
+                }
+                "/clear" => {
+                    client.clear_history();
+                    eprintln!("Conversation cleared.");
+                    continue;
+                }
+                "/help" => {
+                    eprintln!("Commands:");
+                    eprintln!("  /clear  - Clear conversation history");
+                    eprintln!("  /system - Show system prompt");
+                    eprintln!("  /quit   - Exit chat");
+                    continue;
+                }
+                "/system" => {
+                    eprintln!("System prompt: {}", client.system_prompt());
+                    continue;
+                }
+                _ => {
+                    eprintln!(
+                        "Unknown command: {}. Type /help for available commands.",
+                        input
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Generate and stream the response
+        print!("\nAssistant: ");
+        io::stdout().flush()?;
+
+        match client.chat_streaming(input) {
+            Ok(_) => {
+                println!();
+                println!();
+            }
+            Err(e) => {
+                eprintln!("\nError: {}", e);
+                eprintln!();
+            }
+        }
     }
 
     Ok(())

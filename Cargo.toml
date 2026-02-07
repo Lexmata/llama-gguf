@@ -1,6 +1,6 @@
 [package]
 name = "llama-gguf"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>"]
@@ -19,8 +19,9 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cpu", "huggingface", "cli"]
+default = ["cpu", "huggingface", "cli", "client"]
 cli = ["dep:clap"]
+client = ["dep:reqwest"]
 cpu = []
 cuda = ["dep:cudarc"]
 vulkan = ["dep:ash", "dep:gpu-allocator"]
