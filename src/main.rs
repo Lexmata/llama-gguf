@@ -2,12 +2,11 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use llama_gguf::engine::{ChatEngine, Engine, EngineConfig};
 use llama_gguf::gguf::{GgufFile, MetadataValue};
 #[cfg(feature = "huggingface")]
 use llama_gguf::huggingface::{format_bytes, HfClient};
 use llama_gguf::model::{InferenceContext, ModelLoader};
-use llama_gguf::sampling::{Sampler, SamplerConfig};
-use llama_gguf::tokenizer::Tokenizer;
 use llama_gguf::Model;
 
 #[derive(Parser)]
@@ -723,152 +722,34 @@ fn run_inference(
     seed: Option<u64>,
     use_gpu: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Loading model from: {}", model_path);
-
-    // Load GGUF file
-    let gguf = GgufFile::open(model_path)?;
-
-    // Load tokenizer
-    eprintln!("Loading tokenizer...");
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    eprintln!("Vocabulary size: {}", tokenizer.vocab_size);
-
-    // Load model
-    eprintln!("Loading model weights...");
-    let loader = ModelLoader::load(model_path)?;
-    let config = loader.config().clone();
-    eprintln!(
-        "Model: {} layers, {} heads, {} hidden dim",
-        config.num_layers, config.num_heads, config.hidden_size
-    );
-
-    let model = loader.build_model()?;
-
-    // Create backend and context
-    let backend: Arc<dyn llama_gguf::Backend> = if use_gpu {
-        #[cfg(feature = "cuda")]
-        {
-            match llama_gguf::backend::cuda::CudaBackend::new() {
-                Ok(mut cuda) => {
-                    eprintln!("Using CUDA backend: {}", cuda.device_name());
-                    // Upload dequantized weights to GPU for full acceleration
-                    eprintln!("Uploading model weights to GPU (dequantizing to F32)...");
-                    match cuda.load_model_weights(&model) {
-                        Ok(()) => {
-                            let vram_mb = cuda.gpu_weight_vram() as f64 / (1024.0 * 1024.0);
-                            eprintln!("GPU weights loaded: {:.1} MB VRAM", vram_mb);
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Failed to load GPU weights ({}), using quantized ops", e);
-                        }
-                    }
-                    Arc::new(cuda)
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to initialize CUDA ({}), falling back to CPU", e);
-                    Arc::new(llama_gguf::backend::cpu::CpuBackend::new())
-                }
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            eprintln!("Warning: CUDA not compiled in, falling back to CPU");
-            Arc::new(llama_gguf::backend::cpu::CpuBackend::new())
-        }
-    } else {
-        Arc::new(llama_gguf::backend::cpu::CpuBackend::new())
-    };
-    let mut ctx = InferenceContext::new(&config, backend);
-
-    // Configure sampler
-    let sampler_config = SamplerConfig {
+    let engine = Engine::load(EngineConfig {
+        model_path: model_path.to_string(),
         temperature,
         top_k,
         top_p,
         repeat_penalty,
+        max_tokens: n_predict,
         seed,
-        ..Default::default()
-    };
-    let mut sampler = Sampler::new(sampler_config, config.vocab_size);
+        use_gpu,
+    })?;
 
-    // Encode prompt
     let raw_prompt = prompt.unwrap_or("Hello");
 
-    // Check if model has chat template tokens and wrap prompt if needed
-    let prompt_text = if let Some(chat_template) = gguf.data.get_string("tokenizer.chat_template") {
-        // Model has a chat template - check if prompt already has chat tokens
-        if raw_prompt.contains("<|user|>") || raw_prompt.contains("<|im_start|>") || raw_prompt.contains("[INST]") {
-            // Prompt already has chat format
-            raw_prompt.to_string()
-        } else if chat_template.contains("<|user|>") {
-            // Use <|user|>/<|assistant|> format (matches llama.cpp behavior)
-            format!("<|user|>\n{}<|assistant|>\n", raw_prompt)
-        } else if chat_template.contains("<|im_start|>") {
-            // Use ChatML format (Qwen2, etc.)
-            format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", raw_prompt)
-        } else if chat_template.contains("[INST]") {
-            // Use Llama-2 format
-            format!("[INST] {} [/INST]", raw_prompt)
-        } else {
-            // Unknown template, use raw prompt
-            raw_prompt.to_string()
-        }
-    } else {
-        // No chat template, use raw prompt
-        raw_prompt.to_string()
-    };
-
-    // Check if we should add BOS token (some models like Qwen2 don't want BOS)
-    let add_bos = gguf.data.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(true);
-    
-    let mut tokens = tokenizer.encode(&prompt_text, add_bos)?;
-
-    // Debug: show encoded tokens and decoded representation (uncomment to debug)
-    // eprintln!("Encoded {} tokens: {:?}", tokens.len(), &tokens[..tokens.len().min(50)]);
-    // if let Ok(decoded) = tokenizer.decode(&tokens) {
-    //     eprintln!("Decoded prompt: {:?}", decoded);
-    // }
-
-    // Print the original prompt (not the wrapped version)
+    // Print the prompt before streaming the response
     print!("{}", raw_prompt);
     io::stdout().flush()?;
 
-    // Generation loop
-    for _ in 0..n_predict {
-        // Check if we hit EOS
-        if let Some(&last) = tokens.last()
-            && last == tokenizer.special_tokens.eos_token_id {
-                break;
-            }
-
-        // Run forward pass (just the last token for incremental generation)
-        let input_tokens = if ctx.position == 0 {
-            &tokens[..]
-        } else {
-            &tokens[tokens.len() - 1..]
-        };
-
-        let logits = model.forward(input_tokens, &mut ctx)?;
-
-        // Sample next token
-        let next_token = sampler.sample(&logits, &tokens);
-
-        // Decode and print
-        if let Ok(text) = tokenizer.decode(&[next_token]) {
-            print!("{}", text);
-            io::stdout().flush()?;
-        }
-
-        tokens.push(next_token);
-
-        // Check for EOS
-        if next_token == tokenizer.special_tokens.eos_token_id {
-            break;
-        }
+    // Stream tokens as they are generated
+    let mut count = 0;
+    for token_result in engine.generate_streaming(raw_prompt, n_predict) {
+        let text = token_result?;
+        print!("{}", text);
+        io::stdout().flush()?;
+        count += 1;
     }
 
     println!();
-    eprintln!("\nGenerated {} tokens", tokens.len());
+    eprintln!("\nGenerated {} tokens", count);
 
     Ok(())
 }
@@ -884,48 +765,19 @@ fn run_chat(
     repeat_penalty: f32,
     seed: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Loading model from: {}", model_path);
-
-    // Load GGUF file
-    let gguf = GgufFile::open(model_path)?;
-
-    // Load tokenizer
-    eprintln!("Loading tokenizer...");
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    eprintln!("Vocabulary size: {}", tokenizer.vocab_size);
-
-    // Load model
-    eprintln!("Loading model weights...");
-    let loader = ModelLoader::load(model_path)?;
-    let config = loader.config().clone();
-    eprintln!(
-        "Model: {} layers, {} heads, {} hidden dim",
-        config.num_layers, config.num_heads, config.hidden_size
-    );
-    eprintln!("Max context: {} tokens", config.max_seq_len);
-
-    let model = loader.build_model()?;
-
-    // Create backend and context
-    let backend: Arc<dyn llama_gguf::Backend> = Arc::new(llama_gguf::backend::cpu::CpuBackend::new());
-    let mut ctx = InferenceContext::new(&config, backend);
-
-    // Configure sampler
-    let sampler_config = SamplerConfig {
+    let engine = Engine::load(EngineConfig {
+        model_path: model_path.to_string(),
         temperature,
         top_k,
         top_p,
         repeat_penalty,
+        max_tokens: n_predict,
         seed,
-        ..Default::default()
-    };
-    let mut sampler = Sampler::new(sampler_config, config.vocab_size);
+        use_gpu: false,
+    })?;
 
-    // Conversation history as tokens
-    let mut conversation_tokens: Vec<u32> = Vec::new();
-
-    // Format system prompt if provided
     let system_text = system_prompt.unwrap_or("You are a helpful AI assistant.");
+    let mut chat = ChatEngine::new(engine, Some(system_text.to_string()));
 
     // Print chat header
     eprintln!();
@@ -970,9 +822,7 @@ fn run_chat(
                     break;
                 }
                 "/clear" => {
-                    conversation_tokens.clear();
-                    ctx.reset();
-                    sampler.reset();
+                    chat.clear_history();
                     eprintln!("Conversation cleared.");
                     continue;
                 }
@@ -984,95 +834,28 @@ fn run_chat(
                     continue;
                 }
                 "/system" => {
-                    eprintln!("System prompt: {}", system_text);
+                    eprintln!("System prompt: {}", chat.system_prompt());
                     continue;
                 }
                 _ => {
-                    eprintln!("Unknown command: {}. Type /help for available commands.", input);
+                    eprintln!(
+                        "Unknown command: {}. Type /help for available commands.",
+                        input
+                    );
                     continue;
                 }
             }
         }
 
-        // Format the conversation for the model
-        // Using a simple chat format: [INST] user message [/INST] assistant response
-        let formatted_input = if conversation_tokens.is_empty() {
-            // First message - include system prompt
-            format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]", system_text, input)
-        } else {
-            // Continuation
-            format!(" [INST] {} [/INST]", input)
-        };
-
-        // Encode user input
-        let new_tokens = tokenizer.encode(&formatted_input, conversation_tokens.is_empty())?;
-
-        // Check context length
-        let total_len = conversation_tokens.len() + new_tokens.len() + n_predict;
-        if total_len > config.max_seq_len {
-            // Need to truncate - shift the KV cache
-            let excess = total_len - config.max_seq_len + 100; // Leave some buffer
-            if excess >= conversation_tokens.len() {
-                // Too much - just reset
-                eprintln!("(Context full, resetting conversation)");
-                conversation_tokens.clear();
-                ctx.reset();
-            } else {
-                eprintln!("(Trimming {} tokens from context)", excess);
-                conversation_tokens = conversation_tokens[excess..].to_vec();
-                ctx.kv_cache.shift_left(excess);
-                ctx.position = ctx.position.saturating_sub(excess);
-            }
-        }
-
-        // Add new tokens to conversation
-        conversation_tokens.extend(&new_tokens);
-
-        // Process the new tokens
-        let start_pos = ctx.position;
-        for (i, &token) in new_tokens.iter().enumerate() {
-            let pos = start_pos + i;
-            if pos < config.max_seq_len {
-                let _ = model.forward(&[token], &mut ctx);
-            }
-        }
-
-        // Generate response
+        // Generate and stream the response
         print!("\nAssistant: ");
         io::stdout().flush()?;
 
-        let mut response_tokens = Vec::new();
-        let mut generated_text = String::new();
-
-        for _ in 0..n_predict {
-            // Check for end of response patterns
-            if generated_text.contains("[INST]") || generated_text.contains("</s>") {
-                break;
-            }
-
-            // Get last token for generation
-            let last_token = *conversation_tokens.last().unwrap_or(&tokenizer.special_tokens.bos_token_id);
-
-            // Forward pass
-            let logits = model.forward(&[last_token], &mut ctx)?;
-
-            // Sample next token
-            let next_token = sampler.sample(&logits, &conversation_tokens);
-
-            // Check for EOS
-            if next_token == tokenizer.special_tokens.eos_token_id {
-                break;
-            }
-
-            // Decode and print
-            if let Ok(text) = tokenizer.decode(&[next_token]) {
-                print!("{}", text);
-                io::stdout().flush()?;
-                generated_text.push_str(&text);
-            }
-
-            conversation_tokens.push(next_token);
-            response_tokens.push(next_token);
+        let stream = chat.chat_streaming(input)?;
+        for token_result in stream {
+            let text = token_result?;
+            print!("{}", text);
+            io::stdout().flush()?;
         }
 
         println!();
@@ -1494,23 +1277,13 @@ fn run_embed(
     text: &str,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use llama_gguf::model::{EmbeddingConfig, EmbeddingExtractor};
-
-    eprintln!("Loading model: {}", model_path);
-    let gguf = GgufFile::open(model_path)?;
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let loader = ModelLoader::load(model_path)?;
-    let config = loader.config().clone();
-    let model = loader.build_model()?;
-
-    let backend: Arc<dyn llama_gguf::Backend> = Arc::new(llama_gguf::backend::cpu::CpuBackend::new());
-    let mut ctx = InferenceContext::new(&config, backend.clone());
-
-    let embed_config = EmbeddingConfig::default();
-    let extractor = EmbeddingExtractor::new(embed_config, &config);
+    let engine = Engine::load(EngineConfig {
+        model_path: model_path.to_string(),
+        ..Default::default()
+    })?;
 
     eprintln!("Extracting embeddings for: \"{}\"", text);
-    let embedding = extractor.embed_text(&model, &tokenizer, &mut ctx, text)?;
+    let embedding = engine.embed(text)?;
 
     match format {
         "json" => {
