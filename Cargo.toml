@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Lexmata LLC <jquinn@lexmata.ai>"]
 description = "A high-performance Rust implementation of llama.cpp - LLM inference engine with full GGUF support"
-repository = "https://github.com/pegasusheavy/llama-rs"
+repository = "https://github.com/Lexmata/llama-gguf"
 keywords = ["llm", "inference", "gguf", "llama", "ai"]
 categories = ["science", "algorithms"]
 

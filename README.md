@@ -18,7 +18,7 @@ A high-performance Rust implementation of [llama.cpp](https://github.com/ggergan
 ### From Source
 
 ```bash
-git clone https://github.com/pegasusheavy/llama-gguf.git
+git clone https://github.com/Lexmata/llama-gguf.git
 cd llama-gguf
 cargo build --release
 ```
@@ -31,7 +31,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-llama-gguf = { git = "https://github.com/pegasusheavy/llama-gguf.git" }
+llama-gguf = { git = "https://github.com/Lexmata/llama-gguf.git" }
 ```
 
 ## Quick Start
