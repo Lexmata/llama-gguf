@@ -239,4 +239,4 @@ at your option.
 
 ---
 
-**Pegasus Heavy Industries LLC** - [pegasusheavyindustries@gmail.com](mailto:pegasusheavyindustries@gmail.com)
+**Lexmata LLC** - [jquinn@lexmata.ai](mailto:jquinn@lexmata.ai)

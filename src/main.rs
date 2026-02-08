@@ -642,8 +642,12 @@ fn main() {
                 // Local mode: load model
                 let model = model.unwrap_or_else(|| {
                     cfg.model.path.clone().unwrap_or_else(|| {
-                        eprintln!("Error: No model specified. Provide a model path or use --server.");
-                        eprintln!("Usage: llama-gguf chat <MODEL> or llama-gguf chat --server <URL>");
+                        eprintln!(
+                            "Error: No model specified. Provide a model path or use --server."
+                        );
+                        eprintln!(
+                            "Usage: llama-gguf chat <MODEL> or llama-gguf chat --server <URL>"
+                        );
                         std::process::exit(1);
                     })
                 });
@@ -1029,7 +1033,8 @@ fn run_remote_chat(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use llama_gguf::client::RemoteChatClient;
 
-    let mut client = RemoteChatClient::new(server_url, system_prompt, temperature, max_tokens, top_p)?;
+    let mut client =
+        RemoteChatClient::new(server_url, system_prompt, temperature, max_tokens, top_p)?;
 
     let system_text = client.system_prompt().to_string();
     let model_name = client.model_name().to_string();

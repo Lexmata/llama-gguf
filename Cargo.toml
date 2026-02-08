@@ -1,9 +1,9 @@
 [package]
 name = "llama-gguf"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-authors = ["Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>"]
+authors = ["Lexmata LLC <jquinn@lexmata.ai>"]
 description = "A high-performance Rust implementation of llama.cpp - LLM inference engine with full GGUF support"
 repository = "https://github.com/pegasusheavy/llama-rs"
 keywords = ["llm", "inference", "gguf", "llama", "ai"]
