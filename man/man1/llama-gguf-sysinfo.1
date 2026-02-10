@@ -1,0 +1,35 @@
+.\" Man page for llama-gguf-sysinfo
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-SYSINFO 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-sysinfo \- show system information and capabilities
+.SH SYNOPSIS
+.B llama-gguf sysinfo
+.SH DESCRIPTION
+Display system information relevant to LLM inference, including CPU
+capabilities, SIMD instruction support, and available features.
+.SH OUTPUT
+The command displays information in sections:
+.TP
+.B CPU
+Number of threads, SIMD capabilities (AVX2, AVX-512, NEON), and
+CPU feature detection results.
+.TP
+.B Supported Quantization Formats
+Lists all quantization formats supported by the current build
+(Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, Q8K).
+.TP
+.B Features
+Compiled features such as HTTP server, CUDA support, HuggingFace
+integration, and RAG capabilities.
+.SH EXAMPLES
+Show system information:
+.PP
+.RS
+.B llama-gguf sysinfo
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-bench (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

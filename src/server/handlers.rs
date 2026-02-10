@@ -16,7 +16,7 @@ use crate::engine::ChatTemplate;
 use crate::model::{InferenceContext, ModelConfig};
 use crate::sampling::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
-use crate::Model;
+use crate::{Backend, Model};
 
 use super::types::*;
 
@@ -28,6 +28,8 @@ pub struct AppState {
     pub model_name: String,
     /// Detected chat template for the loaded model
     pub chat_template: ChatTemplate,
+    /// Backend for inference (CPU or GPU)
+    pub backend: Arc<dyn Backend>,
     /// Mutex to serialize inference requests (single-threaded for now)
     pub inference_lock: Mutex<()>,
 }
@@ -243,10 +245,8 @@ async fn generate_response(
     sampler_config: SamplerConfig,
     _stop_sequences: Option<&[String]>,
 ) -> Result<(String, usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-    // Create a new context for this request
-    let backend: Arc<dyn crate::Backend> =
-        Arc::new(crate::backend::cpu::CpuBackend::new());
-    let mut ctx = InferenceContext::new(&state.config, backend);
+    // Create a new context for this request using the shared backend
+    let mut ctx = InferenceContext::new(&state.config, state.backend.clone());
     let mut sampler = Sampler::new(sampler_config, state.config.vocab_size);
 
     // Encode prompt

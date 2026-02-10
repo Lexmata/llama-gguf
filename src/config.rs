@@ -492,6 +492,7 @@ impl Config {
 
         EngineConfig {
             model_path,
+            tokenizer_path: None,
             temperature: self.generation.temperature,
             top_k: self.generation.top_k,
             top_p: self.generation.top_p,

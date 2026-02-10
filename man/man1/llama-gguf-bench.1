@@ -1,0 +1,85 @@
+.\" Man page for llama-gguf-bench
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-BENCH 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-bench \- benchmark model performance
+.SH SYNOPSIS
+.B llama-gguf bench
+[\fIOPTIONS\fR]
+\fIMODEL\fR
+.SH DESCRIPTION
+Benchmark the inference performance of a GGUF model, measuring both
+prompt processing (prefill) and text generation (decode) speeds.
+.PP
+Results are displayed in a human-readable format and also output as
+JSON for scripting and automation.
+.SH ARGUMENTS
+.TP
+.I MODEL
+Path to the GGUF model file.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-n-prompt " " \fIN\fR
+Number of prompt tokens to process during prefill benchmark.
+Default: 512.
+.TP
+.BR \-n ", " \-\-n-gen " " \fIN\fR
+Number of tokens to generate during decode benchmark.
+Default: 128.
+.TP
+.BR \-r ", " \-\-repetitions " " \fIN\fR
+Number of repetitions for averaging results.
+Default: 3.
+.TP
+.BR \-\-threads " " \fIN\fR
+Number of threads to use. If not specified, uses all available threads.
+.SH OUTPUT
+The benchmark outputs two main metrics:
+.TP
+.B Prompt processing (prefill)
+Time and tokens/second for processing the initial prompt. This measures
+how quickly the model can process input context.
+.TP
+.B Text generation (decode)
+Time and tokens/second for generating new tokens. This measures the
+model's generation speed for interactive use.
+.PP
+JSON output is also provided with the following fields:
+.RS
+.IP \(bu 2
+prompt_tokens, gen_tokens - token counts
+.IP \(bu 2
+prompt_time_s, gen_time_s - times in seconds
+.IP \(bu 2
+prompt_tokens_per_sec, gen_tokens_per_sec - throughput
+.RE
+.SH EXAMPLES
+Basic benchmark:
+.PP
+.RS
+.B llama-gguf bench model.gguf
+.RE
+.PP
+Benchmark with more tokens:
+.PP
+.RS
+.B llama-gguf bench model.gguf -p 1024 -n 256 -r 5
+.RE
+.PP
+Benchmark with specific thread count:
+.PP
+.RS
+.B llama-gguf bench model.gguf --threads 4
+.RE
+.PP
+Parse JSON output in scripts:
+.PP
+.RS
+.B llama-gguf bench model.gguf 2>/dev/null | jq '.gen_tokens_per_sec'
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-run (1),
+.BR llama-gguf-sysinfo (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

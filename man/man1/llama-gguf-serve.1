@@ -1,0 +1,98 @@
+.\" Man page for llama-gguf-serve
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-SERVE 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-serve \- start HTTP server with OpenAI-compatible API
+.SH SYNOPSIS
+.B llama-gguf serve
+[\fIOPTIONS\fR]
+\fIMODEL\fR
+.SH DESCRIPTION
+Start an HTTP server that provides an OpenAI-compatible API for inference.
+This allows other applications and tools to interact with the model using
+standard OpenAI client libraries.
+.PP
+Requires the \fBserver\fR feature to be compiled in.
+.SH ARGUMENTS
+.TP
+.I MODEL
+Path to the GGUF model file.
+.SH OPTIONS
+.TP
+.BR \-\-host " " \fIHOST\fR
+Host address to bind to. Default: 127.0.0.1.
+Use 0.0.0.0 to accept connections from any interface.
+.TP
+.BR \-p ", " \-\-port " " \fIPORT\fR
+Port to listen on. Default: 8080.
+.TP
+.BR \-\-rag-database-url " " \fIURL\fR
+Enable RAG with PostgreSQL/pgvector database. Format:
+\fBpostgres://user:pass@host:port/database\fR.
+Can also be set via the \fBRAG_DATABASE_URL\fR environment variable.
+Requires the \fBrag\fR feature.
+.TP
+.BR \-\-rag-config " " \fIFILE\fR
+Path to RAG configuration file (alternative to \fB--rag-database-url\fR).
+Requires the \fBrag\fR feature.
+.SH API ENDPOINTS
+.TP
+.B POST /v1/chat/completions
+Chat completion endpoint (OpenAI-compatible).
+.TP
+.B POST /v1/completions
+Text completion endpoint (OpenAI-compatible).
+.TP
+.B POST /v1/embeddings
+Generate embeddings for input text.
+.TP
+.B GET /v1/models
+List available models.
+.TP
+.B GET /health
+Health check endpoint.
+.PP
+When RAG is enabled, additional endpoints are available under \fB/v1/rag/\fR:
+.TP
+.B POST /v1/rag/retrieve
+Retrieve relevant documents for a query.
+.TP
+.B POST /v1/rag/retrieve-and-generate
+Retrieve documents and generate a response.
+.TP
+.B POST /v1/rag/ingest
+Ingest documents into the knowledge base.
+.SH EXAMPLES
+Start server on localhost:
+.PP
+.RS
+.B llama-gguf serve model.gguf
+.RE
+.PP
+Start server accessible from network:
+.PP
+.RS
+.B llama-gguf serve model.gguf --host 0.0.0.0 --port 8080
+.RE
+.PP
+Start server with RAG enabled:
+.PP
+.RS
+.B llama-gguf serve model.gguf --rag-database-url postgres://user:pass@localhost/ragdb
+.RE
+.PP
+Use with curl:
+.PP
+.RS
+.nf
+curl http://localhost:8080/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"messages":[{"role":"user","content":"Hello!"}]}'
+.fi
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-chat (1),
+.BR llama-gguf-rag (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

@@ -26,9 +26,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show information about a GGUF model file
+    /// Show information about a model file (GGUF or ONNX)
     Info {
-        /// Path to the GGUF model file
+        /// Path to the model file (.gguf or .onnx)
         model: String,
 
         /// Show all metadata (verbose)
@@ -38,7 +38,7 @@ enum Commands {
 
     /// Run inference on a model
     Run {
-        /// Path to the GGUF model file
+        /// Path to the model file (.gguf or .onnx)
         model: String,
 
         /// Prompt text
@@ -72,11 +72,15 @@ enum Commands {
         /// Use GPU acceleration (CUDA)
         #[arg(long)]
         gpu: bool,
+
+        /// Path to external tokenizer (tokenizer.json or .gguf file)
+        #[arg(long)]
+        tokenizer: Option<String>,
     },
 
     /// Interactive chat mode (local model or remote server)
     Chat {
-        /// Path to the GGUF model file (not needed when using --server)
+        /// Path to the model file (not needed when using --server)
         model: Option<String>,
 
         /// Connect to a remote OpenAI-compatible server instead of loading a local model.
@@ -111,6 +115,10 @@ enum Commands {
         /// Random seed (optional)
         #[arg(long)]
         seed: Option<u64>,
+
+        /// Path to external tokenizer (tokenizer.json or .gguf file)
+        #[arg(long)]
+        tokenizer: Option<String>,
     },
 
     /// Start HTTP server with OpenAI-compatible API
@@ -234,6 +242,14 @@ enum Commands {
         /// Output path for the configuration file
         #[arg(short, long, default_value = "llama-gguf.toml")]
         output: String,
+    },
+
+    /// Generate and install man pages
+    Manpages {
+        /// Output directory for man pages.
+        /// Typical locations: /usr/local/share/man/man1, ~/.local/share/man/man1
+        #[arg(default_value = ".")]
+        output_dir: String,
     },
 }
 
@@ -582,6 +598,7 @@ fn main() {
             repeat_penalty,
             seed,
             gpu,
+            tokenizer,
         } => {
             // CLI args override config file values; clap defaults are used when
             // the user didn't explicitly pass an argument (we detect this by
@@ -597,6 +614,7 @@ fn main() {
                 cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
                 seed.or(ec.seed),
                 gpu || ec.use_gpu,
+                tokenizer,
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -612,6 +630,7 @@ fn main() {
             top_p,
             repeat_penalty,
             seed,
+            tokenizer,
         } => {
             // Determine server URL: --server flag > config file > none
             let server_url = server.or_else(|| cfg.server.host_url());
@@ -662,6 +681,7 @@ fn main() {
                     cli_or_config_f32(top_p, 0.9, ec.top_p),
                     cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
                     seed.or(ec.seed),
+                    tokenizer,
                 ) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
@@ -813,7 +833,83 @@ fn main() {
             eprintln!("Created configuration file: {}", output);
             eprintln!("Edit it to set your model path and preferred defaults.");
         }
+        Commands::Manpages { output_dir } => {
+            if let Err(e) = generate_manpages(&output_dir) {
+                eprintln!("Error generating man pages: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+/// Generate man pages using clap_mangen
+fn generate_manpages(output_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use clap::CommandFactory;
+    use clap_mangen::Man;
+    use std::fs;
+    use std::path::Path;
+
+    let out_dir = Path::new(output_dir);
+
+    // Create output directory if it doesn't exist
+    fs::create_dir_all(out_dir)?;
+
+    // Generate main command man page
+    let cmd = Cli::command();
+    let man = Man::new(cmd.clone());
+    let mut buffer = Vec::new();
+    man.render(&mut buffer)?;
+    let main_path = out_dir.join("llama-gguf.1");
+    fs::write(&main_path, buffer)?;
+    eprintln!("Generated: {}", main_path.display());
+
+    // Generate man pages for each subcommand
+    for subcommand in cmd.get_subcommands() {
+        let name = subcommand.get_name();
+        // Skip hidden commands
+        if subcommand.is_hide_set() {
+            continue;
+        }
+
+        let sub_man = Man::new(subcommand.clone());
+        let mut buffer = Vec::new();
+        sub_man.render(&mut buffer)?;
+
+        let filename = format!("llama-gguf-{}.1", name);
+        let path = out_dir.join(&filename);
+        fs::write(&path, buffer)?;
+        eprintln!("Generated: {}", path.display());
+
+        // Handle nested subcommands (like "models list", "rag init", etc.)
+        for nested in subcommand.get_subcommands() {
+            if nested.is_hide_set() {
+                continue;
+            }
+            let nested_name = nested.get_name();
+            let nested_man = Man::new(nested.clone());
+            let mut buffer = Vec::new();
+            nested_man.render(&mut buffer)?;
+
+            let filename = format!("llama-gguf-{}-{}.1", name, nested_name);
+            let path = out_dir.join(&filename);
+            fs::write(&path, buffer)?;
+            eprintln!("Generated: {}", path.display());
+        }
+    }
+
+    eprintln!();
+    eprintln!("Man pages generated in: {}", out_dir.display());
+    eprintln!();
+    eprintln!("To install system-wide (requires sudo):");
+    eprintln!("  sudo cp {}/*.1 /usr/local/share/man/man1/", out_dir.display());
+    eprintln!("  sudo mandb");
+    eprintln!();
+    eprintln!("Or install for current user:");
+    eprintln!("  mkdir -p ~/.local/share/man/man1");
+    eprintln!("  cp {}/*.1 ~/.local/share/man/man1/", out_dir.display());
+    eprintln!("  mandb -u");
+
+    Ok(())
 }
 
 // ============================================================================
@@ -878,9 +974,11 @@ fn run_inference(
     repeat_penalty: f32,
     seed: Option<u64>,
     use_gpu: bool,
+    tokenizer_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::load(EngineConfig {
         model_path: model_path.to_string(),
+        tokenizer_path,
         temperature,
         top_k,
         top_p,
@@ -921,9 +1019,11 @@ fn run_chat(
     top_p: f32,
     repeat_penalty: f32,
     seed: Option<u64>,
+    tokenizer_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::load(EngineConfig {
         model_path: model_path.to_string(),
+        tokenizer_path,
         temperature,
         top_k,
         top_p,
@@ -1127,6 +1227,11 @@ fn run_remote_chat(
 }
 
 fn show_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Auto-detect format
+    if path.ends_with(".onnx") {
+        return show_onnx_info(path, verbose);
+    }
+
     let file = GgufFile::open(path)?;
     let data = &file.data;
 
@@ -1247,6 +1352,140 @@ fn show_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>
     }
 
     Ok(())
+}
+
+fn show_onnx_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "onnx")]
+    {
+        use llama_gguf::onnx::{OnnxFile, OnnxModelLoader};
+        use llama_gguf::onnx::reader::{onnx_dtype_name};
+
+        let onnx = OnnxFile::open(path)?;
+        let meta = onnx.metadata();
+
+        println!("╭─────────────────────────────────────────────────────────────────╮");
+        println!("│                        ONNX Model Info                          │");
+        println!("╰─────────────────────────────────────────────────────────────────╯");
+        println!();
+        println!("File: {}", path);
+        println!("IR Version: {}", meta.ir_version);
+        println!("Producer: {} {}", meta.producer_name, meta.producer_version);
+        if !meta.domain.is_empty() {
+            println!("Domain: {}", meta.domain);
+        }
+        println!();
+
+        // Opset info
+        println!("┌─ Opset Imports ─────────────────────────────────────────────────┐");
+        for (domain, version) in &meta.opset_imports {
+            let domain_display = if domain.is_empty() { "ai.onnx" } else { domain };
+            println!("│ {:<40} v{:<21} │", domain_display, version);
+        }
+        println!("└───────────────────────────────────────────────────────────────┘");
+        println!();
+
+        // Try to load config.json for architecture info
+        let model_dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let config_path = model_dir.join("config.json");
+        if config_path.exists() {
+            if let Ok(loader) = OnnxModelLoader::load(path) {
+                let config = loader.config();
+                println!("┌─ Model Configuration (from config.json) ─────────────────────┐");
+                println!("│ Architecture: {:<49} │", format!("{:?}", loader.architecture()));
+                println!("│ Hidden size: {:<50} │", config.hidden_size);
+                println!("│ Intermediate size: {:<44} │", config.intermediate_size);
+                println!("│ Layers: {:<55} │", config.num_layers);
+                println!("│ Attention heads: {:<46} │", config.num_heads);
+                println!("│ KV heads: {:<53} │", config.num_kv_heads);
+                println!("│ Head dim: {:<53} │", config.head_dim);
+                println!("│ Max seq len: {:<50} │", config.max_seq_len);
+                println!("│ Vocab size: {:<51} │", config.vocab_size);
+                println!("│ RoPE freq base: {:<47} │", config.rope_config.freq_base);
+                println!("│ Norm eps: {:<53} │", format!("{:.2e}", config.norm_eps));
+                println!("└───────────────────────────────────────────────────────────────┘");
+                println!();
+            }
+        }
+
+        // Graph inputs/outputs
+        if let Ok(inputs) = onnx.inputs() {
+            println!("┌─ Graph Inputs ─────────────────────────────────────────────────┐");
+            for (name, dims) in &inputs {
+                let dims_str = format!("{:?}", dims);
+                println!("│ {:<40} {:>22} │", truncate(name, 40), dims_str);
+            }
+            println!("└───────────────────────────────────────────────────────────────┘");
+            println!();
+        }
+
+        if let Ok(outputs) = onnx.outputs() {
+            println!("┌─ Graph Outputs ────────────────────────────────────────────────┐");
+            for name in &outputs {
+                println!("│ {:<63} │", truncate(name, 63));
+            }
+            println!("└───────────────────────────────────────────────────────────────┘");
+            println!();
+        }
+
+        // Show initializer tensors (weights)
+        if let Ok(infos) = onnx.tensor_infos() {
+            println!("┌─ Initializer Tensors (Weights) ────────────────────────────────┐");
+            let max_tensors = if verbose { infos.len() } else { 15 };
+            for info in infos.iter().take(max_tensors) {
+                let dims_str = format!("{:?}", info.dims);
+                let dtype_str = onnx_dtype_name(info.data_type);
+                println!(
+                    "│ {:<30} {:>16} {:>8} │",
+                    truncate(&info.name, 30),
+                    dims_str,
+                    dtype_str
+                );
+            }
+            if infos.len() > max_tensors {
+                println!(
+                    "│ ... and {} more tensors{:>29} │",
+                    infos.len() - max_tensors,
+                    ""
+                );
+            }
+            println!("│                                                               │");
+            println!("│ Total initializers: {:<43} │", infos.len());
+            println!("└───────────────────────────────────────────────────────────────┘");
+        }
+
+        // Show graph nodes if verbose
+        if verbose {
+            if let Ok(nodes) = onnx.nodes() {
+                println!();
+                println!("┌─ Graph Nodes ({}) ─────────────────────────────────────────┐", nodes.len());
+                for node in nodes.iter().take(50) {
+                    println!(
+                        "│ {:<20} {:<43} │",
+                        truncate(&node.op_type, 20),
+                        truncate(&node.name, 43)
+                    );
+                }
+                if nodes.len() > 50 {
+                    println!(
+                        "│ ... and {} more nodes{:>30} │",
+                        nodes.len() - 50,
+                        ""
+                    );
+                }
+                println!("└───────────────────────────────────────────────────────────────┘");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = (path, verbose);
+        Err("ONNX support requires the `onnx` feature. Build with: cargo build --features onnx".into())
+    }
 }
 
 fn truncate(s: &str, max_len: usize) -> String {

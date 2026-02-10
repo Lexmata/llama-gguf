@@ -1,10 +1,11 @@
 //! llama-rs: A Rust implementation of llama.cpp
 //!
-//! High-performance LLM inference engine with support for GGUF models.
+//! High-performance LLM inference engine with support for GGUF and ONNX models.
 //!
 //! # Features
 //!
 //! - Full GGUF file format support (v1, v2, v3)
+//! - ONNX model loading (with `onnx` feature) for HuggingFace Optimum exports
 //! - All quantization formats (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, K-quants)
 //! - Memory-mapped model loading
 //! - CPU backend with SIMD and parallel operations
@@ -33,6 +34,8 @@ pub mod gguf;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod model;
+#[cfg(feature = "onnx")]
+pub mod onnx;
 pub mod rag;
 pub mod sampling;
 #[cfg(feature = "server")]
@@ -68,6 +71,8 @@ pub use tensor::{DType, Tensor, TensorError, TensorStorage};
 pub use tokenizer::{Tokenizer, TokenizerError};
 #[cfg(feature = "huggingface")]
 pub use huggingface::{HfClient, HfError, HfFileInfo, format_bytes};
+#[cfg(feature = "onnx")]
+pub use onnx::{OnnxError, OnnxFile, OnnxMetadata, OnnxModelLoader, OnnxTensorInfo, HfConfig};
 #[cfg(feature = "rag")]
 pub use rag::{RagConfig, RagStore, RagError, RagResult, Document, NewDocument, RagContextBuilder, TextChunker};
 

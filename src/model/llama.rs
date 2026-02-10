@@ -194,7 +194,8 @@ impl Model for LlamaModel {
             }
             
             final_hidden = Some(hidden);
-        }
+            
+            }
 
         // Update position
         ctx.position = new_pos;

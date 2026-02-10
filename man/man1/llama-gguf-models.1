@@ -1,0 +1,87 @@
+.\" Man page for llama-gguf-models
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-MODELS 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-models \- manage local model cache
+.SH SYNOPSIS
+.B llama-gguf models
+\fIACTION\fR
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Manage the local cache of downloaded GGUF models. Provides commands to
+list cached models, search HuggingFace Hub, view cache information, and
+clear the cache.
+.PP
+Requires the \fBhuggingface\fR feature to be compiled in.
+.SH ACTIONS
+.TP
+.BR list
+List all locally cached models with their file paths and sizes.
+.TP
+.BR search " " \fIQUERY\fR
+Search for models on HuggingFace Hub.
+.RS
+.TP
+.BR \-l ", " \-\-limit " " \fIN\fR
+Maximum number of search results. Default: 10.
+.RE
+.TP
+.BR cache-info
+Show information about the model cache, including directory location,
+total size, and number of cached models.
+.TP
+.BR clear-cache
+Clear the model cache, removing all downloaded models.
+.RS
+.TP
+.BR \-y ", " \-\-yes
+Skip confirmation prompt.
+.RE
+.TP
+.BR list-files " " \fIREPO\fR
+List GGUF files available in a HuggingFace repository.
+.SH EXAMPLES
+List cached models:
+.PP
+.RS
+.B llama-gguf models list
+.RE
+.PP
+Search HuggingFace for GGUF models:
+.PP
+.RS
+.B llama-gguf models search "llama 7b gguf"
+.RE
+.PP
+Show cache information:
+.PP
+.RS
+.B llama-gguf models cache-info
+.RE
+.PP
+Clear cache with confirmation:
+.PP
+.RS
+.B llama-gguf models clear-cache
+.RE
+.PP
+Clear cache without confirmation:
+.PP
+.RS
+.B llama-gguf models clear-cache -y
+.RE
+.PP
+List files in a repository:
+.PP
+.RS
+.B llama-gguf models list-files Qwen/Qwen2.5-0.5B-Instruct-GGUF
+.RE
+.SH FILES
+.TP
+.I ~/.cache/llama-gguf/
+Default model cache directory.
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-download (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

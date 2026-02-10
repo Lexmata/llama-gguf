@@ -258,6 +258,7 @@ impl Attention {
         self.wk.forward(&x_vec, &mut k, backend)?;
         self.wv.forward(&x_vec, &mut v, backend)?;
 
+
         // Reshape to [num_heads, 1, head_dim] for RoPE
         let mut q_reshaped = q.reshape(vec![self.num_heads, 1, self.head_dim])?;
         let mut k_reshaped = k.reshape(vec![self.num_kv_heads, 1, self.head_dim])?;

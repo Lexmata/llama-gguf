@@ -1,10 +1,11 @@
 # llama-gguf
 
-A high-performance Rust implementation of [llama.cpp](https://github.com/ggerganov/llama.cpp) - an LLM inference engine with full GGUF support.
+A high-performance Rust implementation of [llama.cpp](https://github.com/ggerganov/llama.cpp) - an LLM inference engine with full GGUF and ONNX support.
 
 ## Features
 
 - **Full GGUF Support** - Load any GGUF model file compatible with llama.cpp
+- **ONNX Support** - Load HuggingFace Optimum ONNX exports (F32, F16, BF16 with auto-conversion)
 - **Multiple Architectures** - LLaMA, Mistral, Qwen2, TinyLlama, DeepSeek, and more
 - **Quantization** - All K-quant formats (Q2_K through Q8_0) plus F16/F32
 - **HuggingFace Integration** - Download models directly from HuggingFace Hub
@@ -24,6 +25,48 @@ cargo build --release
 ```
 
 The binary will be at `target/release/llama-gguf`.
+
+### System Installation with Man Pages
+
+**Option 1: Using cargo install (generates man pages from CLI)**
+
+```bash
+cargo install llama-gguf
+
+# Generate and install man pages
+llama-gguf manpages ~/.local/share/man/man1
+mandb -u
+
+# Or system-wide (requires sudo)
+sudo llama-gguf manpages /usr/local/share/man/man1
+sudo mandb
+```
+
+**Option 2: Using make (includes detailed hand-written man pages)**
+
+```bash
+git clone https://github.com/Lexmata/llama-gguf.git
+cd llama-gguf
+
+# Build and install to /usr/local (requires sudo)
+sudo make install
+
+# Or install to a custom prefix
+make PREFIX=~/.local install
+
+# Install man pages only
+sudo make install-man
+```
+
+After installation, access documentation with:
+
+```bash
+man llama-gguf           # Main command overview
+man llama-gguf-run       # Run inference
+man llama-gguf-chat      # Interactive chat
+man llama-gguf-serve     # HTTP server
+man llama-gguf-rag       # RAG operations
+```
 
 ### As a Library
 
@@ -49,8 +92,11 @@ llama-gguf download Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q4_
 ### Run Inference
 
 ```bash
-# Basic text generation
+# Basic text generation (GGUF)
 llama-gguf run model.gguf -p "Hello, world!" -n 50
+
+# ONNX model (requires config.json and tokenizer.json in the same directory)
+llama-gguf run model.onnx -p "Hello, world!" -n 50
 
 # With sampling parameters
 llama-gguf run model.gguf -p "Once upon a time" -n 100 --temperature 0.8 --top-k 40
@@ -63,6 +109,7 @@ llama-gguf run model.gguf -p "1+1=" -n 5 --temperature 0
 
 ```bash
 llama-gguf info model.gguf
+llama-gguf info model.onnx
 ```
 
 ## Supported Models
@@ -139,11 +186,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 llama-gguf <COMMAND>
 
 Commands:
-  run       Run inference on a model
-  info      Display model information
-  download  Download a model from HuggingFace Hub
-  models    Manage cached models
-  help      Print help
+  info         Display model information
+  run          Run inference on a model
+  chat         Interactive chat mode
+  serve        Start HTTP server (with --features server)
+  quantize     Quantize a model
+  bench        Benchmark model performance
+  embed        Extract embeddings
+  download     Download a model from HuggingFace Hub
+  models       Manage cached models
+  rag          RAG operations (with --features rag)
+  init-config  Generate example config file
+  manpages     Generate and install man pages
+  help         Print help
 
 Run Options:
   -p, --prompt <PROMPT>      Input prompt
@@ -156,11 +211,42 @@ Run Options:
       --gpu                  Use GPU acceleration (requires CUDA build)
 ```
 
+## ONNX Support
+
+llama-gguf can load models exported to ONNX format via [HuggingFace Optimum](https://huggingface.co/docs/optimum/). ONNX support is enabled by default.
+
+**Supported formats:**
+- F32, F16, and BF16 weight tensors (F16/BF16 auto-converted to F32)
+- External data files (`.onnx_data`) for large models
+- Graph-traced tensor name resolution for Optimum exports
+
+**Requirements:**
+
+An ONNX model directory must contain:
+- `model.onnx` — the model graph and weights
+- `config.json` — HuggingFace model configuration
+- `tokenizer.json` — HuggingFace tokenizer
+
+**Exporting a model to ONNX:**
+
+```bash
+pip install optimum[onnxruntime]
+optimum-cli export onnx --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 ./tinyllama-onnx/
+```
+
+```bash
+# Run the exported model
+llama-gguf run ./tinyllama-onnx/model.onnx -p "Hello!" -n 50
+```
+
 ## Building with Features
 
 ```bash
-# CPU only (default)
+# CPU + ONNX (default)
 cargo build --release
+
+# Without ONNX support
+cargo build --release --no-default-features --features cpu,huggingface,cli,client
 
 # With CUDA GPU support (requires CUDA toolkit)
 CUDA_PATH=/opt/cuda cargo build --release --features cuda

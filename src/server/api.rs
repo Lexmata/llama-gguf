@@ -8,7 +8,7 @@ use axum::Router;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::engine::ChatTemplate;
+use crate::engine::{ChatTemplate, Engine, EngineConfig};
 use crate::gguf::GgufFile;
 use crate::model::ModelLoader;
 use crate::tokenizer::Tokenizer;
@@ -52,6 +52,17 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     let model = loader.build_model()?;
     eprintln!("Model loaded successfully");
 
+    // Select backend (GPU if LLAMA_GPU=1, otherwise CPU)
+    let use_gpu = std::env::var("LLAMA_GPU")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let backend: Arc<dyn crate::Backend> = if use_gpu {
+        Engine::select_gpu_backend(&model)
+    } else {
+        Arc::new(crate::backend::cpu::CpuBackend::new())
+    };
+
     // Extract model name from path
     let model_name = std::path::Path::new(&config.model_path)
         .file_stem()
@@ -66,6 +77,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
         config: model_config,
         model_name,
         chat_template,
+        backend,
         inference_lock: Mutex::new(()),
     });
 

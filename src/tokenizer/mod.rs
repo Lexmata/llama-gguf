@@ -605,6 +605,201 @@ impl Tokenizer {
             || self.special_tokens.pad_token_id == Some(id)
             || self.special_tokens.unk_token_id == Some(id)
     }
+
+    /// Load tokenizer from a HuggingFace `tokenizer.json` file
+    ///
+    /// This parses the JSON format used by HuggingFace tokenizers (the `tokenizers` library).
+    /// Supports BPE models which cover LLaMA, Mistral, Qwen, and most modern LLMs.
+    pub fn from_hf_json(path: impl AsRef<std::path::Path>) -> TokenizerResult<Self> {
+        let path = path.as_ref();
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| TokenizerError::MissingData(format!("{}: {}", path.display(), e)))?;
+
+        Self::from_hf_json_str(&data)
+    }
+
+    /// Parse tokenizer from a HuggingFace tokenizer.json string
+    pub fn from_hf_json_str(json: &str) -> TokenizerResult<Self> {
+        let root: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| TokenizerError::EncodingError(format!("Invalid tokenizer.json: {}", e)))?;
+
+        // Extract the model section
+        let model = root.get("model")
+            .ok_or_else(|| TokenizerError::MissingData("model section in tokenizer.json".into()))?;
+
+        let model_type = model.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("BPE");
+
+        let tokenizer_type = match model_type {
+            "BPE" => TokenizerType::BPE,
+            "Unigram" => TokenizerType::SentencePiece,
+            "WordPiece" => TokenizerType::WordPiece,
+            _ => TokenizerType::Unknown,
+        };
+
+        // Parse vocabulary from model.vocab
+        // HF BPE vocab is an object: { "token": id, ... }
+        let vocab_obj = model.get("vocab")
+            .ok_or_else(|| TokenizerError::MissingData("model.vocab in tokenizer.json".into()))?;
+
+        let vocab_map = vocab_obj.as_object()
+            .ok_or_else(|| TokenizerError::MissingData("model.vocab should be an object".into()))?;
+
+        let vocab_size = vocab_map.len();
+        let mut token_to_id = HashMap::with_capacity(vocab_size);
+        let mut id_to_token = vec![String::new(); vocab_size];
+
+        for (token, id_val) in vocab_map {
+            let id = id_val.as_u64()
+                .ok_or_else(|| TokenizerError::MissingData(format!("Invalid vocab ID for '{}'", token)))?
+                as u32;
+            token_to_id.insert(token.clone(), id);
+            if (id as usize) < id_to_token.len() {
+                id_to_token[id as usize] = token.clone();
+            }
+        }
+
+        // Parse BPE merges from model.merges
+        let mut merges = HashMap::new();
+        if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
+            for (priority, merge_val) in merges_arr.iter().enumerate() {
+                if let Some(merge_str) = merge_val.as_str() {
+                    let parts: Vec<&str> = merge_str.split(' ').collect();
+                    if parts.len() == 2 {
+                        if let (Some(&id1), Some(&id2)) =
+                            (token_to_id.get(parts[0]), token_to_id.get(parts[1]))
+                        {
+                            let merged = format!("{}{}", parts[0], parts[1]);
+                            if let Some(&merged_id) = token_to_id.get(&merged) {
+                                merges.insert((id1, id2), (merged_id, priority));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Parse special tokens from added_tokens
+        let mut bos_token_id: Option<u32> = None;
+        let mut eos_token_id: Option<u32> = None;
+        let mut pad_token_id: Option<u32> = None;
+        let mut unk_token_id: Option<u32> = None;
+
+        if let Some(added_tokens) = root.get("added_tokens").and_then(|v| v.as_array()) {
+            for token_obj in added_tokens {
+                let content = token_obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let id = token_obj.get("id").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let special = token_obj.get("special").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                if special {
+                    if let Some(id) = id {
+                        // Detect special token roles by common names
+                        let content_lower = content.to_lowercase();
+                        if content_lower.contains("bos")
+                            || content == "<s>"
+                            || content == "<|begin_of_text|>"
+                            || content == "<|startoftext|>"
+                        {
+                            bos_token_id = Some(id);
+                        }
+                        if content_lower.contains("eos")
+                            || content == "</s>"
+                            || content == "<|end_of_text|>"
+                            || content == "<|endoftext|>"
+                            || content == "<|eot_id|>"
+                        {
+                            eos_token_id = Some(id);
+                        }
+                        if content_lower.contains("pad") || content == "<pad>" {
+                            pad_token_id = Some(id);
+                        }
+                        if content_lower.contains("unk") || content == "<unk>" {
+                            unk_token_id = Some(id);
+                        }
+
+                        // Make sure the special token is in the vocab
+                        token_to_id.insert(content.to_string(), id);
+                        if (id as usize) < id_to_token.len() {
+                            id_to_token[id as usize] = content.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check post_processor for special token IDs
+        if let Some(post_proc) = root.get("post_processor") {
+            // TemplateProcessing format
+            if let Some(special_tokens_map) = post_proc.get("special_tokens") {
+                if let Some(bos_obj) = special_tokens_map.get("<s>")
+                    .or_else(|| special_tokens_map.get("<|begin_of_text|>"))
+                {
+                    if let Some(ids) = bos_obj.get("ids").and_then(|v| v.as_array()) {
+                        if let Some(id) = ids.first().and_then(|v| v.as_u64()) {
+                            bos_token_id = bos_token_id.or(Some(id as u32));
+                        }
+                    }
+                }
+                if let Some(eos_obj) = special_tokens_map.get("</s>")
+                    .or_else(|| special_tokens_map.get("<|end_of_text|>"))
+                {
+                    if let Some(ids) = eos_obj.get("ids").and_then(|v| v.as_array()) {
+                        if let Some(id) = ids.first().and_then(|v| v.as_u64()) {
+                            eos_token_id = eos_token_id.or(Some(id as u32));
+                        }
+                    }
+                }
+            }
+        }
+
+        let special_tokens = SpecialTokens {
+            bos_token_id: bos_token_id.unwrap_or(1),
+            eos_token_id: eos_token_id.unwrap_or(2),
+            pad_token_id,
+            unk_token_id,
+        };
+
+        // Build token types (all normal for HF tokenizer, mark specials as Control)
+        let mut token_types = vec![TokenType::Normal; vocab_size];
+        for &id in [special_tokens.bos_token_id, special_tokens.eos_token_id].iter() {
+            if (id as usize) < token_types.len() {
+                token_types[id as usize] = TokenType::Control;
+            }
+        }
+        if let Some(pad_id) = special_tokens.pad_token_id {
+            if (pad_id as usize) < token_types.len() {
+                token_types[pad_id as usize] = TokenType::Control;
+            }
+        }
+        if let Some(unk_id) = special_tokens.unk_token_id {
+            if (unk_id as usize) < token_types.len() {
+                token_types[unk_id as usize] = TokenType::Control;
+            }
+        }
+
+        // Mark byte tokens
+        for (token, &id) in &token_to_id {
+            if token.starts_with("<0x") && token.ends_with('>') && token.len() == 6 {
+                if (id as usize) < token_types.len() {
+                    token_types[id as usize] = TokenType::Byte;
+                }
+            }
+        }
+
+        let scores = vec![0.0; vocab_size];
+
+        Ok(Self {
+            token_to_id,
+            id_to_token,
+            scores,
+            merges,
+            special_tokens,
+            tokenizer_type,
+            vocab_size,
+            token_types,
+        })
+    }
 }
 
 #[cfg(test)]

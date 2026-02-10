@@ -1,0 +1,86 @@
+.\" Man page for llama-gguf-run
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-RUN 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-run \- run inference on a GGUF model
+.SH SYNOPSIS
+.B llama-gguf run
+[\fIOPTIONS\fR]
+\fIMODEL\fR
+.SH DESCRIPTION
+Run text generation inference on a GGUF model file. The generated text
+is streamed to stdout as tokens are produced.
+.SH ARGUMENTS
+.TP
+.I MODEL
+Path to the GGUF model file.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-prompt " " \fITEXT\fR
+Input prompt text. If not specified, defaults to "Hello".
+.TP
+.BR \-n ", " \-\-n-predict " " \fIN\fR
+Number of tokens to generate. Default: 128.
+.TP
+.BR \-t ", " \-\-temperature " " \fIT\fR
+Sampling temperature. Higher values produce more creative/random output.
+Use 0.0 for deterministic (greedy) sampling. Default: 0.8.
+.TP
+.BR \-\-top-k " " \fIK\fR
+Top-K sampling parameter. Limits token selection to the K most likely
+tokens. Use 0 to disable. Default: 40.
+.TP
+.BR \-\-top-p " " \fIP\fR
+Top-P (nucleus) sampling parameter. Selects from the smallest set of
+tokens whose cumulative probability exceeds P. Default: 0.95.
+.TP
+.BR \-\-repeat-penalty " " \fIR\fR
+Repetition penalty. Values > 1.0 discourage repetition. Default: 1.1.
+.TP
+.BR \-\-seed " " \fISEED\fR
+Random seed for reproducible output. If not specified, a random seed is used.
+.TP
+.BR \-\-gpu
+Use GPU acceleration (CUDA). Requires the \fBcuda\fR feature to be compiled in.
+.SH CHAT TEMPLATES
+For models trained with chat/instruction formats, the prompt is automatically
+wrapped in the appropriate template based on model metadata. Supported formats:
+.TP
+.B <|user|>/<|assistant|>
+Used by many fine-tuned models.
+.TP
+.B <|im_start|>/<|im_end|>
+ChatML format used by Qwen2 and similar models.
+.TP
+.B [INST]...[/INST]
+Llama-2 instruction format used by Mistral.
+.SH EXAMPLES
+Basic text generation:
+.PP
+.RS
+.B llama-gguf run model.gguf -p "Once upon a time" -n 100
+.RE
+.PP
+Deterministic output (greedy sampling):
+.PP
+.RS
+.B llama-gguf run model.gguf -p "1+1=" -n 5 --temperature 0
+.RE
+.PP
+Creative generation with higher temperature:
+.PP
+.RS
+.B llama-gguf run model.gguf -p "Write a poem about" --temperature 1.2 --top-p 0.9
+.RE
+.PP
+Reproducible output with seed:
+.PP
+.RS
+.B llama-gguf run model.gguf -p "Hello" --seed 42
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-chat (1),
+.BR llama-gguf-info (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

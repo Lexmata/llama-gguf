@@ -24,7 +24,7 @@ pub use architecture::Architecture;
 pub use cache::{
     CachedPrefix, PrefixId, PrefixSharing, PromptCache, PromptCacheConfig, PromptCacheStats,
 };
-pub use config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType};
+pub use config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType, RopeType};
 pub use embeddings::{
     EmbeddingConfig, EmbeddingError, EmbeddingExtractor, PoolingStrategy, TruncationStrategy,
     cosine_similarity, dot_product, euclidean_distance, find_nearest,
