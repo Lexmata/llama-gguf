@@ -89,3 +89,27 @@ jobs:
 
       - name: Test
         run: cargo test --features vulkan
+
+  dx12:
+    name: DX12 (Windows)
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-dx12
+
+      - name: Verify dxc
+        run: dxc --version
+        continue-on-error: true
+
+      - name: Build
+        run: cargo build --features dx12
+
+      - name: Test
+        run: cargo test --features dx12
+
+      - name: DX12 integration tests
+        run: cargo test --features dx12 --test dx12_integration

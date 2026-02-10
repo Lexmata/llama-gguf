@@ -229,7 +229,10 @@ impl ChatTemplate {
                 )
             }
             ChatTemplate::None => {
-                format!("System: {}\n\nUser: {}\n\nAssistant:", system_prompt, user_message)
+                format!(
+                    "System: {}\n\nUser: {}\n\nAssistant:",
+                    system_prompt, user_message
+                )
             }
         }
     }
@@ -309,7 +312,8 @@ impl Engine {
             Some("onnx") => Self::load_onnx(config),
             #[cfg(not(feature = "onnx"))]
             Some("onnx") => Err(EngineError::Other(
-                "ONNX support requires the `onnx` feature. Build with: cargo build --features onnx".into(),
+                "ONNX support requires the `onnx` feature. Build with: cargo build --features onnx"
+                    .into(),
             )),
             _ => Self::load_gguf(config),
         }
@@ -462,9 +466,7 @@ impl Engine {
         let model: Box<dyn Model> = Box::new(concrete_model);
 
         // Infer chat template from model type
-        let chat_template = ChatTemplate::detect_from_model_type(
-            hf_config.model_type.as_deref(),
-        );
+        let chat_template = ChatTemplate::detect_from_model_type(hf_config.model_type.as_deref());
         tracing::info!("Chat template: {:?}", chat_template);
 
         // For ONNX models, default to adding BOS
@@ -496,10 +498,8 @@ impl Engine {
 
     /// Select the best available GPU backend.
     ///
-    /// Priority: CUDA > Metal > Vulkan > CPU fallback.
-    pub fn select_gpu_backend(
-        model: &crate::model::LlamaModel,
-    ) -> Arc<dyn Backend> {
+    /// Priority: CUDA > Metal > DX12 > Vulkan > CPU fallback.
+    pub fn select_gpu_backend(_model: &crate::model::LlamaModel) -> Arc<dyn Backend> {
         // Try CUDA first (NVIDIA GPUs)
         #[cfg(feature = "cuda")]
         {
@@ -507,10 +507,7 @@ impl Engine {
                 Ok(mut cuda) => {
                     tracing::info!("Using CUDA backend: {}", cuda.device_name());
                     if let Err(e) = cuda.load_model_weights(model) {
-                        tracing::warn!(
-                            "Failed to load GPU weights ({}), using quantized ops",
-                            e
-                        );
+                        tracing::warn!("Failed to load GPU weights ({}), using quantized ops", e);
                     }
                     return Arc::new(cuda);
                 }
@@ -529,7 +526,21 @@ impl Engine {
                     return Arc::new(metal);
                 }
                 Err(e) => {
-                    tracing::info!("Metal not available ({}), trying Vulkan...", e);
+                    tracing::info!("Metal not available ({}), trying DX12...", e);
+                }
+            }
+        }
+
+        // Try DX12 (native Windows GPU compute)
+        #[cfg(all(feature = "dx12", target_os = "windows"))]
+        {
+            match crate::backend::dx12::Dx12Backend::new() {
+                Ok(dx12) => {
+                    tracing::info!("Using DX12 backend: {}", dx12.device_name());
+                    return Arc::new(dx12);
+                }
+                Err(e) => {
+                    tracing::info!("DX12 not available ({}), trying Vulkan...", e);
                 }
             }
         }
@@ -549,10 +560,15 @@ impl Engine {
         }
 
         // Fallback message when no GPU backend is compiled
-        #[cfg(not(any(feature = "cuda", feature = "vulkan", all(feature = "metal", target_os = "macos"))))]
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "vulkan",
+            all(feature = "metal", target_os = "macos"),
+            all(feature = "dx12", target_os = "windows")
+        )))]
         {
             tracing::warn!(
-                "No GPU backend compiled. Build with --features cuda, --features metal, or --features vulkan"
+                "No GPU backend compiled. Build with --features cuda, --features metal, --features dx12, or --features vulkan"
             );
         }
 
@@ -602,10 +618,10 @@ impl Engine {
 
         for _ in 0..max_tokens {
             // Check if we hit EOS
-            if let Some(&last) = tokens.last() {
-                if last == self.tokenizer.special_tokens.eos_token_id {
-                    break;
-                }
+            if let Some(&last) = tokens.last()
+                && last == self.tokenizer.special_tokens.eos_token_id
+            {
+                break;
             }
 
             // Run forward pass
@@ -657,11 +673,7 @@ impl Engine {
     ///
     /// Each item in the returned iterator is a `Result<String, EngineError>` containing
     /// the decoded text of one or more tokens.
-    pub fn generate_streaming(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-    ) -> GenerationStream<'_> {
+    pub fn generate_streaming(&self, prompt: &str, max_tokens: usize) -> GenerationStream<'_> {
         GenerationStream::new(self, prompt, max_tokens)
     }
 
@@ -725,11 +737,11 @@ impl<'a> Iterator for GenerationStream<'a> {
         }
 
         // Check EOS from last token
-        if let Some(&last) = self.tokens.last() {
-            if last == self.engine.tokenizer.special_tokens.eos_token_id {
-                self.done = true;
-                return None;
-            }
+        if let Some(&last) = self.tokens.last()
+            && last == self.engine.tokenizer.special_tokens.eos_token_id
+        {
+            self.done = true;
+            return None;
         }
 
         // Forward pass
@@ -921,10 +933,7 @@ impl ChatEngine {
     ///
     /// Returns an iterator of `Result<String, EngineError>` where each item is
     /// a decoded token chunk.
-    pub fn chat_streaming(
-        &mut self,
-        message: &str,
-    ) -> Result<ChatStream<'_>, EngineError> {
+    pub fn chat_streaming(&mut self, message: &str) -> Result<ChatStream<'_>, EngineError> {
         let max_tokens = self.engine.engine_config.max_tokens;
 
         // Format the message
@@ -1024,11 +1033,14 @@ impl<'a> Iterator for ChatStream<'a> {
             }
         }
 
-        let last_token = *self
-            .chat_engine
-            .conversation_tokens
-            .last()
-            .unwrap_or(&self.chat_engine.engine.tokenizer.special_tokens.bos_token_id);
+        let last_token = *self.chat_engine.conversation_tokens.last().unwrap_or(
+            &self
+                .chat_engine
+                .engine
+                .tokenizer
+                .special_tokens
+                .bos_token_id,
+        );
 
         let logits = match self
             .chat_engine
@@ -1049,7 +1061,14 @@ impl<'a> Iterator for ChatStream<'a> {
             .sample(&logits, &self.chat_engine.conversation_tokens);
 
         // Check for EOS
-        if next_token == self.chat_engine.engine.tokenizer.special_tokens.eos_token_id {
+        if next_token
+            == self
+                .chat_engine
+                .engine
+                .tokenizer
+                .special_tokens
+                .eos_token_id
+        {
             self.done = true;
             return None;
         }

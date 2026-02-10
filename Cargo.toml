@@ -27,6 +27,7 @@ cuda = ["dep:cudarc"]
 vulkan = ["dep:ash", "dep:gpu-allocator"]
 vulkan-shaders = []  # Enable build-time shader compilation (requires glslc)
 metal = ["dep:metal", "dep:objc"]
+dx12 = ["dep:windows"]
 server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:futures"]
 rag = ["dep:tokio-postgres", "dep:pgvector", "dep:deadpool-postgres", "dep:tokio", "dep:url"]
 huggingface = ["dep:reqwest", "dep:indicatif", "dep:directories"]
@@ -53,6 +54,14 @@ ash = { version = "0.38", optional = true, features = ["loaded", "debug"] }
 gpu-allocator = { version = "0.28", optional = true, default-features = false, features = ["vulkan", "std"] }
 metal = { version = "0.28", optional = true }
 objc = { version = "0.2", optional = true }
+windows = { version = "0.58", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+] }
 
 axum = { version = "0.7", optional = true }
 tokio = { version = "1.35", features = ["full"], optional = true }

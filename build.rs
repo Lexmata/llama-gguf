@@ -18,6 +18,12 @@ fn main() {
     if env::var("CARGO_FEATURE_VULKAN").is_ok() {
         compile_vulkan_shaders();
     }
+
+    // Compile DX12 shaders when the dx12 feature is enabled (Windows only)
+    #[cfg(target_os = "windows")]
+    if env::var("CARGO_FEATURE_DX12").is_ok() {
+        compile_dx12_shaders();
+    }
 }
 
 // =============================================================================
@@ -61,10 +67,7 @@ fn compile_vulkan_shaders() {
             let precompiled = shader_dir.join(format!("{}.spv", shader_name));
             if precompiled.exists() {
                 std::fs::copy(&precompiled, &output).unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to copy pre-compiled shader {}: {}",
-                        shader_name, e
-                    );
+                    panic!("Failed to copy pre-compiled shader {}: {}", shader_name, e);
                 });
                 eprintln!(
                     "cargo:warning=Using pre-compiled SPIR-V for {} (no shader compiler found)",
@@ -85,17 +88,17 @@ fn compile_vulkan_shaders() {
 
 fn find_shader_compiler() -> Option<ShaderCompiler> {
     // Try glslc first (from Vulkan SDK or system)
-    if let Ok(output) = Command::new("glslc").arg("--version").output() {
-        if output.status.success() {
-            return Some(ShaderCompiler::Glslc);
-        }
+    if let Ok(output) = Command::new("glslc").arg("--version").output()
+        && output.status.success()
+    {
+        return Some(ShaderCompiler::Glslc);
     }
 
     // Try glslangValidator
-    if let Ok(output) = Command::new("glslangValidator").arg("--version").output() {
-        if output.status.success() {
-            return Some(ShaderCompiler::GlslangValidator);
-        }
+    if let Ok(output) = Command::new("glslangValidator").arg("--version").output()
+        && output.status.success()
+    {
+        return Some(ShaderCompiler::GlslangValidator);
     }
 
     None
@@ -130,7 +133,11 @@ fn compile_shader(compiler: &ShaderCompiler, input: &Path, output: &Path, name: 
             eprintln!("Compiled shader: {}", name);
         }
         Ok(s) => {
-            panic!("Shader compilation failed for {}: exit code {:?}", name, s.code());
+            panic!(
+                "Shader compilation failed for {}: exit code {:?}",
+                name,
+                s.code()
+            );
         }
         Err(e) => {
             panic!("Failed to run shader compiler for {}: {}", name, e);
@@ -207,9 +214,7 @@ fn compile_metal_shaders() {
                 // xcrun not available -- try pre-compiled
                 let precompiled = shader_dir.join("shaders.metallib");
                 if precompiled.exists() {
-                    eprintln!(
-                        "cargo:warning=xcrun not found, using pre-compiled Metal library"
-                    );
+                    eprintln!("cargo:warning=xcrun not found, using pre-compiled Metal library");
                     std::fs::copy(&precompiled, out_dir.join("shaders.metallib"))
                         .expect("Failed to copy pre-compiled metallib");
                     return;
@@ -241,15 +246,130 @@ fn compile_metal_shaders() {
             );
         }
         Ok(s) => {
-            panic!(
-                "Metal library linking failed: exit code {:?}",
-                s.code()
-            );
+            panic!("Metal library linking failed: exit code {:?}", s.code());
         }
         Err(e) => {
             panic!("Failed to run metallib linker: {}", e);
         }
     }
+}
+
+// =============================================================================
+// DX12 HLSL shader compilation (Windows only)
+// =============================================================================
+
+#[cfg(target_os = "windows")]
+fn compile_dx12_shaders() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let shader_dir = Path::new("src/backend/dx12/shaders");
+
+    let shaders = [
+        "add",
+        "mul",
+        "scale",
+        "silu",
+        "gelu",
+        "softmax_max",
+        "softmax_exp",
+        "softmax_div",
+        "rms_norm_sum",
+        "rms_norm_scale",
+        "vec_mat",
+        "rope",
+    ];
+
+    let compiler = find_dxc_compiler();
+
+    for shader_name in &shaders {
+        let input = shader_dir.join(format!("{}.hlsl", shader_name));
+        let output = out_dir.join(format!("{}.cso", shader_name));
+
+        println!("cargo:rerun-if-changed={}", input.display());
+
+        if let Some(ref dxc) = compiler {
+            let status = Command::new(dxc)
+                .arg("/T")
+                .arg("cs_6_0")
+                .arg("/O2")
+                .arg("/Fo")
+                .arg(&output)
+                .arg(&input)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    eprintln!("Compiled DX12 shader: {}", shader_name);
+                }
+                Ok(s) => {
+                    panic!(
+                        "DX12 shader compilation failed for {}: exit code {:?}",
+                        shader_name,
+                        s.code()
+                    );
+                }
+                Err(e) => {
+                    panic!("Failed to run dxc for {}: {}", shader_name, e);
+                }
+            }
+        } else {
+            // Try pre-compiled CSO from source tree
+            let precompiled = shader_dir.join(format!("{}.cso", shader_name));
+            if precompiled.exists() {
+                std::fs::copy(&precompiled, &output).unwrap_or_else(|e| {
+                    panic!("Failed to copy pre-compiled shader {}: {}", shader_name, e);
+                });
+                eprintln!(
+                    "cargo:warning=Using pre-compiled CSO for {} (dxc not found)",
+                    shader_name
+                );
+            } else {
+                panic!(
+                    "Cannot compile DX12 shaders: dxc.exe not found and no pre-compiled \
+                     .cso files available.\n\
+                     Install the Windows SDK or DirectX Shader Compiler, or \
+                     pre-compile shaders with: dxc /T cs_6_0 /O2 /Fo {}.cso {}.hlsl",
+                    shader_name, shader_name
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_dxc_compiler() -> Option<PathBuf> {
+    // Try dxc from PATH
+    if let Ok(output) = Command::new("dxc").arg("--version").output() {
+        if output.status.success() {
+            return Some(PathBuf::from("dxc"));
+        }
+    }
+
+    // Try Windows SDK paths
+    let program_files =
+        env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+
+    let sdk_base = Path::new(&program_files).join("Windows Kits\\10\\bin");
+    if sdk_base.is_dir() {
+        // Look for the newest SDK version
+        if let Ok(entries) = std::fs::read_dir(&sdk_base) {
+            let mut versions: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.path())
+                .collect();
+            versions.sort();
+            versions.reverse();
+
+            for ver_dir in versions {
+                let dxc_path = ver_dir.join("x64\\dxc.exe");
+                if dxc_path.exists() {
+                    return Some(dxc_path);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // =============================================================================
