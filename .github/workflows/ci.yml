@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
+  test:
+    name: Test (${{ matrix.name }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+            features: default
+          - name: macOS ARM
+            runner: macos-latest
+            features: default,metal
+          - name: macOS Intel
+            runner: macos-13
+            features: default,metal
+          - name: Windows
+            runner: windows-latest
+            features: default
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.runner }}-${{ matrix.features }}
+
+      - name: Verify Metal toolchain
+        if: contains(matrix.features, 'metal')
+        run: xcrun --sdk macosx metal --version
+
+      - name: Build
+        run: cargo build --features ${{ matrix.features }}
+
+      - name: Test
+        run: cargo test --features ${{ matrix.features }}
+
+      - name: Metal integration tests
+        if: contains(matrix.features, 'metal')
+        run: cargo test --features metal --test metal_integration
+
+  vulkan:
+    name: Vulkan (Linux)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-vulkan
+
+      - name: Install Vulkan SDK
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Verify glslc
+        run: glslc --version
+
+      - name: Build
+        run: cargo build --features vulkan
+
+      - name: Test
+        run: cargo test --features vulkan
