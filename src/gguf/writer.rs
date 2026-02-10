@@ -10,9 +10,9 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
-use super::constants::{GgmlType, GgufMetadataValueType, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC};
-use super::types::{MetadataArray, MetadataValue};
 use super::GgufError;
+use super::constants::{GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GgmlType, GgufMetadataValueType};
+use super::types::{MetadataArray, MetadataValue};
 
 /// GGUF file writer
 pub struct GgufWriter<W: Write + Seek> {
@@ -176,7 +176,9 @@ impl<W: Write + Seek> GgufWriter<W> {
 
     fn write_metadata(&mut self) -> Result<(), GgufError> {
         // Sort keys for consistent output and clone values to avoid borrow issues
-        let mut items: Vec<_> = self.metadata.iter()
+        let mut items: Vec<_> = self
+            .metadata
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         items.sort_by(|a, b| a.0.cmp(&b.0));
@@ -300,7 +302,7 @@ impl<W: Write + Seek> GgufWriter<W> {
             MetadataValue::Bool(v) => self.writer.write_all(&[if *v { 1 } else { 0 }])?,
             MetadataValue::String(v) => self.write_string(v)?,
             MetadataValue::Array(_) => {
-                return Err(GgufError::InvalidData("Nested arrays not supported".into()))
+                return Err(GgufError::InvalidData("Nested arrays not supported".into()));
             }
         }
         Ok(())
@@ -308,7 +310,9 @@ impl<W: Write + Seek> GgufWriter<W> {
 
     fn write_tensor_infos(&mut self) -> Result<Vec<u64>, GgufError> {
         // Clone tensor info to avoid borrow issues
-        let tensor_infos: Vec<_> = self.tensors.iter()
+        let tensor_infos: Vec<_> = self
+            .tensors
+            .iter()
             .map(|t| (t.name.clone(), t.dims.clone(), t.dtype, t.data_size()))
             .collect();
 
@@ -350,9 +354,7 @@ impl<W: Write + Seek> GgufWriter<W> {
 
     fn write_tensor_data(&mut self, _offsets: &[u64]) -> Result<(), GgufError> {
         // Clone tensor data to avoid borrow issues
-        let tensor_data: Vec<_> = self.tensors.iter()
-            .map(|t| t.data.clone())
-            .collect();
+        let tensor_data: Vec<_> = self.tensors.iter().map(|t| t.data.clone()).collect();
         let alignment = self.alignment;
 
         for data in tensor_data {
@@ -434,15 +436,19 @@ impl GgufBuilder {
 
     /// Add general architecture metadata
     pub fn architecture(mut self, arch: &str) -> Self {
-        self.metadata
-            .insert("general.architecture".to_string(), MetadataValue::String(arch.to_string()));
+        self.metadata.insert(
+            "general.architecture".to_string(),
+            MetadataValue::String(arch.to_string()),
+        );
         self
     }
 
     /// Add model name
     pub fn name(mut self, name: &str) -> Self {
-        self.metadata
-            .insert("general.name".to_string(), MetadataValue::String(name.to_string()));
+        self.metadata.insert(
+            "general.name".to_string(),
+            MetadataValue::String(name.to_string()),
+        );
         self
     }
 

@@ -73,12 +73,7 @@ pub fn mul(ctx: &MetalContext, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Back
 }
 
 /// Scale: out = a * scalar
-pub fn scale(
-    ctx: &MetalContext,
-    a: &Tensor,
-    scalar: f32,
-    out: &mut Tensor,
-) -> BackendResult<()> {
+pub fn scale(ctx: &MetalContext, a: &Tensor, scalar: f32, out: &mut Tensor) -> BackendResult<()> {
     let a_data = a.as_f32()?;
     let out_data = out.as_f32_mut()?;
     let n = a_data.len();
@@ -316,12 +311,7 @@ pub fn rms_norm(
 }
 
 /// Vector-matrix multiply: out = a @ b where a is [k], b is [k, n] (GGUF column-major), out is [n]
-pub fn vec_mat(
-    ctx: &MetalContext,
-    a: &Tensor,
-    b: &Tensor,
-    out: &mut Tensor,
-) -> BackendResult<()> {
+pub fn vec_mat(ctx: &MetalContext, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
     let a_data = a.as_f32()?;
     let b_data = b.as_f32()?;
     let out_data = out.as_f32_mut()?;

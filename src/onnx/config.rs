@@ -86,9 +86,8 @@ impl HfConfig {
     /// Load config from a JSON file path
     pub fn from_file<P: AsRef<Path>>(path: P) -> OnnxResult<Self> {
         let path = path.as_ref();
-        let data = std::fs::read_to_string(path).map_err(|e| {
-            OnnxError::MissingConfig(format!("{}: {}", path.display(), e))
-        })?;
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| OnnxError::MissingConfig(format!("{}: {}", path.display(), e)))?;
         Self::from_json(&data)
     }
 
@@ -114,9 +113,9 @@ impl HfConfig {
 
     /// Convert to internal ModelConfig
     pub fn to_model_config(&self) -> OnnxResult<ModelConfig> {
-        let hidden_size = self.hidden_size.ok_or_else(|| {
-            OnnxError::ConfigParse("missing hidden_size in config.json".into())
-        })?;
+        let hidden_size = self
+            .hidden_size
+            .ok_or_else(|| OnnxError::ConfigParse("missing hidden_size in config.json".into()))?;
 
         let num_heads = self.num_attention_heads.ok_or_else(|| {
             OnnxError::ConfigParse("missing num_attention_heads in config.json".into())

@@ -116,9 +116,7 @@ impl VulkanBackend {
                 return vec![];
             };
 
-            let devices = instance
-                .enumerate_physical_devices()
-                .unwrap_or_default();
+            let devices = instance.enumerate_physical_devices().unwrap_or_default();
 
             let mut result = Vec::new();
             for pd in devices {
@@ -299,9 +297,9 @@ impl Backend for VulkanBackend {
         use_neox: bool,
     ) -> BackendResult<()> {
         match ops::rope(&self.ctx, q, k, pos, freq_base, freq_scale, use_neox) {
-            Err(BackendError::Unsupported(_)) => {
-                self.cpu_fallback.rope(q, k, pos, freq_base, freq_scale, use_neox)
-            }
+            Err(BackendError::Unsupported(_)) => self
+                .cpu_fallback
+                .rope(q, k, pos, freq_base, freq_scale, use_neox),
             other => other,
         }
     }
@@ -434,12 +432,22 @@ mod tests {
 
     /// Assert two f32 slices are approximately equal.
     fn assert_approx_eq(a: &[f32], b: &[f32], tol: f32) {
-        assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
             assert!(
                 (x - y).abs() < tol,
                 "element {} differs: gpu={} expected={} (diff={}, tol={})",
-                i, x, y, (x - y).abs(), tol,
+                i,
+                x,
+                y,
+                (x - y).abs(),
+                tol,
             );
         }
     }
@@ -762,8 +770,8 @@ mod tests {
         backend.silu(&x, &mut out).unwrap();
 
         let result = out.as_f32().unwrap();
-        assert!(result[0].abs() < 1e-5);             // SiLU(0) = 0
-        assert!((result[1] - 0.731).abs() < 0.01);   // SiLU(1) ≈ 0.731
+        assert!(result[0].abs() < 1e-5); // SiLU(0) = 0
+        assert!((result[1] - 0.731).abs() < 0.01); // SiLU(1) ≈ 0.731
         assert!((result[2] - (-0.269)).abs() < 0.01); // SiLU(-1) ≈ -0.269
     }
 
@@ -882,7 +890,9 @@ mod tests {
             assert!(
                 result[i] >= result[i - 1],
                 "not monotonic at {}: {} < {}",
-                i, result[i], result[i - 1]
+                i,
+                result[i],
+                result[i - 1]
             );
         }
     }
@@ -910,7 +920,8 @@ mod tests {
             assert!(
                 (v - expected_val).abs() < 1e-5,
                 "expected {} got {}",
-                expected_val, v
+                expected_val,
+                v
             );
         }
     }
@@ -1012,11 +1023,7 @@ mod tests {
         let mut cpu_out = Tensor::zeros(vec![n], DType::F32);
         cpu.rms_norm(&x, &weight, 1e-5, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            gpu_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-3,
-        );
+        assert_approx_eq(gpu_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-3);
     }
 
     // =========================================================================
@@ -1101,11 +1108,7 @@ mod tests {
         let mut cpu_out = Tensor::zeros(vec![n], DType::F32);
         cpu.vec_mat(&a, &b, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            gpu_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-2,
-        );
+        assert_approx_eq(gpu_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-2);
     }
 
     #[test]
@@ -1174,16 +1177,8 @@ mod tests {
         cpu.rope(&mut q_cpu, &mut k_cpu, pos, freq_base, freq_scale, false)
             .unwrap();
 
-        assert_approx_eq(
-            q_gpu.as_f32().unwrap(),
-            q_cpu.as_f32().unwrap(),
-            1e-3,
-        );
-        assert_approx_eq(
-            k_gpu.as_f32().unwrap(),
-            k_cpu.as_f32().unwrap(),
-            1e-3,
-        );
+        assert_approx_eq(q_gpu.as_f32().unwrap(), q_cpu.as_f32().unwrap(), 1e-3);
+        assert_approx_eq(k_gpu.as_f32().unwrap(), k_cpu.as_f32().unwrap(), 1e-3);
     }
 
     #[test]
@@ -1251,7 +1246,9 @@ mod tests {
             assert!(
                 (mag_after - q_mag_before[h]).abs() < 0.1,
                 "head {} magnitude changed: {} -> {}",
-                h, q_mag_before[h], mag_after,
+                h,
+                q_mag_before[h],
+                mag_after,
             );
         }
     }
@@ -1273,16 +1270,25 @@ mod tests {
         let mut q1 = Tensor::from_f32(&data, vec![1, 1, head_dim]).unwrap();
         let mut k1 = Tensor::from_f32(&data, vec![1, 1, head_dim]).unwrap();
 
-        backend.rope(&mut q0, &mut k0, 0, 10000.0, 1.0, false).unwrap();
-        backend.rope(&mut q1, &mut k1, 10, 10000.0, 1.0, false).unwrap();
+        backend
+            .rope(&mut q0, &mut k0, 0, 10000.0, 1.0, false)
+            .unwrap();
+        backend
+            .rope(&mut q1, &mut k1, 10, 10000.0, 1.0, false)
+            .unwrap();
 
         // Position 0 and 10 should give different results
         let q0_data = q0.as_f32().unwrap();
         let q1_data = q1.as_f32().unwrap();
-        let diff: f32 = q0_data.iter().zip(q1_data.iter())
+        let diff: f32 = q0_data
+            .iter()
+            .zip(q1_data.iter())
             .map(|(a, b)| (a - b).abs())
             .sum();
-        assert!(diff > 0.01, "positions 0 and 10 should produce different rotations");
+        assert!(
+            diff > 0.01,
+            "positions 0 and 10 should produce different rotations"
+        );
     }
 
     // =========================================================================
@@ -1317,7 +1323,9 @@ mod tests {
         };
 
         let a = Tensor::from_f32(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
             vec![3, 4],
         )
         .unwrap();
@@ -1491,11 +1499,7 @@ mod tests {
             backend.add(&a, &b, &mut gpu_out).unwrap();
             cpu.add(&a, &b, &mut cpu_out).unwrap();
 
-            assert_approx_eq(
-                gpu_out.as_f32().unwrap(),
-                cpu_out.as_f32().unwrap(),
-                1e-4,
-            );
+            assert_approx_eq(gpu_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-4);
         }
     }
 
@@ -1521,11 +1525,7 @@ mod tests {
             backend.mul(&a, &b, &mut gpu_out).unwrap();
             cpu.mul(&a, &b, &mut cpu_out).unwrap();
 
-            assert_approx_eq(
-                gpu_out.as_f32().unwrap(),
-                cpu_out.as_f32().unwrap(),
-                1e-4,
-            );
+            assert_approx_eq(gpu_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-4);
         }
     }
 

@@ -16,17 +16,27 @@
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod tests {
-    use llama_gguf::backend::metal::{MetalBackend, MetalConfig};
     use llama_gguf::backend::Backend;
+    use llama_gguf::backend::metal::{MetalBackend, MetalConfig};
     use llama_gguf::tensor::{DType, Tensor};
 
     fn assert_approx_eq(a: &[f32], b: &[f32], tol: f32) {
-        assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
             assert!(
                 (x - y).abs() < tol,
                 "element {} differs: metal={} expected={} (diff={}, tol={})",
-                i, x, y, (x - y).abs(), tol,
+                i,
+                x,
+                y,
+                (x - y).abs(),
+                tol,
             );
         }
     }
@@ -97,11 +107,7 @@ mod tests {
             backend.add(&a, &b, &mut metal_out).unwrap();
             cpu.add(&a, &b, &mut cpu_out).unwrap();
 
-            assert_approx_eq(
-                metal_out.as_f32().unwrap(),
-                cpu_out.as_f32().unwrap(),
-                1e-5,
-            );
+            assert_approx_eq(metal_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-5);
             println!("  add n={}: PASS", n);
         }
     }
@@ -124,11 +130,7 @@ mod tests {
         backend.mul(&a, &b, &mut metal_out).unwrap();
         cpu.mul(&a, &b, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            metal_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-5,
-        );
+        assert_approx_eq(metal_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-5);
     }
 
     #[test]
@@ -146,11 +148,7 @@ mod tests {
         backend.scale(&a, 2.718, &mut metal_out).unwrap();
         cpu.scale(&a, 2.718, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            metal_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-4,
-        );
+        assert_approx_eq(metal_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-4);
     }
 
     #[test]
@@ -168,11 +166,7 @@ mod tests {
         backend.silu(&x, &mut metal_out).unwrap();
         cpu.silu(&x, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            metal_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-4,
-        );
+        assert_approx_eq(metal_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-4);
     }
 
     #[test]
@@ -190,11 +184,7 @@ mod tests {
         backend.gelu(&x, &mut metal_out).unwrap();
         cpu.gelu(&x, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            metal_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-4,
-        );
+        assert_approx_eq(metal_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-4);
     }
 
     #[test]
@@ -215,11 +205,7 @@ mod tests {
         backend.rms_norm(&x, &weight, 1e-5, &mut metal_out).unwrap();
         cpu.rms_norm(&x, &weight, 1e-5, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            metal_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-3,
-        );
+        assert_approx_eq(metal_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-3);
     }
 
     #[test]
@@ -241,11 +227,7 @@ mod tests {
         backend.vec_mat(&a, &b, &mut metal_out).unwrap();
         cpu.vec_mat(&a, &b, &mut cpu_out).unwrap();
 
-        assert_approx_eq(
-            metal_out.as_f32().unwrap(),
-            cpu_out.as_f32().unwrap(),
-            1e-2,
-        );
+        assert_approx_eq(metal_out.as_f32().unwrap(), cpu_out.as_f32().unwrap(), 1e-2);
     }
 
     #[test]
@@ -271,16 +253,8 @@ mod tests {
         cpu.rope(&mut q_cpu, &mut k_cpu, 42, 10000.0, 1.0, false)
             .unwrap();
 
-        assert_approx_eq(
-            q_metal.as_f32().unwrap(),
-            q_cpu.as_f32().unwrap(),
-            1e-3,
-        );
-        assert_approx_eq(
-            k_metal.as_f32().unwrap(),
-            k_cpu.as_f32().unwrap(),
-            1e-3,
-        );
+        assert_approx_eq(q_metal.as_f32().unwrap(), q_cpu.as_f32().unwrap(), 1e-3);
+        assert_approx_eq(k_metal.as_f32().unwrap(), k_cpu.as_f32().unwrap(), 1e-3);
     }
 
     // =========================================================================
@@ -362,10 +336,7 @@ mod tests {
             .expect("Failed to generate with Metal backend");
 
         println!("Generated: \"{}\"", result);
-        assert!(
-            !result.is_empty(),
-            "Metal backend produced empty output"
-        );
+        assert!(!result.is_empty(), "Metal backend produced empty output");
 
         println!("GGUF model loading and inference on Metal: PASSED");
     }

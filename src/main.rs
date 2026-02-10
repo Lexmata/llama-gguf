@@ -901,7 +901,10 @@ fn generate_manpages(output_dir: &str) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("Man pages generated in: {}", out_dir.display());
     eprintln!();
     eprintln!("To install system-wide (requires sudo):");
-    eprintln!("  sudo cp {}/*.1 /usr/local/share/man/man1/", out_dir.display());
+    eprintln!(
+        "  sudo cp {}/*.1 /usr/local/share/man/man1/",
+        out_dir.display()
+    );
     eprintln!("  sudo mandb");
     eprintln!();
     eprintln!("Or install for current user:");
@@ -964,6 +967,7 @@ fn run_server(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inference(
     model_path: &str,
     prompt: Option<&str>,
@@ -1010,6 +1014,7 @@ fn run_inference(
 }
 
 /// Interactive chat mode
+#[allow(clippy::too_many_arguments)]
 fn run_chat(
     model_path: &str,
     system_prompt: Option<&str>,
@@ -1357,8 +1362,8 @@ fn show_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>
 fn show_onnx_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "onnx")]
     {
+        use llama_gguf::onnx::reader::onnx_dtype_name;
         use llama_gguf::onnx::{OnnxFile, OnnxModelLoader};
-        use llama_gguf::onnx::reader::{onnx_dtype_name};
 
         let onnx = OnnxFile::open(path)?;
         let meta = onnx.metadata();
@@ -1389,24 +1394,27 @@ fn show_onnx_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::E
             .parent()
             .unwrap_or(std::path::Path::new("."));
         let config_path = model_dir.join("config.json");
-        if config_path.exists() {
-            if let Ok(loader) = OnnxModelLoader::load(path) {
-                let config = loader.config();
-                println!("┌─ Model Configuration (from config.json) ─────────────────────┐");
-                println!("│ Architecture: {:<49} │", format!("{:?}", loader.architecture()));
-                println!("│ Hidden size: {:<50} │", config.hidden_size);
-                println!("│ Intermediate size: {:<44} │", config.intermediate_size);
-                println!("│ Layers: {:<55} │", config.num_layers);
-                println!("│ Attention heads: {:<46} │", config.num_heads);
-                println!("│ KV heads: {:<53} │", config.num_kv_heads);
-                println!("│ Head dim: {:<53} │", config.head_dim);
-                println!("│ Max seq len: {:<50} │", config.max_seq_len);
-                println!("│ Vocab size: {:<51} │", config.vocab_size);
-                println!("│ RoPE freq base: {:<47} │", config.rope_config.freq_base);
-                println!("│ Norm eps: {:<53} │", format!("{:.2e}", config.norm_eps));
-                println!("└───────────────────────────────────────────────────────────────┘");
-                println!();
-            }
+        if config_path.exists()
+            && let Ok(loader) = OnnxModelLoader::load(path)
+        {
+            let config = loader.config();
+            println!("┌─ Model Configuration (from config.json) ─────────────────────┐");
+            println!(
+                "│ Architecture: {:<49} │",
+                format!("{:?}", loader.architecture())
+            );
+            println!("│ Hidden size: {:<50} │", config.hidden_size);
+            println!("│ Intermediate size: {:<44} │", config.intermediate_size);
+            println!("│ Layers: {:<55} │", config.num_layers);
+            println!("│ Attention heads: {:<46} │", config.num_heads);
+            println!("│ KV heads: {:<53} │", config.num_kv_heads);
+            println!("│ Head dim: {:<53} │", config.head_dim);
+            println!("│ Max seq len: {:<50} │", config.max_seq_len);
+            println!("│ Vocab size: {:<51} │", config.vocab_size);
+            println!("│ RoPE freq base: {:<47} │", config.rope_config.freq_base);
+            println!("│ Norm eps: {:<53} │", format!("{:.2e}", config.norm_eps));
+            println!("└───────────────────────────────────────────────────────────────┘");
+            println!();
         }
 
         // Graph inputs/outputs
@@ -1456,26 +1464,23 @@ fn show_onnx_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::E
         }
 
         // Show graph nodes if verbose
-        if verbose {
-            if let Ok(nodes) = onnx.nodes() {
-                println!();
-                println!("┌─ Graph Nodes ({}) ─────────────────────────────────────────┐", nodes.len());
-                for node in nodes.iter().take(50) {
-                    println!(
-                        "│ {:<20} {:<43} │",
-                        truncate(&node.op_type, 20),
-                        truncate(&node.name, 43)
-                    );
-                }
-                if nodes.len() > 50 {
-                    println!(
-                        "│ ... and {} more nodes{:>30} │",
-                        nodes.len() - 50,
-                        ""
-                    );
-                }
-                println!("└───────────────────────────────────────────────────────────────┘");
+        if verbose && let Ok(nodes) = onnx.nodes() {
+            println!();
+            println!(
+                "┌─ Graph Nodes ({}) ─────────────────────────────────────────┐",
+                nodes.len()
+            );
+            for node in nodes.iter().take(50) {
+                println!(
+                    "│ {:<20} {:<43} │",
+                    truncate(&node.op_type, 20),
+                    truncate(&node.name, 43)
+                );
             }
+            if nodes.len() > 50 {
+                println!("│ ... and {} more nodes{:>30} │", nodes.len() - 50, "");
+            }
+            println!("└───────────────────────────────────────────────────────────────┘");
         }
 
         Ok(())
@@ -1484,7 +1489,10 @@ fn show_onnx_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::E
     #[cfg(not(feature = "onnx"))]
     {
         let _ = (path, verbose);
-        Err("ONNX support requires the `onnx` feature. Build with: cargo build --features onnx".into())
+        Err(
+            "ONNX support requires the `onnx` feature. Build with: cargo build --features onnx"
+                .into(),
+        )
     }
 }
 
@@ -2095,10 +2103,10 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
             rt.block_on(async {
                 use llama_gguf::rag::{NewDocument, TextChunker};
                 use std::path::Path;
-                
+
                 // Load config
                 let mut cfg = RagConfig::load(config.as_deref())?;
-                
+
                 // Apply CLI overrides
                 if let Some(url) = database_url {
                     cfg.database.connection_string = url;
@@ -2106,23 +2114,23 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                 if let Some(t) = table {
                     cfg.embeddings.table_name = t;
                 }
-                
+
                 println!("Indexing documents from: {}", path);
-                
+
                 let store = RagStore::connect(cfg).await?;
-                
+
                 let chunker = TextChunker::new(chunk_size).with_overlap(chunk_overlap);
                 let path = Path::new(&path);
-                
+
                 let mut total_chunks = 0;
-                
+
                 if path.is_file() {
                     let content = std::fs::read_to_string(path)?;
                     let chunks = chunker.chunk(&content);
-                    
+
                     for chunk in chunks {
                         let embedding = vec![0.0f32; store.config().embedding_dim()];
-                        
+
                         let doc = NewDocument {
                             content: chunk,
                             embedding,
@@ -2130,7 +2138,7 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                                 "source": path.to_string_lossy()
                             })),
                         };
-                        
+
                         store.insert(doc).await?;
                         total_chunks += 1;
                     }
@@ -2138,14 +2146,14 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                     for entry in std::fs::read_dir(path)? {
                         let entry = entry?;
                         let file_path = entry.path();
-                        
+
                         if file_path.is_file()
                             && let Ok(content) = std::fs::read_to_string(&file_path) {
                                 let chunks = chunker.chunk(&content);
-                                
+
                                 for chunk in chunks {
                                     let embedding = vec![0.0f32; store.config().embedding_dim()];
-                                    
+
                                     let doc = NewDocument {
                                         content: chunk,
                                         embedding,
@@ -2153,17 +2161,17 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
                                             "source": file_path.to_string_lossy()
                                         })),
                                     };
-                                    
+
                                     store.insert(doc).await?;
                                     total_chunks += 1;
                                 }
                             }
                     }
                 }
-                
+
                 println!("\nIndexed {} chunks", total_chunks);
                 println!("\nNote: Using placeholder embeddings. For production, integrate a real embedding model.");
-                
+
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
         }

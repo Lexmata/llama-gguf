@@ -77,11 +77,9 @@ impl MetalContext {
         // At build time, all .metal shaders are compiled into a single .metallib
         let metallib_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 
-        let library = device
-            .new_library_with_data(metallib_bytes)
-            .map_err(|e| {
-                BackendError::InitializationFailed(format!("Failed to load Metal library: {}", e))
-            })?;
+        let library = device.new_library_with_data(metallib_bytes).map_err(|e| {
+            BackendError::InitializationFailed(format!("Failed to load Metal library: {}", e))
+        })?;
 
         // Each shader function name maps to a pipeline
         let shader_functions = [

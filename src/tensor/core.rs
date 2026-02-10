@@ -114,9 +114,7 @@ impl Tensor {
             });
         }
 
-        let bytes: Vec<u8> = data.iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         Self::new(bytes, shape, DType::F32)
     }
@@ -145,17 +143,17 @@ impl Tensor {
     pub fn strides(&self) -> &[usize] {
         &self.strides
     }
-    
+
     /// Get the tensor name (for GPU weight lookup)
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
-    
+
     /// Set the tensor name (for GPU weight lookup)
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = Some(name.into());
     }
-    
+
     /// Create a named tensor (builder pattern)
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -172,7 +170,8 @@ impl Tensor {
     pub fn data_mut(&mut self) -> Option<&mut [u8]> {
         let size = self.dtype.size_for_elements(self.numel());
         let offset = self.offset;
-        self.storage.as_bytes_mut()
+        self.storage
+            .as_bytes_mut()
             .map(|bytes| &mut bytes[offset..offset + size])
     }
 
@@ -187,12 +186,8 @@ impl Tensor {
 
         let data = self.data();
         // SAFETY: We verified dtype is F32 and data is contiguous
-        let f32_slice = unsafe {
-            std::slice::from_raw_parts(
-                data.as_ptr() as *const f32,
-                self.numel(),
-            )
-        };
+        let f32_slice =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, self.numel()) };
         Ok(f32_slice)
     }
 
@@ -208,12 +203,8 @@ impl Tensor {
         let numel = self.numel();
         let data = self.data_mut().ok_or(TensorError::NotContiguous)?;
         // SAFETY: We verified dtype is F32 and data is contiguous
-        let f32_slice = unsafe {
-            std::slice::from_raw_parts_mut(
-                data.as_mut_ptr() as *mut f32,
-                numel,
-            )
-        };
+        let f32_slice =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut f32, numel) };
         Ok(f32_slice)
     }
 
@@ -254,7 +245,7 @@ impl Tensor {
     }
 
     /// Reshape the tensor to a new shape
-    /// 
+    ///
     /// Returns a new tensor with the same data but different shape.
     /// The new tensor has its own copy of the data to allow mutation.
     pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, TensorError> {

@@ -61,12 +61,7 @@ pub fn mul(ctx: &VulkanContext, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Bac
 }
 
 /// Scale: out = a * scalar
-pub fn scale(
-    ctx: &VulkanContext,
-    a: &Tensor,
-    scalar: f32,
-    out: &mut Tensor,
-) -> BackendResult<()> {
+pub fn scale(ctx: &VulkanContext, a: &Tensor, scalar: f32, out: &mut Tensor) -> BackendResult<()> {
     let a_data = a.as_f32()?;
     let out_data = out.as_f32_mut()?;
     let n = a_data.len();
@@ -160,7 +155,10 @@ pub fn softmax(ctx: &VulkanContext, x: &Tensor, out: &mut Tensor) -> BackendResu
 
     // Read partial maxes and find global max on CPU
     let partial_maxes = ctx.read_buffer(&partial_max_buf)?;
-    let max_val = partial_maxes.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_val = partial_maxes
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
     ctx.free_buffer(partial_max_buf);
 
     // Pass 2: exp(x - max) per element

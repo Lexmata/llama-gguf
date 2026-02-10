@@ -136,7 +136,10 @@ impl HfClient {
             proj_dirs.cache_dir().join("models")
         } else {
             // Fallback to home directory
-            dirs_fallback().join(".cache").join("llama-rs").join("models")
+            dirs_fallback()
+                .join(".cache")
+                .join("llama-rs")
+                .join("models")
         }
     }
 

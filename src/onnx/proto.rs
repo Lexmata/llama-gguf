@@ -2,4 +2,6 @@
 //!
 //! This module re-exports the prost-generated types from the ONNX proto3 schema.
 
+#![allow(clippy::doc_overindented_list_items, clippy::enum_variant_names)]
+
 include!(concat!(env!("OUT_DIR"), "/onnx.rs"));

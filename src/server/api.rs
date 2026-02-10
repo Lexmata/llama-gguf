@@ -3,8 +3,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
 use axum::Router;
+use axum::routing::{delete, get, post};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -106,8 +106,8 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
 
     #[cfg(feature = "rag")]
     if let Some(ref db_url) = config.rag_database_url {
-        use crate::rag::RagConfig;
         use super::handlers::RagState;
+        use crate::rag::RagConfig;
 
         eprintln!("RAG enabled with database connection");
 
@@ -119,7 +119,10 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
             // Bedrock-style Knowledge Base APIs
             .route("/knowledgebases", post(handlers::list_knowledge_bases))
             .route("/knowledgebases/:kb_id", get(handlers::get_knowledge_base))
-            .route("/knowledgebases/:kb_id", delete(handlers::delete_knowledge_base))
+            .route(
+                "/knowledgebases/:kb_id",
+                delete(handlers::delete_knowledge_base),
+            )
             // Retrieval APIs
             .route("/retrieve", post(handlers::retrieve))
             .route("/ingest", post(handlers::ingest))
@@ -127,7 +130,10 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
 
         // RAG + Model routes (need both states)
         let rag_gen_routes = Router::new()
-            .route("/retrieveAndGenerate", post(handlers::retrieve_and_generate))
+            .route(
+                "/retrieveAndGenerate",
+                post(handlers::retrieve_and_generate),
+            )
             .with_state((app_state.clone(), rag_state));
 
         app = app

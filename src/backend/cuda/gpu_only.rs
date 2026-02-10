@@ -108,10 +108,10 @@ fn rms_norm_gpu(
     };
 
     unsafe {
-        kernels.rms_norm_scale.clone().launch(
-            config,
-            (x, &weight.data, out, rms_inv, n as i32),
-        )
+        kernels
+            .rms_norm_scale
+            .clone()
+            .launch(config, (x, &weight.data, out, rms_inv, n as i32))
     }
     .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
 }
@@ -139,10 +139,10 @@ fn linear_gpu(
     };
 
     unsafe {
-        kernels.vec_mat_f32.clone().launch(
-            config,
-            (x, &weight.data, &mut *out, k as i32, n as i32),
-        )
+        kernels
+            .vec_mat_f32
+            .clone()
+            .launch(config, (x, &weight.data, &mut *out, k as i32, n as i32))
     }
     .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
 
@@ -181,8 +181,13 @@ fn add_gpu(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe { kernels.add_f32.clone().launch(config, (a, b, out, n as i32)) }
-        .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
+    unsafe {
+        kernels
+            .add_f32
+            .clone()
+            .launch(config, (a, b, out, n as i32))
+    }
+    .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
 }
 
 fn mul_gpu(
@@ -198,8 +203,13 @@ fn mul_gpu(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe { kernels.mul_f32.clone().launch(config, (a, b, out, n as i32)) }
-        .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
+    unsafe {
+        kernels
+            .mul_f32
+            .clone()
+            .launch(config, (a, b, out, n as i32))
+    }
+    .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
 }
 
 fn silu_gpu(
@@ -238,8 +248,7 @@ impl GpuOnlyInference {
         let cfg = model.config();
 
         let device = Arc::new(
-            CudaDevice::new(0)
-                .map_err(|e| BackendError::InitializationFailed(format!("{}", e)))?,
+            CudaDevice::new(0).map_err(|e| BackendError::InitializationFailed(format!("{}", e)))?,
         );
 
         eprintln!("Initializing GPU-only inference...");

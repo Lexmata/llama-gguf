@@ -1,7 +1,7 @@
 //! GGUF parsed data types
 
-use std::collections::HashMap;
 use super::constants::GgmlType;
+use std::collections::HashMap;
 
 /// Metadata value variants
 #[derive(Debug, Clone)]

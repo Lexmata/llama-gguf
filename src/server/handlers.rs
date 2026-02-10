@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::stream::{self, Stream};
 use tokio::sync::Mutex;
 
@@ -273,7 +273,9 @@ async fn generate_response(
     let mut completion_tokens = 0;
 
     for _ in 0..max_tokens {
-        let last_token = *all_tokens.last().unwrap_or(&state.tokenizer.special_tokens.bos_token_id);
+        let last_token = *all_tokens
+            .last()
+            .unwrap_or(&state.tokenizer.special_tokens.bos_token_id);
 
         // Forward pass
         let logits = state.model.forward(&[last_token], &mut ctx)?;
@@ -297,7 +299,11 @@ async fn generate_response(
                 for pattern in stop_patterns {
                     if let Some(idx) = combined.find(pattern) {
                         response_text = combined[..idx].to_string();
-                        return Ok((response_text.trim().to_string(), prompt_len, completion_tokens));
+                        return Ok((
+                            response_text.trim().to_string(),
+                            prompt_len,
+                            completion_tokens,
+                        ));
                     }
                 }
                 break;
@@ -309,7 +315,11 @@ async fn generate_response(
         completion_tokens += 1;
     }
 
-    Ok((response_text.trim().to_string(), prompt_len, completion_tokens))
+    Ok((
+        response_text.trim().to_string(),
+        prompt_len,
+        completion_tokens,
+    ))
 }
 
 /// Create streaming response for chat completions
@@ -409,13 +419,13 @@ pub async fn retrieve(
     // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
-        kbs.get(&request.knowledge_base_id).cloned().unwrap_or_else(|| {
-            KnowledgeBaseConfig {
+        kbs.get(&request.knowledge_base_id)
+            .cloned()
+            .unwrap_or_else(|| KnowledgeBaseConfig {
                 name: request.knowledge_base_id.clone(),
                 storage: rag_state.rag_config.clone(),
                 ..Default::default()
-            }
-        })
+            })
     };
 
     // Connect to knowledge base
@@ -432,22 +442,25 @@ pub async fn retrieve(
 
     // Build retrieval config
     let mut retrieval_config = RetrievalConfig::default();
-    
+
     if let Some(ref config) = request.retrieval_configuration
-        && let Some(ref vs_config) = config.vector_search_configuration {
-            retrieval_config.max_results = vs_config.number_of_results;
-            
-            // Convert filter if provided
-            if let Some(ref filter) = vs_config.filter {
-                retrieval_config.filter = convert_filter(filter);
-            }
+        && let Some(ref vs_config) = config.vector_search_configuration
+    {
+        retrieval_config.max_results = vs_config.number_of_results;
+
+        // Convert filter if provided
+        if let Some(ref filter) = vs_config.filter {
+            retrieval_config.filter = convert_filter(filter);
         }
+    }
 
     // Perform retrieval
     match kb.retrieve(&request.query, Some(retrieval_config)).await {
         Ok(response) => {
-            let results: Vec<RetrievalResult> = response.chunks.into_iter().map(|chunk| {
-                RetrievalResult {
+            let results: Vec<RetrievalResult> = response
+                .chunks
+                .into_iter()
+                .map(|chunk| RetrievalResult {
                     content: RetrievalResultContent {
                         text: chunk.content,
                     },
@@ -460,19 +473,17 @@ pub async fn retrieve(
                     },
                     score: chunk.score,
                     metadata: chunk.metadata,
-                }
-            }).collect();
+                })
+                .collect();
 
             Json(RetrieveResponse {
                 retrieval_results: results,
                 next_token: None,
-            }).into_response()
+            })
+            .into_response()
         }
         Err(e) => {
-            let error = ErrorResponse::new(
-                format!("Retrieval failed: {}", e),
-                "retrieval_error",
-            );
+            let error = ErrorResponse::new(format!("Retrieval failed: {}", e), "retrieval_error");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
         }
     }
@@ -486,18 +497,21 @@ pub async fn retrieve_and_generate(
 ) -> Response {
     use crate::rag::{KnowledgeBase, KnowledgeBaseConfig, RetrievalConfig};
 
-    let kb_id = &request.retrieve_and_generate_configuration.knowledge_base_configuration.knowledge_base_id;
+    let kb_id = &request
+        .retrieve_and_generate_configuration
+        .knowledge_base_configuration
+        .knowledge_base_id;
 
     // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
-        kbs.get(kb_id).cloned().unwrap_or_else(|| {
-            KnowledgeBaseConfig {
+        kbs.get(kb_id)
+            .cloned()
+            .unwrap_or_else(|| KnowledgeBaseConfig {
                 name: kb_id.clone(),
                 storage: rag_state.rag_config.clone(),
                 ..Default::default()
-            }
-        })
+            })
     };
 
     // Connect to knowledge base
@@ -514,41 +528,56 @@ pub async fn retrieve_and_generate(
 
     // Build retrieval config
     let mut retrieval_config = RetrievalConfig::default();
-    
-    if let Some(ref config) = request.retrieve_and_generate_configuration.knowledge_base_configuration.retrieval_configuration
-        && let Some(ref vs_config) = config.vector_search_configuration {
-            retrieval_config.max_results = vs_config.number_of_results;
-        }
+
+    if let Some(ref config) = request
+        .retrieve_and_generate_configuration
+        .knowledge_base_configuration
+        .retrieval_configuration
+        && let Some(ref vs_config) = config.vector_search_configuration
+    {
+        retrieval_config.max_results = vs_config.number_of_results;
+    }
 
     // Get prompt template if provided
-    if let Some(ref gen_config) = request.retrieve_and_generate_configuration.knowledge_base_configuration.generation_configuration
-        && let Some(ref template) = gen_config.prompt_template {
-            // Convert Bedrock template format ($query$, $search_results$) to our format ({query}, {context})
-            let converted = template.text_prompt_template
-                .replace("$query$", "{query}")
-                .replace("$search_results$", "{context}");
-            retrieval_config.prompt_template = Some(converted);
-        }
+    if let Some(ref gen_config) = request
+        .retrieve_and_generate_configuration
+        .knowledge_base_configuration
+        .generation_configuration
+        && let Some(ref template) = gen_config.prompt_template
+    {
+        // Convert Bedrock template format ($query$, $search_results$) to our format ({query}, {context})
+        let converted = template
+            .text_prompt_template
+            .replace("$query$", "{query}")
+            .replace("$search_results$", "{context}");
+        retrieval_config.prompt_template = Some(converted);
+    }
 
     // Perform retrieval
-    let rag_response = match kb.retrieve_and_generate(&request.input.text, Some(retrieval_config)).await {
+    let rag_response = match kb
+        .retrieve_and_generate(&request.input.text, Some(retrieval_config))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
-            let error = ErrorResponse::new(
-                format!("RAG failed: {}", e),
-                "rag_error",
-            );
+            let error = ErrorResponse::new(format!("RAG failed: {}", e), "rag_error");
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
         }
     };
 
     // Get inference config
-    let (temperature, top_p, max_tokens) = if let Some(ref gen_config) = 
-        request.retrieve_and_generate_configuration.knowledge_base_configuration.generation_configuration 
+    let (temperature, top_p, max_tokens) = if let Some(ref gen_config) = request
+        .retrieve_and_generate_configuration
+        .knowledge_base_configuration
+        .generation_configuration
     {
         if let Some(ref inf_config) = gen_config.inference_config {
             if let Some(ref text_config) = inf_config.text_inference_config {
-                (text_config.temperature, text_config.top_p, text_config.max_tokens)
+                (
+                    text_config.temperature,
+                    text_config.top_p,
+                    text_config.max_tokens,
+                )
             } else {
                 (0.7, 0.9, 256)
             }
@@ -561,7 +590,7 @@ pub async fn retrieve_and_generate(
 
     // Generate response using the model
     let _lock = app_state.inference_lock.lock().await;
-    
+
     let sampler_config = SamplerConfig {
         temperature,
         top_p,
@@ -574,36 +603,33 @@ pub async fn retrieve_and_generate(
         max_tokens,
         sampler_config,
         None,
-    ).await {
+    )
+    .await
+    {
         Ok((text, _, _)) => text,
         Err(e) => {
-            let error = ErrorResponse::new(
-                format!("Generation failed: {}", e),
-                "generation_error",
-            );
+            let error = ErrorResponse::new(format!("Generation failed: {}", e), "generation_error");
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
         }
     };
 
     // Build citations
-    let citations: Vec<Citation> = rag_response.citations.into_iter().map(|c| {
-        Citation {
+    let citations: Vec<Citation> = rag_response
+        .citations
+        .into_iter()
+        .map(|c| Citation {
             generated_response_part: None,
             retrieved_references: vec![RetrievedReference {
-                content: RetrievalResultContent {
-                    text: c.content,
-                },
+                content: RetrievalResultContent { text: c.content },
                 location: RetrievalResultLocation {
                     location_type: "CUSTOM".to_string(),
                     s3_location: None,
-                    custom_location: Some(CustomLocation {
-                        uri: c.source.uri,
-                    }),
+                    custom_location: Some(CustomLocation { uri: c.source.uri }),
                 },
                 metadata: None,
             }],
-        }
-    }).collect();
+        })
+        .collect();
 
     Json(RetrieveAndGenerateResponse {
         output: RetrieveAndGenerateOutput {
@@ -611,7 +637,8 @@ pub async fn retrieve_and_generate(
         },
         citations,
         session_id: request.session_id,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// Ingest documents into knowledge base
@@ -620,18 +647,18 @@ pub async fn ingest(
     State(rag_state): State<Arc<RagState>>,
     Json(request): Json<IngestRequest>,
 ) -> Response {
-    use crate::rag::{KnowledgeBase, KnowledgeBaseConfig, DataSource};
+    use crate::rag::{DataSource, KnowledgeBase, KnowledgeBaseConfig};
 
     // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
-        kbs.get(&request.knowledge_base_id).cloned().unwrap_or_else(|| {
-            KnowledgeBaseConfig {
+        kbs.get(&request.knowledge_base_id)
+            .cloned()
+            .unwrap_or_else(|| KnowledgeBaseConfig {
                 name: request.knowledge_base_id.clone(),
                 storage: rag_state.rag_config.clone(),
                 ..Default::default()
-            }
-        })
+            })
     };
 
     // Connect to knowledge base
@@ -681,7 +708,8 @@ pub async fn ingest(
         documents_ingested: total_docs,
         chunks_created: total_chunks,
         failures,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// List knowledge bases
@@ -691,21 +719,23 @@ pub async fn list_knowledge_bases(
     Json(_request): Json<ListKnowledgeBasesRequest>,
 ) -> Response {
     let kbs = rag_state.knowledge_bases.read().await;
-    
-    let summaries: Vec<KnowledgeBaseSummary> = kbs.iter().map(|(id, config)| {
-        KnowledgeBaseSummary {
+
+    let summaries: Vec<KnowledgeBaseSummary> = kbs
+        .iter()
+        .map(|(id, config)| KnowledgeBaseSummary {
             knowledge_base_id: id.clone(),
             name: config.name.clone(),
             description: config.description.clone(),
             status: "ACTIVE".to_string(),
             updated_at: current_timestamp(),
-        }
-    }).collect();
+        })
+        .collect();
 
     Json(ListKnowledgeBasesResponse {
         knowledge_base_summaries: summaries,
         next_token: None,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// Get knowledge base details
@@ -719,48 +749,42 @@ pub async fn get_knowledge_base(
     // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
-        kbs.get(&kb_id).cloned().unwrap_or_else(|| {
-            KnowledgeBaseConfig {
+        kbs.get(&kb_id)
+            .cloned()
+            .unwrap_or_else(|| KnowledgeBaseConfig {
                 name: kb_id.clone(),
                 storage: rag_state.rag_config.clone(),
                 ..Default::default()
-            }
-        })
+            })
     };
 
     // Try to connect to get stats
     match KnowledgeBase::connect(kb_config.clone()).await {
-        Ok(kb) => {
-            match kb.stats().await {
-                Ok(stats) => {
-                    Json(GetKnowledgeBaseResponse {
-                        knowledge_base: KnowledgeBaseDetail {
-                            knowledge_base_id: kb_id,
-                            name: stats.name,
-                            description: kb_config.description,
-                            status: "ACTIVE".to_string(),
-                            storage_configuration: StorageConfigurationResponse {
-                                storage_type: "PGVECTOR".to_string(),
-                                vector_dimension: stats.embedding_dimension,
-                            },
-                            updated_at: current_timestamp(),
-                        },
-                    }).into_response()
-                }
-                Err(e) => {
-                    let error = ErrorResponse::new(
-                        format!("Failed to get stats: {}", e),
-                        "knowledge_base_error",
-                    );
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
-                }
+        Ok(kb) => match kb.stats().await {
+            Ok(stats) => Json(GetKnowledgeBaseResponse {
+                knowledge_base: KnowledgeBaseDetail {
+                    knowledge_base_id: kb_id,
+                    name: stats.name,
+                    description: kb_config.description,
+                    status: "ACTIVE".to_string(),
+                    storage_configuration: StorageConfigurationResponse {
+                        storage_type: "PGVECTOR".to_string(),
+                        vector_dimension: stats.embedding_dimension,
+                    },
+                    updated_at: current_timestamp(),
+                },
+            })
+            .into_response(),
+            Err(e) => {
+                let error = ErrorResponse::new(
+                    format!("Failed to get stats: {}", e),
+                    "knowledge_base_error",
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
             }
-        }
+        },
         Err(e) => {
-            let error = ErrorResponse::new(
-                format!("Knowledge base not found: {}", e),
-                "not_found",
-            );
+            let error = ErrorResponse::new(format!("Knowledge base not found: {}", e), "not_found");
             (StatusCode::NOT_FOUND, Json(error)).into_response()
         }
     }
@@ -777,39 +801,28 @@ pub async fn delete_knowledge_base(
     // Get knowledge base config
     let kb_config = {
         let mut kbs = rag_state.knowledge_bases.write().await;
-        kbs.remove(&kb_id).unwrap_or_else(|| {
-            KnowledgeBaseConfig {
-                name: kb_id.clone(),
-                storage: rag_state.rag_config.clone(),
-                ..Default::default()
-            }
+        kbs.remove(&kb_id).unwrap_or_else(|| KnowledgeBaseConfig {
+            name: kb_id.clone(),
+            storage: rag_state.rag_config.clone(),
+            ..Default::default()
         })
     };
 
     // Connect and delete
     match KnowledgeBase::connect(kb_config).await {
-        Ok(kb) => {
-            match kb.delete().await {
-                Ok(_) => {
-                    Json(serde_json::json!({
-                        "knowledgeBaseId": kb_id,
-                        "status": "DELETING"
-                    })).into_response()
-                }
-                Err(e) => {
-                    let error = ErrorResponse::new(
-                        format!("Failed to delete: {}", e),
-                        "delete_error",
-                    );
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
-                }
+        Ok(kb) => match kb.delete().await {
+            Ok(_) => Json(serde_json::json!({
+                "knowledgeBaseId": kb_id,
+                "status": "DELETING"
+            }))
+            .into_response(),
+            Err(e) => {
+                let error = ErrorResponse::new(format!("Failed to delete: {}", e), "delete_error");
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
             }
-        }
+        },
         Err(e) => {
-            let error = ErrorResponse::new(
-                format!("Knowledge base not found: {}", e),
-                "not_found",
-            );
+            let error = ErrorResponse::new(format!("Knowledge base not found: {}", e), "not_found");
             (StatusCode::NOT_FOUND, Json(error)).into_response()
         }
     }
@@ -822,9 +835,7 @@ fn convert_filter(filter: &RetrievalFilter) -> Option<crate::rag::MetadataFilter
 
     // Handle AND
     if let Some(ref and_filters) = filter.and_all {
-        let converted: Vec<_> = and_filters.iter()
-            .filter_map(convert_filter)
-            .collect();
+        let converted: Vec<_> = and_filters.iter().filter_map(convert_filter).collect();
         if !converted.is_empty() {
             return Some(MetadataFilter::and(converted));
         }
@@ -832,9 +843,7 @@ fn convert_filter(filter: &RetrievalFilter) -> Option<crate::rag::MetadataFilter
 
     // Handle OR
     if let Some(ref or_filters) = filter.or_all {
-        let converted: Vec<_> = or_filters.iter()
-            .filter_map(convert_filter)
-            .collect();
+        let converted: Vec<_> = or_filters.iter().filter_map(convert_filter).collect();
         if !converted.is_empty() {
             return Some(MetadataFilter::or(converted));
         }
@@ -862,15 +871,17 @@ fn convert_filter(filter: &RetrievalFilter) -> Option<crate::rag::MetadataFilter
 
     // Handle string contains
     if let Some(ref cond) = filter.string_contains
-        && let Some(s) = cond.value.as_str() {
-            return Some(MetadataFilter::contains(&cond.key, s));
-        }
+        && let Some(s) = cond.value.as_str()
+    {
+        return Some(MetadataFilter::contains(&cond.key, s));
+    }
 
     // Handle starts with
     if let Some(ref cond) = filter.starts_with
-        && let Some(s) = cond.value.as_str() {
-            return Some(MetadataFilter::starts_with(&cond.key, s));
-        }
+        && let Some(s) = cond.value.as_str()
+    {
+        return Some(MetadataFilter::starts_with(&cond.key, s));
+    }
 
     None
 }

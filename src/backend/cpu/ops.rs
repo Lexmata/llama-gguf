@@ -5,10 +5,10 @@
 
 use crate::backend::{BackendError, BackendResult};
 use crate::tensor::quant::{
-    dequantize_q2_k, dequantize_q3_k, dequantize_q4_0, dequantize_q4_1, dequantize_q4_k,
-    dequantize_q5_0, dequantize_q5_1, dequantize_q5_k, dequantize_q6_k, dequantize_q8_0,
-    dequantize_q8_1, dequantize_q8_k, BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1,
-    BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K, BlockQ8_0, BlockQ8_1,
+    BlockQ2K, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ4K, BlockQ5_0, BlockQ5_1, BlockQ5K, BlockQ6K,
+    BlockQ8_0, BlockQ8_1, BlockQ8K, dequantize_q2_k, dequantize_q3_k, dequantize_q4_0,
+    dequantize_q4_1, dequantize_q4_k, dequantize_q5_0, dequantize_q5_1, dequantize_q5_k,
+    dequantize_q6_k, dequantize_q8_0, dequantize_q8_1, dequantize_q8_k,
 };
 use crate::tensor::{DType, Tensor};
 use rayon::prelude::*;
@@ -49,13 +49,13 @@ fn add_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
     if super::simd::has_avx2() {
         unsafe { add_f32_avx2(a, b, out) };
     }
-    
+
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { add_f32_neon(a, b, out) };
         return;
     }
-    
+
     // Scalar fallback
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     for ((o, &a_val), &b_val) in out.iter_mut().zip(a.iter()).zip(b.iter()) {
@@ -65,41 +65,43 @@ fn add_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn add_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) { unsafe {
-    use std::arch::x86_64::*;
-    
-    let n = a.len();
-    let chunks = n / 8;
-    
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-    let out_ptr = out.as_mut_ptr();
-    
-    for i in 0..chunks {
-        let offset = i * 8;
-        let va = _mm256_loadu_ps(a_ptr.add(offset));
-        let vb = _mm256_loadu_ps(b_ptr.add(offset));
-        let vr = _mm256_add_ps(va, vb);
-        _mm256_storeu_ps(out_ptr.add(offset), vr);
+unsafe fn add_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = a.len();
+        let chunks = n / 8;
+
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vb = _mm256_loadu_ps(b_ptr.add(offset));
+            let vr = _mm256_add_ps(va, vb);
+            _mm256_storeu_ps(out_ptr.add(offset), vr);
+        }
+
+        // Handle remainder
+        for i in (chunks * 8)..n {
+            *out.get_unchecked_mut(i) = *a.get_unchecked(i) + *b.get_unchecked(i);
+        }
     }
-    
-    // Handle remainder
-    for i in (chunks * 8)..n {
-        *out.get_unchecked_mut(i) = *a.get_unchecked(i) + *b.get_unchecked(i);
-    }
-}}
+}
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn add_f32_neon(a: &[f32], b: &[f32], out: &mut [f32]) {
     use std::arch::aarch64::*;
-    
+
     let n = a.len();
     let chunks = n / 4;
-    
+
     let a_ptr = a.as_ptr();
     let b_ptr = b.as_ptr();
     let out_ptr = out.as_mut_ptr();
-    
+
     for i in 0..chunks {
         let offset = i * 4;
         let va = vld1q_f32(a_ptr.add(offset));
@@ -107,7 +109,7 @@ unsafe fn add_f32_neon(a: &[f32], b: &[f32], out: &mut [f32]) {
         let vr = vaddq_f32(va, vb);
         vst1q_f32(out_ptr.add(offset), vr);
     }
-    
+
     for i in (chunks * 4)..n {
         *out.get_unchecked_mut(i) = *a.get_unchecked(i) + *b.get_unchecked(i);
     }
@@ -141,13 +143,13 @@ fn mul_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
     if super::simd::has_avx2() {
         unsafe { mul_f32_avx2(a, b, out) };
     }
-    
+
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { mul_f32_neon(a, b, out) };
         return;
     }
-    
+
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     for ((o, &a_val), &b_val) in out.iter_mut().zip(a.iter()).zip(b.iter()) {
         *o = a_val * b_val;
@@ -156,40 +158,42 @@ fn mul_f32_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn mul_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) { unsafe {
-    use std::arch::x86_64::*;
-    
-    let n = a.len();
-    let chunks = n / 8;
-    
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-    let out_ptr = out.as_mut_ptr();
-    
-    for i in 0..chunks {
-        let offset = i * 8;
-        let va = _mm256_loadu_ps(a_ptr.add(offset));
-        let vb = _mm256_loadu_ps(b_ptr.add(offset));
-        let vr = _mm256_mul_ps(va, vb);
-        _mm256_storeu_ps(out_ptr.add(offset), vr);
+unsafe fn mul_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = a.len();
+        let chunks = n / 8;
+
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vb = _mm256_loadu_ps(b_ptr.add(offset));
+            let vr = _mm256_mul_ps(va, vb);
+            _mm256_storeu_ps(out_ptr.add(offset), vr);
+        }
+
+        for i in (chunks * 8)..n {
+            *out.get_unchecked_mut(i) = *a.get_unchecked(i) * *b.get_unchecked(i);
+        }
     }
-    
-    for i in (chunks * 8)..n {
-        *out.get_unchecked_mut(i) = *a.get_unchecked(i) * *b.get_unchecked(i);
-    }
-}}
+}
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn mul_f32_neon(a: &[f32], b: &[f32], out: &mut [f32]) {
     use std::arch::aarch64::*;
-    
+
     let n = a.len();
     let chunks = n / 4;
-    
+
     let a_ptr = a.as_ptr();
     let b_ptr = b.as_ptr();
     let out_ptr = out.as_mut_ptr();
-    
+
     for i in 0..chunks {
         let offset = i * 4;
         let va = vld1q_f32(a_ptr.add(offset));
@@ -197,7 +201,7 @@ unsafe fn mul_f32_neon(a: &[f32], b: &[f32], out: &mut [f32]) {
         let vr = vmulq_f32(va, vb);
         vst1q_f32(out_ptr.add(offset), vr);
     }
-    
+
     for i in (chunks * 4)..n {
         *out.get_unchecked_mut(i) = *a.get_unchecked(i) * *b.get_unchecked(i);
     }
@@ -229,13 +233,13 @@ fn scale_f32_simd(a: &[f32], scalar: f32, out: &mut [f32]) {
     if super::simd::has_avx2() {
         unsafe { scale_f32_avx2(a, scalar, out) };
     }
-    
+
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { scale_f32_neon(a, scalar, out) };
         return;
     }
-    
+
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     for (o, &a_val) in out.iter_mut().zip(a.iter()) {
         *o = a_val * scalar;
@@ -244,46 +248,48 @@ fn scale_f32_simd(a: &[f32], scalar: f32, out: &mut [f32]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scale_f32_avx2(a: &[f32], scalar: f32, out: &mut [f32]) { unsafe {
-    use std::arch::x86_64::*;
-    
-    let n = a.len();
-    let chunks = n / 8;
-    let vscalar = _mm256_set1_ps(scalar);
-    
-    let a_ptr = a.as_ptr();
-    let out_ptr = out.as_mut_ptr();
-    
-    for i in 0..chunks {
-        let offset = i * 8;
-        let va = _mm256_loadu_ps(a_ptr.add(offset));
-        let vr = _mm256_mul_ps(va, vscalar);
-        _mm256_storeu_ps(out_ptr.add(offset), vr);
+unsafe fn scale_f32_avx2(a: &[f32], scalar: f32, out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = a.len();
+        let chunks = n / 8;
+        let vscalar = _mm256_set1_ps(scalar);
+
+        let a_ptr = a.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vr = _mm256_mul_ps(va, vscalar);
+            _mm256_storeu_ps(out_ptr.add(offset), vr);
+        }
+
+        for i in (chunks * 8)..n {
+            *out.get_unchecked_mut(i) = *a.get_unchecked(i) * scalar;
+        }
     }
-    
-    for i in (chunks * 8)..n {
-        *out.get_unchecked_mut(i) = *a.get_unchecked(i) * scalar;
-    }
-}}
+}
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn scale_f32_neon(a: &[f32], scalar: f32, out: &mut [f32]) {
     use std::arch::aarch64::*;
-    
+
     let n = a.len();
     let chunks = n / 4;
     let vscalar = vdupq_n_f32(scalar);
-    
+
     let a_ptr = a.as_ptr();
     let out_ptr = out.as_mut_ptr();
-    
+
     for i in 0..chunks {
         let offset = i * 4;
         let va = vld1q_f32(a_ptr.add(offset));
         let vr = vmulq_f32(va, vscalar);
         vst1q_f32(out_ptr.add(offset), vr);
     }
-    
+
     for i in (chunks * 4)..n {
         *out.get_unchecked_mut(i) = *a.get_unchecked(i) * scalar;
     }
@@ -454,7 +460,7 @@ pub fn matmul(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
 
     // Use different strategies based on matrix size
     let total_ops = m * k1 * n;
-    
+
     if total_ops < 256 * 256 * 256 {
         // Simple parallel implementation for small matrices
         matmul_simple(a_data, b_data, out_data, m, k1, n);
@@ -468,62 +474,56 @@ pub fn matmul(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
 
 /// Simple parallel matmul for small matrices
 fn matmul_simple(a: &[f32], b: &[f32], c: &mut [f32], _m: usize, k: usize, n: usize) {
-    c.par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(i, row_out)| {
-            for j in 0..n {
-                let mut sum = 0.0f32;
-                let a_row = i * k;
-                for kk in 0..k {
-                    sum += unsafe {
-                        *a.get_unchecked(a_row + kk) * *b.get_unchecked(kk * n + j)
-                    };
-                }
-                row_out[j] = sum;
+    c.par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+        for (j, out_val) in row_out.iter_mut().enumerate().take(n) {
+            let mut sum = 0.0f32;
+            let a_row = i * k;
+            for kk in 0..k {
+                sum += unsafe { *a.get_unchecked(a_row + kk) * *b.get_unchecked(kk * n + j) };
             }
-        });
+            *out_val = sum;
+        }
+    });
 }
 
 /// Tiled matrix multiplication for better cache utilization (large matrices)
 fn matmul_tiled(a: &[f32], b: &[f32], c: &mut [f32], _m: usize, k: usize, n: usize) {
     // Tile sizes tuned for L2 cache (~256KB)
-    const TILE_M: usize = 32;
+    const _TILE_M: usize = 32;
     const TILE_N: usize = 256;
     const TILE_K: usize = 32;
-    
+
     // Initialize output to zero
     c.iter_mut().for_each(|x| *x = 0.0);
-    
+
     // Process rows in parallel
-    c.par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(i, c_row)| {
-            for kk in (0..k).step_by(TILE_K) {
-                let k_end = (kk + TILE_K).min(k);
-                
-                for jj in (0..n).step_by(TILE_N) {
-                    let j_end = (jj + TILE_N).min(n);
-                    
-                    let a_row = i * k;
-                    
-                    for j in jj..j_end {
-                        let mut sum = c_row[j];
-                        
-                        for kk_inner in kk..k_end {
-                            sum += unsafe {
-                                *a.get_unchecked(a_row + kk_inner) * *b.get_unchecked(kk_inner * n + j)
-                            };
-                        }
-                        
-                        c_row[j] = sum;
+    c.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
+        for kk in (0..k).step_by(TILE_K) {
+            let k_end = (kk + TILE_K).min(k);
+
+            for jj in (0..n).step_by(TILE_N) {
+                let j_end = (jj + TILE_N).min(n);
+
+                let a_row = i * k;
+
+                for (j, c_val) in c_row.iter_mut().enumerate().take(j_end).skip(jj) {
+                    let mut sum = *c_val;
+
+                    for kk_inner in kk..k_end {
+                        sum += unsafe {
+                            *a.get_unchecked(a_row + kk_inner) * *b.get_unchecked(kk_inner * n + j)
+                        };
                     }
+
+                    *c_val = sum;
                 }
             }
-        });
+        }
+    });
 }
 
 /// Matrix-vector multiplication: out = a @ b where b is 1D (SIMD-optimized)
-/// 
+///
 /// Computes y = A @ x where A is [m, k] and x is [k], giving y [m]
 ///
 /// Uses row-major storage (standard Rust/C convention).
@@ -914,9 +914,9 @@ pub fn matvec_q(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
 }
 
 /// Vector-matrix multiplication: out = a @ b where a is 1D, b is 2D
-/// 
+///
 /// Computes y = x @ W where x is [k] and W is [k, n], giving y [n]
-/// 
+///
 /// GGUF stores matrices in column-major order (ne[0] is contiguous).
 /// For shape [k, n], element (i, j) is at index i + j * k.
 pub fn vec_mat(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
@@ -932,7 +932,7 @@ pub fn vec_mat(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
 
     let k = a.shape()[0];
     let (k2, n) = (b.shape()[0], b.shape()[1]);
-    
+
     if k != k2 {
         return Err(BackendError::ShapeMismatch {
             expected: vec![k],
@@ -965,7 +965,7 @@ pub fn vec_mat(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
 }
 
 /// Quantized vector-matrix multiply
-/// 
+///
 /// For now, this dequantizes and uses regular vec_mat.
 /// TODO: Implement fused quantized vecmat for better performance.
 pub fn vec_mat_q(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
@@ -1021,25 +1021,44 @@ pub fn rope(
     // Apply RoPE to Q
     {
         let q_data = q.as_f32_mut()?;
-        apply_rope_to_tensor(q_data, q_num_heads, q_seq_len, q_head_dim, pos, freq_base, freq_scale, use_neox);
+        apply_rope_to_tensor(
+            q_data,
+            q_num_heads,
+            q_seq_len,
+            q_head_dim,
+            pos,
+            freq_base,
+            freq_scale,
+            use_neox,
+        );
     }
 
     // Apply RoPE to K
     {
         let k_data = k.as_f32_mut()?;
-        apply_rope_to_tensor(k_data, k_num_kv_heads, k_seq_len, k_head_dim, pos, freq_base, freq_scale, use_neox);
+        apply_rope_to_tensor(
+            k_data,
+            k_num_kv_heads,
+            k_seq_len,
+            k_head_dim,
+            pos,
+            freq_base,
+            freq_scale,
+            use_neox,
+        );
     }
 
     Ok(())
 }
 
 /// Internal function to apply RoPE to a tensor
-/// 
+///
 /// Supports two RoPE styles:
 /// - LLaMA/Standard (GGML_ROPE_TYPE_NORMAL): consecutive pairs (x[2i], x[2i+1])
 /// - NeoX (GGML_ROPE_TYPE_NEOX): first half paired with second half (x[i], x[i+d/2])
 ///
 /// Qwen2 uses NeoX style RoPE.
+#[allow(clippy::too_many_arguments)]
 fn apply_rope_to_tensor(
     data: &mut [f32],
     num_heads: usize,
@@ -1137,7 +1156,11 @@ pub fn attention(
     let num_kv_heads = k_shape[0];
     let kv_len = k_shape[1];
 
-    if k_shape[2] != head_dim || v_shape[0] != num_kv_heads || v_shape[1] != kv_len || v_shape[2] != head_dim {
+    if k_shape[2] != head_dim
+        || v_shape[0] != num_kv_heads
+        || v_shape[1] != kv_len
+        || v_shape[2] != head_dim
+    {
         return Err(BackendError::InvalidArgument(
             "Attention tensor dimension mismatch".into(),
         ));
@@ -1151,7 +1174,6 @@ pub fn attention(
     let v_data = v.as_f32()?;
     let out_data = out.as_f32_mut()?;
 
-
     // Process each head
     for head in 0..num_heads {
         let kv_head = head / num_queries_per_kv; // Map to KV head for GQA
@@ -1163,12 +1185,12 @@ pub fn attention(
 
             // Attention scores: Q @ K^T
             let mut scores = vec![0.0f32; kv_len];
-            for kv_pos in 0..kv_len {
+            for (kv_pos, score) in scores.iter_mut().enumerate() {
                 // Causal mask: only attend to positions <= current position
                 // For inference: current query is at position (kv_len - seq_len + s)
                 let q_abs_pos = kv_len.saturating_sub(seq_len) + s;
                 if kv_pos > q_abs_pos {
-                    scores[kv_pos] = f32::NEG_INFINITY;
+                    *score = f32::NEG_INFINITY;
                     continue;
                 }
 
@@ -1180,7 +1202,7 @@ pub fn attention(
                 for d in 0..head_dim {
                     dot += q_vec[d] * k_vec[d];
                 }
-                scores[kv_pos] = dot * scale;
+                *score = dot * scale;
             }
 
             // Softmax on scores
@@ -1200,13 +1222,13 @@ pub fn attention(
             let out_vec = &mut out_data[out_offset..out_offset + head_dim];
             out_vec.fill(0.0);
 
-            for kv_pos in 0..kv_len {
-                if scores[kv_pos] > 0.0 {
+            for (kv_pos, &score_val) in scores.iter().enumerate() {
+                if score_val > 0.0 {
                     let v_offset = kv_head * kv_len * head_dim + kv_pos * head_dim;
                     let v_vec = &v_data[v_offset..v_offset + head_dim];
 
                     for d in 0..head_dim {
-                        out_vec[d] += scores[kv_pos] * v_vec[d];
+                        out_vec[d] += score_val * v_vec[d];
                     }
                 }
             }
@@ -1347,7 +1369,9 @@ mod tests {
     fn test_matvec() {
         // 3x4 @ 4 = 3
         let a = Tensor::from_f32(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
             vec![3, 4],
         )
         .unwrap();
@@ -1410,13 +1434,13 @@ mod tests {
         // At position 1:
         //   theta_0 = 1 / 10000^0 = 1
         //   theta_1 = 1 / 10000^(2/4) = 1/100 = 0.01
-        // 
+        //
         // With x = [1, 2, 3, 4]:
         //   x'[0] = x[0]*cos(1) - x[2]*sin(1) = 1*0.5403 - 3*0.8415 ≈ -1.98
         //   x'[2] = x[0]*sin(1) + x[2]*cos(1) = 1*0.8415 + 3*0.5403 ≈ 2.46
         //   x'[1] = x[1]*cos(0.01) - x[3]*sin(0.01) = 2*1 - 4*0.01 ≈ 1.96
         //   x'[3] = x[1]*sin(0.01) + x[3]*cos(0.01) = 2*0.01 + 4*1 ≈ 4.02
-        
+
         let q_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let k_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
 
@@ -1427,15 +1451,31 @@ mod tests {
         rope(&mut q, &mut k, 1, 10000.0, 1.0, true).unwrap();
 
         let q_result = q.as_f32().unwrap();
-        
+
         // Verify NeoX pairing behavior
         // First pair (0,2): significant rotation (theta=1)
-        assert!((q_result[0] - (-1.98)).abs() < 0.05, "q[0]={} expected ~-1.98", q_result[0]);
-        assert!((q_result[2] - 2.46).abs() < 0.05, "q[2]={} expected ~2.46", q_result[2]);
-        
+        assert!(
+            (q_result[0] - (-1.98)).abs() < 0.05,
+            "q[0]={} expected ~-1.98",
+            q_result[0]
+        );
+        assert!(
+            (q_result[2] - 2.46).abs() < 0.05,
+            "q[2]={} expected ~2.46",
+            q_result[2]
+        );
+
         // Second pair (1,3): minimal rotation (theta=0.01)
-        assert!((q_result[1] - 1.96).abs() < 0.05, "q[1]={} expected ~1.96", q_result[1]);
-        assert!((q_result[3] - 4.02).abs() < 0.05, "q[3]={} expected ~4.02", q_result[3]);
+        assert!(
+            (q_result[1] - 1.96).abs() < 0.05,
+            "q[1]={} expected ~1.96",
+            q_result[1]
+        );
+        assert!(
+            (q_result[3] - 4.02).abs() < 0.05,
+            "q[3]={} expected ~4.02",
+            q_result[3]
+        );
     }
 
     #[test]
@@ -1474,7 +1514,7 @@ mod tests {
     #[test]
     fn test_vec_mat_gguf_layout() {
         // Test vec_mat with GGUF-style memory layout
-        // 
+        //
         // Simulates a PyTorch Linear layer with:
         //   - in_features = 3
         //   - out_features = 2
@@ -1491,16 +1531,16 @@ mod tests {
         // For input x = [1, 1, 1]:
         //   y[0] = 1*1 + 2*1 + 3*1 = 6  (output 0)
         //   y[1] = 4*1 + 5*1 + 6*1 = 15 (output 1)
-        
+
         // GGUF weight: shape [3, 2], data is PyTorch row-major
         let weight_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let weight = Tensor::from_f32(&weight_data, vec![3, 2]).unwrap();
-        
+
         let x = Tensor::from_f32(&[1.0, 1.0, 1.0], vec![3]).unwrap();
         let mut out = Tensor::zeros(vec![2], DType::F32);
-        
+
         vec_mat(&x, &weight, &mut out).unwrap();
-        
+
         let result = out.as_f32().unwrap();
         // y[j] = sum_i x[i] * W[i + j * k]
         // j=0: x[0]*W[0] + x[1]*W[1] + x[2]*W[2] = 1*1 + 1*2 + 1*3 = 6
@@ -1514,15 +1554,15 @@ mod tests {
         // PyTorch: W = [[1,0,0], [0,1,0]] (2 outputs, 3 inputs), selects first 2 inputs
         // Flat (row-major): [1, 0, 0, 0, 1, 0]
         // GGUF shape: [3, 2]
-        
+
         let weight_data = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
         let weight = Tensor::from_f32(&weight_data, vec![3, 2]).unwrap();
-        
+
         let x = Tensor::from_f32(&[7.0, 8.0, 9.0], vec![3]).unwrap();
         let mut out = Tensor::zeros(vec![2], DType::F32);
-        
+
         vec_mat(&x, &weight, &mut out).unwrap();
-        
+
         let result = out.as_f32().unwrap();
         // Should select first two inputs: [7, 8]
         assert_eq!(result, &[7.0, 8.0]);

@@ -175,8 +175,8 @@ pub fn dequantize_q3_k(block: &BlockQ3K, output: &mut [f32; 256]) {
     }
 
     // Process 16 groups of 16 values
-    for i in 0..16 {
-        let scale = d * scales[i] as f32;
+    for (i, &sc) in scales.iter().enumerate() {
+        let scale = d * sc as f32;
         let offset = i * 16;
 
         for j in 0..16 {
@@ -330,13 +330,21 @@ pub fn dequantize_q6_k(block: &BlockQ6K, output: &mut [f32; 256]) {
         let out_base = n * 128;
 
         for l in 0..32 {
-            let is = l / 16;  // Scale group index (0 or 1)
+            let is = l / 16; // Scale group index (0 or 1)
 
             // Extract 4 quantized values using interleaved pattern
-            let q1 = ((block.ql[ql_base + l] & 0x0F) | ((block.qh[qh_base + l] & 0x03) << 4)) as i32 - 32;
-            let q2 = ((block.ql[ql_base + l + 32] & 0x0F) | (((block.qh[qh_base + l] >> 2) & 0x03) << 4)) as i32 - 32;
-            let q3 = ((block.ql[ql_base + l] >> 4) | (((block.qh[qh_base + l] >> 4) & 0x03) << 4)) as i32 - 32;
-            let q4 = ((block.ql[ql_base + l + 32] >> 4) | (((block.qh[qh_base + l] >> 6) & 0x03) << 4)) as i32 - 32;
+            let q1 = ((block.ql[ql_base + l] & 0x0F) | ((block.qh[qh_base + l] & 0x03) << 4))
+                as i32
+                - 32;
+            let q2 = ((block.ql[ql_base + l + 32] & 0x0F)
+                | (((block.qh[qh_base + l] >> 2) & 0x03) << 4)) as i32
+                - 32;
+            let q3 = ((block.ql[ql_base + l] >> 4) | (((block.qh[qh_base + l] >> 4) & 0x03) << 4))
+                as i32
+                - 32;
+            let q4 = ((block.ql[ql_base + l + 32] >> 4)
+                | (((block.qh[qh_base + l] >> 6) & 0x03) << 4)) as i32
+                - 32;
 
             // Apply scales with correct interleaved pattern
             output[out_base + l] = d * block.scales[sc_base + is] as f32 * q1 as f32;

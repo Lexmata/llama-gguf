@@ -58,32 +58,32 @@ impl LlamaModel {
             architecture,
         })
     }
-    
+
     /// Get model configuration
     pub fn config(&self) -> &ModelConfig {
         &self.config
     }
-    
+
     /// Get transformer layers
     pub fn layers(&self) -> &[TransformerLayer] {
         &self.layers
     }
-    
+
     /// Get final normalization layer
     pub fn norm(&self) -> &RMSNorm {
         &self.norm
     }
-    
+
     /// Get output projection layer  
     pub fn output(&self) -> &Linear {
         &self.output
     }
-    
+
     /// Get token embedding tensor
     pub fn token_embedding(&self) -> &Tensor {
         &self.token_embedding
     }
-    
+
     /// Get token embedding for given token IDs (public for testing)
     pub fn embed_tokens(&self, tokens: &[u32], backend: &dyn Backend) -> ModelResult<Tensor> {
         let hidden_size = self.config.hidden_size;
@@ -118,15 +118,19 @@ impl LlamaModel {
 
             let src_start = token_idx * hidden_size;
             let src_end = src_start + hidden_size;
-            
+
             if src_end > embedding_data.len() {
                 return Err(ModelError::InvalidMetadata {
                     key: "embedding".into(),
-                    message: format!("Embedding index out of bounds: token_idx={}, src_end={}, embedding_len={}", 
-                        token_idx, src_end, embedding_data.len()),
+                    message: format!(
+                        "Embedding index out of bounds: token_idx={}, src_end={}, embedding_len={}",
+                        token_idx,
+                        src_end,
+                        embedding_data.len()
+                    ),
                 });
             }
-            
+
             let dst_start = i * hidden_size;
             output[dst_start..dst_start + hidden_size]
                 .copy_from_slice(&embedding_data[src_start..src_end]);
@@ -141,11 +145,7 @@ impl LlamaModel {
     }
 
     /// Compute logits from hidden state
-    fn compute_logits(
-        &self,
-        hidden: &Tensor,
-        backend: &dyn Backend,
-    ) -> ModelResult<Tensor> {
+    fn compute_logits(&self, hidden: &Tensor, backend: &dyn Backend) -> ModelResult<Tensor> {
         // Apply final normalization
         let mut normed = Tensor::zeros(hidden.shape().to_vec(), DType::F32);
         self.norm.forward(hidden, &mut normed, backend)?;
@@ -173,10 +173,10 @@ impl Model for LlamaModel {
 
         // Process each token sequentially to properly build KV cache
         let mut final_hidden = None;
-        
+
         for (token_offset, &token) in tokens.iter().enumerate() {
             let current_pos = ctx.position + token_offset;
-            
+
             // Get embedding for single token
             let mut hidden = self.embed_tokens(&[token], backend)?;
 
@@ -192,17 +192,17 @@ impl Model for LlamaModel {
                     backend,
                 )?;
             }
-            
+
             final_hidden = Some(hidden);
-            
-            }
+        }
 
         // Update position
         ctx.position = new_pos;
         ctx.kv_cache.seq_len = new_pos;
 
         // Compute logits from final hidden state
-        let hidden = final_hidden.ok_or_else(|| ModelError::ConfigError("No tokens to process".into()))?;
+        let hidden =
+            final_hidden.ok_or_else(|| ModelError::ConfigError("No tokens to process".into()))?;
         self.compute_logits(&hidden, backend)
     }
 

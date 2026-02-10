@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 
 use crate::tensor::Tensor;
 
-pub use grammar::{Grammar, GrammarSampler, GbnfGrammar, JsonGrammar, RegexGrammar};
+pub use grammar::{GbnfGrammar, Grammar, GrammarSampler, JsonGrammar, RegexGrammar};
 
 /// Mirostat sampling configuration
 #[derive(Debug, Clone)]

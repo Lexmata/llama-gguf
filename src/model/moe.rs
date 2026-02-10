@@ -10,7 +10,6 @@
 //! - Qwen MoE
 //! - DeepSeek MoE
 
-
 use crate::backend::Backend;
 use crate::tensor::{DType, Tensor};
 
@@ -122,7 +121,10 @@ impl MoeRouter {
     ///
     /// # Returns
     /// Expert selection with indices and weights
-    pub fn route(&self, hidden_states: &Tensor) -> Result<ExpertSelection, crate::backend::BackendError> {
+    pub fn route(
+        &self,
+        hidden_states: &Tensor,
+    ) -> Result<ExpertSelection, crate::backend::BackendError> {
         let h_data = hidden_states.as_f32()?;
         let w_data = self.weight.as_f32()?;
 
@@ -175,7 +177,10 @@ impl MoeRouter {
                 .collect();
 
             // Softmax over top-k to get routing weights
-            let max_val = top_k_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let max_val = top_k_logits
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
             let exp_sum: f32 = top_k_logits.iter().map(|&l| (l - max_val).exp()).sum();
             let weights: Vec<f32> = top_k_logits
                 .iter()
@@ -353,7 +358,10 @@ impl MoeLayer {
         if h_shape.len() == 1 {
             Ok(Tensor::from_f32(&output_data, vec![hidden_dim])?)
         } else {
-            Ok(Tensor::from_f32(&output_data, vec![batch_size, hidden_dim])?)
+            Ok(Tensor::from_f32(
+                &output_data,
+                vec![batch_size, hidden_dim],
+            )?)
         }
     }
 

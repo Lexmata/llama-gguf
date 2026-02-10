@@ -114,21 +114,13 @@ pub struct Config {
 /// Model path and hardware configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ModelSection {
     /// Path to the GGUF model file.
     pub path: Option<String>,
 
     /// Use GPU acceleration (CUDA/Metal/Vulkan).
     pub gpu: bool,
-}
-
-impl Default for ModelSection {
-    fn default() -> Self {
-        Self {
-            path: None,
-            gpu: false,
-        }
-    }
 }
 
 /// Generation and sampling parameters.
@@ -343,43 +335,43 @@ impl Config {
         if let Ok(gpu) = std::env::var("LLAMA_GPU") {
             config.model.gpu = matches!(gpu.to_lowercase().as_str(), "1" | "true" | "yes");
         }
-        if let Ok(val) = std::env::var("LLAMA_TEMPERATURE") {
-            if let Ok(v) = val.parse() {
-                config.generation.temperature = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_TEMPERATURE")
+            && let Ok(v) = val.parse()
+        {
+            config.generation.temperature = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_TOP_K") {
-            if let Ok(v) = val.parse() {
-                config.generation.top_k = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_TOP_K")
+            && let Ok(v) = val.parse()
+        {
+            config.generation.top_k = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_TOP_P") {
-            if let Ok(v) = val.parse() {
-                config.generation.top_p = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_TOP_P")
+            && let Ok(v) = val.parse()
+        {
+            config.generation.top_p = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_REPEAT_PENALTY") {
-            if let Ok(v) = val.parse() {
-                config.generation.repeat_penalty = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_REPEAT_PENALTY")
+            && let Ok(v) = val.parse()
+        {
+            config.generation.repeat_penalty = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_MAX_TOKENS") {
-            if let Ok(v) = val.parse() {
-                config.generation.max_tokens = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_MAX_TOKENS")
+            && let Ok(v) = val.parse()
+        {
+            config.generation.max_tokens = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_SEED") {
-            if let Ok(v) = val.parse() {
-                config.generation.seed = Some(v);
-            }
+        if let Ok(val) = std::env::var("LLAMA_SEED")
+            && let Ok(v) = val.parse()
+        {
+            config.generation.seed = Some(v);
         }
         if let Ok(val) = std::env::var("LLAMA_HOST") {
             config.server.host = val;
         }
-        if let Ok(val) = std::env::var("LLAMA_PORT") {
-            if let Ok(v) = val.parse() {
-                config.server.port = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_PORT")
+            && let Ok(v) = val.parse()
+        {
+            config.server.port = v;
         }
         if let Ok(val) = std::env::var("LLAMA_SYSTEM_PROMPT") {
             config.chat.system_prompt = Some(val);
@@ -431,43 +423,43 @@ impl Config {
         if let Ok(gpu) = std::env::var("LLAMA_GPU") {
             self.model.gpu = matches!(gpu.to_lowercase().as_str(), "1" | "true" | "yes");
         }
-        if let Ok(val) = std::env::var("LLAMA_TEMPERATURE") {
-            if let Ok(v) = val.parse() {
-                self.generation.temperature = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_TEMPERATURE")
+            && let Ok(v) = val.parse()
+        {
+            self.generation.temperature = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_TOP_K") {
-            if let Ok(v) = val.parse() {
-                self.generation.top_k = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_TOP_K")
+            && let Ok(v) = val.parse()
+        {
+            self.generation.top_k = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_TOP_P") {
-            if let Ok(v) = val.parse() {
-                self.generation.top_p = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_TOP_P")
+            && let Ok(v) = val.parse()
+        {
+            self.generation.top_p = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_REPEAT_PENALTY") {
-            if let Ok(v) = val.parse() {
-                self.generation.repeat_penalty = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_REPEAT_PENALTY")
+            && let Ok(v) = val.parse()
+        {
+            self.generation.repeat_penalty = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_MAX_TOKENS") {
-            if let Ok(v) = val.parse() {
-                self.generation.max_tokens = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_MAX_TOKENS")
+            && let Ok(v) = val.parse()
+        {
+            self.generation.max_tokens = v;
         }
-        if let Ok(val) = std::env::var("LLAMA_SEED") {
-            if let Ok(v) = val.parse() {
-                self.generation.seed = Some(v);
-            }
+        if let Ok(val) = std::env::var("LLAMA_SEED")
+            && let Ok(v) = val.parse()
+        {
+            self.generation.seed = Some(v);
         }
         if let Ok(val) = std::env::var("LLAMA_HOST") {
             self.server.host = val;
         }
-        if let Ok(val) = std::env::var("LLAMA_PORT") {
-            if let Ok(v) = val.parse() {
-                self.server.port = v;
-            }
+        if let Ok(val) = std::env::var("LLAMA_PORT")
+            && let Ok(v) = val.parse()
+        {
+            self.server.port = v;
         }
         if let Ok(val) = std::env::var("LLAMA_SYSTEM_PROMPT") {
             self.chat.system_prompt = Some(val);

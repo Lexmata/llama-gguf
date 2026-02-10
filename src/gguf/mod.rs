@@ -6,7 +6,7 @@ mod reader;
 mod types;
 mod writer;
 
-pub use constants::{GgmlType, GgufMetadataValueType, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC};
+pub use constants::{GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GgmlType, GgufMetadataValueType};
 pub use error::GgufError;
 pub use reader::GgufReader;
 pub use types::{GgufData, GgufHeader, MetadataArray, MetadataValue, TensorInfo};

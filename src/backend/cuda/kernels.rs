@@ -585,35 +585,35 @@ pub struct CudaKernels {
     pub add_f32: CudaFunction,
     pub mul_f32: CudaFunction,
     pub scale_f32: CudaFunction,
-    
+
     // Activations
     pub silu_f32: CudaFunction,
     pub gelu_f32: CudaFunction,
-    
+
     // Normalization
     pub rms_norm_sum_sq: CudaFunction,
     pub rms_norm_scale: CudaFunction,
-    
+
     // Softmax
     pub softmax_max: CudaFunction,
     pub softmax_exp_sum: CudaFunction,
     pub softmax_div: CudaFunction,
-    
+
     // Matrix ops
     pub vec_mat_f32: CudaFunction,
-    
+
     // RoPE
     pub rope_single_pos: CudaFunction,
-    
+
     // Quantized ops
     pub vec_mat_q4k: CudaFunction,
     pub vec_mat_q8_0: CudaFunction,
-    
+
     // KV cache
     pub update_kv_cache: CudaFunction,
     pub attention_multihead: CudaFunction,
     pub vec_mat_q4_0: CudaFunction,
-    
+
     // Attention
     pub attention_single_head: CudaFunction,
 }
@@ -622,60 +622,130 @@ impl CudaKernels {
     /// Compile and load all CUDA kernels
     pub fn new(device: Arc<CudaDevice>) -> BackendResult<Self> {
         // Compile PTX
-        let ptx = cudarc::nvrtc::compile_ptx(KERNEL_SOURCE)
-            .map_err(|e| BackendError::InitializationFailed(format!("NVRTC compile failed: {}", e)))?;
-        
+        let ptx = cudarc::nvrtc::compile_ptx(KERNEL_SOURCE).map_err(|e| {
+            BackendError::InitializationFailed(format!("NVRTC compile failed: {}", e))
+        })?;
+
         // Load module
-        device.load_ptx(ptx, "llama_kernels", &[
-            "add_f32", "mul_f32", "scale_f32",
-            "silu_f32", "gelu_f32",
-            "rms_norm_sum_sq", "rms_norm_scale",
-            "softmax_max", "softmax_exp_sum", "softmax_div",
-            "vec_mat_f32",
-            "rope_single_pos",
-            "vec_mat_q4k", "vec_mat_q8_0", "vec_mat_q4_0",
-            "attention_single_head",
-            "update_kv_cache", "attention_multihead",
-        ]).map_err(|e| BackendError::InitializationFailed(format!("PTX load failed: {}", e)))?;
-        
+        device
+            .load_ptx(
+                ptx,
+                "llama_kernels",
+                &[
+                    "add_f32",
+                    "mul_f32",
+                    "scale_f32",
+                    "silu_f32",
+                    "gelu_f32",
+                    "rms_norm_sum_sq",
+                    "rms_norm_scale",
+                    "softmax_max",
+                    "softmax_exp_sum",
+                    "softmax_div",
+                    "vec_mat_f32",
+                    "rope_single_pos",
+                    "vec_mat_q4k",
+                    "vec_mat_q8_0",
+                    "vec_mat_q4_0",
+                    "attention_single_head",
+                    "update_kv_cache",
+                    "attention_multihead",
+                ],
+            )
+            .map_err(|e| BackendError::InitializationFailed(format!("PTX load failed: {}", e)))?;
+
         // Get function handles
         Ok(Self {
-            add_f32: device.get_func("llama_kernels", "add_f32")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'add_f32' not found".into()))?,
-            mul_f32: device.get_func("llama_kernels", "mul_f32")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'mul_f32' not found".into()))?,
-            scale_f32: device.get_func("llama_kernels", "scale_f32")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'scale_f32' not found".into()))?,
-            silu_f32: device.get_func("llama_kernels", "silu_f32")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'silu_f32' not found".into()))?,
-            gelu_f32: device.get_func("llama_kernels", "gelu_f32")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'gelu_f32' not found".into()))?,
-            rms_norm_sum_sq: device.get_func("llama_kernels", "rms_norm_sum_sq")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'rms_norm_sum_sq' not found".into()))?,
-            rms_norm_scale: device.get_func("llama_kernels", "rms_norm_scale")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'rms_norm_scale' not found".into()))?,
-            softmax_max: device.get_func("llama_kernels", "softmax_max")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'softmax_max' not found".into()))?,
-            softmax_exp_sum: device.get_func("llama_kernels", "softmax_exp_sum")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'softmax_exp_sum' not found".into()))?,
-            softmax_div: device.get_func("llama_kernels", "softmax_div")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'softmax_div' not found".into()))?,
-            vec_mat_f32: device.get_func("llama_kernels", "vec_mat_f32")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_f32' not found".into()))?,
-            rope_single_pos: device.get_func("llama_kernels", "rope_single_pos")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'rope_single_pos' not found".into()))?,
-            vec_mat_q4k: device.get_func("llama_kernels", "vec_mat_q4k")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_q4k' not found".into()))?,
-            vec_mat_q8_0: device.get_func("llama_kernels", "vec_mat_q8_0")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_q8_0' not found".into()))?,
-            vec_mat_q4_0: device.get_func("llama_kernels", "vec_mat_q4_0")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'vec_mat_q4_0' not found".into()))?,
-            attention_single_head: device.get_func("llama_kernels", "attention_single_head")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'attention_single_head' not found".into()))?,
-            update_kv_cache: device.get_func("llama_kernels", "update_kv_cache")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'update_kv_cache' not found".into()))?,
-            attention_multihead: device.get_func("llama_kernels", "attention_multihead")
-                .ok_or_else(|| BackendError::InitializationFailed("Kernel 'attention_multihead' not found".into()))?,
+            add_f32: device.get_func("llama_kernels", "add_f32").ok_or_else(|| {
+                BackendError::InitializationFailed("Kernel 'add_f32' not found".into())
+            })?,
+            mul_f32: device.get_func("llama_kernels", "mul_f32").ok_or_else(|| {
+                BackendError::InitializationFailed("Kernel 'mul_f32' not found".into())
+            })?,
+            scale_f32: device
+                .get_func("llama_kernels", "scale_f32")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'scale_f32' not found".into())
+                })?,
+            silu_f32: device
+                .get_func("llama_kernels", "silu_f32")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'silu_f32' not found".into())
+                })?,
+            gelu_f32: device
+                .get_func("llama_kernels", "gelu_f32")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'gelu_f32' not found".into())
+                })?,
+            rms_norm_sum_sq: device
+                .get_func("llama_kernels", "rms_norm_sum_sq")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'rms_norm_sum_sq' not found".into())
+                })?,
+            rms_norm_scale: device
+                .get_func("llama_kernels", "rms_norm_scale")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'rms_norm_scale' not found".into())
+                })?,
+            softmax_max: device
+                .get_func("llama_kernels", "softmax_max")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'softmax_max' not found".into())
+                })?,
+            softmax_exp_sum: device
+                .get_func("llama_kernels", "softmax_exp_sum")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'softmax_exp_sum' not found".into())
+                })?,
+            softmax_div: device
+                .get_func("llama_kernels", "softmax_div")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'softmax_div' not found".into())
+                })?,
+            vec_mat_f32: device
+                .get_func("llama_kernels", "vec_mat_f32")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'vec_mat_f32' not found".into())
+                })?,
+            rope_single_pos: device
+                .get_func("llama_kernels", "rope_single_pos")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'rope_single_pos' not found".into())
+                })?,
+            vec_mat_q4k: device
+                .get_func("llama_kernels", "vec_mat_q4k")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'vec_mat_q4k' not found".into())
+                })?,
+            vec_mat_q8_0: device
+                .get_func("llama_kernels", "vec_mat_q8_0")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'vec_mat_q8_0' not found".into())
+                })?,
+            vec_mat_q4_0: device
+                .get_func("llama_kernels", "vec_mat_q4_0")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'vec_mat_q4_0' not found".into())
+                })?,
+            attention_single_head: device
+                .get_func("llama_kernels", "attention_single_head")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'attention_single_head' not found".into(),
+                    )
+                })?,
+            update_kv_cache: device
+                .get_func("llama_kernels", "update_kv_cache")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'update_kv_cache' not found".into())
+                })?,
+            attention_multihead: device
+                .get_func("llama_kernels", "attention_multihead")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'attention_multihead' not found".into(),
+                    )
+                })?,
         })
     }
 }

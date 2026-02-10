@@ -2,30 +2,30 @@
 
 use deadpool_postgres::{Config, Pool, Runtime};
 use pgvector::Vector;
-use tokio_postgres::NoTls;
 use serde::{Deserialize, Serialize};
+use tokio_postgres::NoTls;
 
 use super::{RagConfig, RagError, RagResult};
 
 /// Metadata filter for search queries
-/// 
+///
 /// Filters can be combined using AND/OR logic and support various comparison operators
 /// for JSONB fields in PostgreSQL.
-/// 
+///
 /// # Example
-/// 
+///
 /// ```rust,ignore
 /// use llama_gguf::rag::MetadataFilter;
-/// 
+///
 /// // Simple equality filter
 /// let filter = MetadataFilter::eq("source", "docs/readme.md");
-/// 
+///
 /// // Combine filters with AND
 /// let filter = MetadataFilter::and(vec![
 ///     MetadataFilter::eq("type", "documentation"),
 ///     MetadataFilter::gte("version", 2),
 /// ]);
-/// 
+///
 /// // Complex filter with OR
 /// let filter = MetadataFilter::or(vec![
 ///     MetadataFilter::eq("category", "api"),
@@ -36,162 +36,228 @@ use super::{RagConfig, RagError, RagResult};
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum MetadataFilter {
     /// Exact equality: metadata->>'field' = 'value'
-    Eq { field: String, value: serde_json::Value },
-    
+    Eq {
+        field: String,
+        value: serde_json::Value,
+    },
+
     /// Not equal: metadata->>'field' != 'value'
-    Ne { field: String, value: serde_json::Value },
-    
+    Ne {
+        field: String,
+        value: serde_json::Value,
+    },
+
     /// Greater than: (metadata->>'field')::numeric > value
-    Gt { field: String, value: serde_json::Value },
-    
+    Gt {
+        field: String,
+        value: serde_json::Value,
+    },
+
     /// Greater than or equal: (metadata->>'field')::numeric >= value
-    Gte { field: String, value: serde_json::Value },
-    
+    Gte {
+        field: String,
+        value: serde_json::Value,
+    },
+
     /// Less than: (metadata->>'field')::numeric < value
-    Lt { field: String, value: serde_json::Value },
-    
+    Lt {
+        field: String,
+        value: serde_json::Value,
+    },
+
     /// Less than or equal: (metadata->>'field')::numeric <= value
-    Lte { field: String, value: serde_json::Value },
-    
+    Lte {
+        field: String,
+        value: serde_json::Value,
+    },
+
     /// Field exists: metadata ? 'field'
     Exists { field: String },
-    
+
     /// Field does not exist: NOT (metadata ? 'field')
     NotExists { field: String },
-    
+
     /// String contains (case-insensitive): metadata->>'field' ILIKE '%value%'
     Contains { field: String, value: String },
-    
+
     /// String starts with: metadata->>'field' LIKE 'value%'
     StartsWith { field: String, value: String },
-    
+
     /// String ends with: metadata->>'field' LIKE '%value'
     EndsWith { field: String, value: String },
-    
+
     /// Value in array: metadata->'field' ? 'value' (for array fields)
     InArray { field: String, value: String },
-    
+
     /// Value in list: metadata->>'field' IN ('a', 'b', 'c')
-    In { field: String, values: Vec<serde_json::Value> },
-    
+    In {
+        field: String,
+        values: Vec<serde_json::Value>,
+    },
+
     /// Value not in list: metadata->>'field' NOT IN ('a', 'b', 'c')
-    NotIn { field: String, values: Vec<serde_json::Value> },
-    
+    NotIn {
+        field: String,
+        values: Vec<serde_json::Value>,
+    },
+
     /// JSON path exists: metadata @? '$.field[*] ? (@ == "value")'
     JsonPath { path: String },
-    
+
     /// Logical AND of multiple filters
     And { filters: Vec<MetadataFilter> },
-    
+
     /// Logical OR of multiple filters
     Or { filters: Vec<MetadataFilter> },
-    
+
     /// Logical NOT
     Not { filter: Box<MetadataFilter> },
 }
 
 impl MetadataFilter {
     // Convenience constructors
-    
+
     /// Create an equality filter
     pub fn eq(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
-        Self::Eq { field: field.into(), value: value.into() }
+        Self::Eq {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create a not-equal filter
     pub fn ne(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
-        Self::Ne { field: field.into(), value: value.into() }
+        Self::Ne {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create a greater-than filter
     pub fn gt(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
-        Self::Gt { field: field.into(), value: value.into() }
+        Self::Gt {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create a greater-than-or-equal filter
     pub fn gte(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
-        Self::Gte { field: field.into(), value: value.into() }
+        Self::Gte {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create a less-than filter
     pub fn lt(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
-        Self::Lt { field: field.into(), value: value.into() }
+        Self::Lt {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create a less-than-or-equal filter
     pub fn lte(field: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
-        Self::Lte { field: field.into(), value: value.into() }
+        Self::Lte {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create an exists filter
     pub fn exists(field: impl Into<String>) -> Self {
-        Self::Exists { field: field.into() }
+        Self::Exists {
+            field: field.into(),
+        }
     }
-    
+
     /// Create a not-exists filter
     pub fn not_exists(field: impl Into<String>) -> Self {
-        Self::NotExists { field: field.into() }
+        Self::NotExists {
+            field: field.into(),
+        }
     }
-    
+
     /// Create a contains filter (case-insensitive substring match)
     pub fn contains(field: impl Into<String>, value: impl Into<String>) -> Self {
-        Self::Contains { field: field.into(), value: value.into() }
+        Self::Contains {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create a starts-with filter
     pub fn starts_with(field: impl Into<String>, value: impl Into<String>) -> Self {
-        Self::StartsWith { field: field.into(), value: value.into() }
+        Self::StartsWith {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create an ends-with filter
     pub fn ends_with(field: impl Into<String>, value: impl Into<String>) -> Self {
-        Self::EndsWith { field: field.into(), value: value.into() }
+        Self::EndsWith {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create a filter for checking if value is in a JSON array field
     pub fn in_array(field: impl Into<String>, value: impl Into<String>) -> Self {
-        Self::InArray { field: field.into(), value: value.into() }
+        Self::InArray {
+            field: field.into(),
+            value: value.into(),
+        }
     }
-    
+
     /// Create an IN filter
     pub fn in_values(field: impl Into<String>, values: Vec<serde_json::Value>) -> Self {
-        Self::In { field: field.into(), values }
+        Self::In {
+            field: field.into(),
+            values,
+        }
     }
-    
+
     /// Create a NOT IN filter
     pub fn not_in(field: impl Into<String>, values: Vec<serde_json::Value>) -> Self {
-        Self::NotIn { field: field.into(), values }
+        Self::NotIn {
+            field: field.into(),
+            values,
+        }
     }
-    
+
     /// Create a JSON path filter
     pub fn json_path(path: impl Into<String>) -> Self {
         Self::JsonPath { path: path.into() }
     }
-    
+
     /// Create an AND filter combining multiple filters
     pub fn and(filters: Vec<MetadataFilter>) -> Self {
         Self::And { filters }
     }
-    
+
     /// Create an OR filter combining multiple filters
     pub fn or(filters: Vec<MetadataFilter>) -> Self {
         Self::Or { filters }
     }
-    
+
     /// Create a NOT filter
     pub fn not(filter: MetadataFilter) -> Self {
-        Self::Not { filter: Box::new(filter) }
+        Self::Not {
+            filter: Box::new(filter),
+        }
     }
-    
+
     /// Convert the filter to a SQL WHERE clause fragment
-    /// 
+    ///
     /// Returns the SQL string and a list of parameter values
     pub fn to_sql(&self, param_offset: usize) -> (String, Vec<String>) {
         let mut params = Vec::new();
         let sql = self.to_sql_inner(param_offset, &mut params);
         (sql, params)
     }
-    
+
     fn to_sql_inner(&self, param_offset: usize, params: &mut Vec<String>) -> String {
         match self {
             Self::Eq { field, value } => {
@@ -199,130 +265,164 @@ impl MetadataFilter {
                 params.push(json_value_to_string(value));
                 format!("metadata->>'{}' = ${}", escape_field(field), param_idx)
             }
-            
+
             Self::Ne { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
                 format!("metadata->>'{}' != ${}", escape_field(field), param_idx)
             }
-            
+
             Self::Gt { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric > ${}::numeric", escape_field(field), param_idx)
+                format!(
+                    "(metadata->>'{}')::numeric > ${}::numeric",
+                    escape_field(field),
+                    param_idx
+                )
             }
-            
+
             Self::Gte { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric >= ${}::numeric", escape_field(field), param_idx)
+                format!(
+                    "(metadata->>'{}')::numeric >= ${}::numeric",
+                    escape_field(field),
+                    param_idx
+                )
             }
-            
+
             Self::Lt { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric < ${}::numeric", escape_field(field), param_idx)
+                format!(
+                    "(metadata->>'{}')::numeric < ${}::numeric",
+                    escape_field(field),
+                    param_idx
+                )
             }
-            
+
             Self::Lte { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric <= ${}::numeric", escape_field(field), param_idx)
+                format!(
+                    "(metadata->>'{}')::numeric <= ${}::numeric",
+                    escape_field(field),
+                    param_idx
+                )
             }
-            
+
             Self::Exists { field } => {
                 format!("metadata ? '{}'", escape_field(field))
             }
-            
+
             Self::NotExists { field } => {
                 format!("NOT (metadata ? '{}')", escape_field(field))
             }
-            
+
             Self::Contains { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(format!("%{}%", value));
                 format!("metadata->>'{}' ILIKE ${}", escape_field(field), param_idx)
             }
-            
+
             Self::StartsWith { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(format!("{}%", value));
                 format!("metadata->>'{}' LIKE ${}", escape_field(field), param_idx)
             }
-            
+
             Self::EndsWith { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(format!("%{}", value));
                 format!("metadata->>'{}' LIKE ${}", escape_field(field), param_idx)
             }
-            
+
             Self::InArray { field, value } => {
                 let param_idx = param_offset + params.len() + 1;
                 params.push(value.clone());
                 format!("metadata->'{}' ? ${}", escape_field(field), param_idx)
             }
-            
+
             Self::In { field, values } => {
                 if values.is_empty() {
                     return "FALSE".to_string();
                 }
-                let placeholders: Vec<String> = values.iter().enumerate().map(|(i, _v)| {
-                    let param_idx = param_offset + params.len() + 1 + i;
-                    format!("${}", param_idx)
-                }).collect();
+                let placeholders: Vec<String> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _v)| {
+                        let param_idx = param_offset + params.len() + 1 + i;
+                        format!("${}", param_idx)
+                    })
+                    .collect();
                 for v in values {
                     params.push(json_value_to_string(v));
                 }
-                format!("metadata->>'{}' IN ({})", escape_field(field), placeholders.join(", "))
+                format!(
+                    "metadata->>'{}' IN ({})",
+                    escape_field(field),
+                    placeholders.join(", ")
+                )
             }
-            
+
             Self::NotIn { field, values } => {
                 if values.is_empty() {
                     return "TRUE".to_string();
                 }
-                let placeholders: Vec<String> = values.iter().enumerate().map(|(i, _)| {
-                    let param_idx = param_offset + params.len() + 1 + i;
-                    format!("${}", param_idx)
-                }).collect();
+                let placeholders: Vec<String> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let param_idx = param_offset + params.len() + 1 + i;
+                        format!("${}", param_idx)
+                    })
+                    .collect();
                 for v in values {
                     params.push(json_value_to_string(v));
                 }
-                format!("metadata->>'{}' NOT IN ({})", escape_field(field), placeholders.join(", "))
+                format!(
+                    "metadata->>'{}' NOT IN ({})",
+                    escape_field(field),
+                    placeholders.join(", ")
+                )
             }
-            
+
             Self::JsonPath { path } => {
                 format!("metadata @? '{}'", path.replace('\'', "''"))
             }
-            
+
             Self::And { filters } => {
                 if filters.is_empty() {
                     return "TRUE".to_string();
                 }
-                let parts: Vec<String> = filters.iter().map(|f| {
-                    f.to_sql_inner(param_offset + params.len(), params)
-                }).collect();
+                let parts: Vec<String> = filters
+                    .iter()
+                    .map(|f| f.to_sql_inner(param_offset + params.len(), params))
+                    .collect();
                 format!("({})", parts.join(" AND "))
             }
-            
+
             Self::Or { filters } => {
                 if filters.is_empty() {
                     return "FALSE".to_string();
                 }
-                let parts: Vec<String> = filters.iter().map(|f| {
-                    f.to_sql_inner(param_offset + params.len(), params)
-                }).collect();
+                let parts: Vec<String> = filters
+                    .iter()
+                    .map(|f| f.to_sql_inner(param_offset + params.len(), params))
+                    .collect();
                 format!("({})", parts.join(" OR "))
             }
-            
+
             Self::Not { filter } => {
                 let inner = filter.to_sql_inner(param_offset + params.len(), params);
                 format!("NOT ({})", inner)
             }
         }
     }
-    
+
     /// Parse a filter from a simple string syntax
-    /// 
+    ///
     /// Supported formats:
     /// - `field=value` - equality
     /// - `field!=value` - not equal
@@ -337,23 +437,23 @@ impl MetadataFilter {
     /// - `!field?` - not exists
     pub fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
-        
+
         // Check for exists/not exists
         if s.ends_with('?') {
             if s.starts_with('!') {
-                return Ok(Self::not_exists(&s[1..s.len()-1]));
+                return Ok(Self::not_exists(&s[1..s.len() - 1]));
             }
-            return Ok(Self::exists(&s[..s.len()-1]));
+            return Ok(Self::exists(&s[..s.len() - 1]));
         }
-        
+
         // Try to find operator
         let operators = [">=", "<=", "!=", "=", ">", "<", "~", "^", "$"];
-        
+
         for op in &operators {
             if let Some(pos) = s.find(op) {
                 let field = s[..pos].trim();
                 let value = s[pos + op.len()..].trim();
-                
+
                 // Try to parse as number first, then as string
                 let json_value: serde_json::Value = if let Ok(n) = value.parse::<i64>() {
                     serde_json::Value::Number(n.into())
@@ -370,7 +470,7 @@ impl MetadataFilter {
                 } else {
                     serde_json::Value::String(value.to_string())
                 };
-                
+
                 return Ok(match *op {
                     "=" => Self::eq(field, json_value),
                     "!=" => Self::ne(field, json_value),
@@ -385,12 +485,12 @@ impl MetadataFilter {
                 });
             }
         }
-        
+
         Err(format!("Invalid filter syntax: {}", s))
     }
-    
+
     /// Parse multiple filters from a string, combining with AND
-    /// 
+    ///
     /// Filters are separated by `;` or newlines
     pub fn parse_many(s: &str) -> Result<Self, String> {
         let filters: Result<Vec<_>, _> = s
@@ -399,13 +499,13 @@ impl MetadataFilter {
             .filter(|p| !p.is_empty())
             .map(Self::parse)
             .collect();
-        
+
         let filters = filters?;
-        
+
         if filters.is_empty() {
             return Err("No filters provided".to_string());
         }
-        
+
         if filters.len() == 1 {
             Ok(filters.into_iter().next().unwrap())
         } else {
@@ -466,48 +566,63 @@ impl RagStore {
     pub async fn connect(config: RagConfig) -> RagResult<Self> {
         // Validate config first
         config.validate()?;
-        
+
         let mut pg_config = Config::new();
-        
+
         // Parse connection string
         let url = url::Url::parse(config.connection_string())
             .map_err(|e| RagError::ConfigError(format!("Invalid connection string: {}", e)))?;
-        
+
         pg_config.host = url.host_str().map(String::from);
         pg_config.port = url.port();
-        pg_config.user = if url.username().is_empty() { None } else { Some(url.username().to_string()) };
+        pg_config.user = if url.username().is_empty() {
+            None
+        } else {
+            Some(url.username().to_string())
+        };
         pg_config.password = url.password().map(String::from);
         pg_config.dbname = Some(url.path().trim_start_matches('/').to_string());
-        
+
         let pool = pg_config
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         // Test connection
-        let client = pool.get().await
-            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
-        // Verify pgvector extension is available
-        client.query_one("SELECT extversion FROM pg_extension WHERE extname = 'vector'", &[])
+        let client = pool
+            .get()
             .await
-            .map_err(|_| RagError::ConnectionFailed(
-                "pgvector extension not installed. Run: CREATE EXTENSION vector;".into()
-            ))?;
-        
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+
+        // Verify pgvector extension is available
+        client
+            .query_one(
+                "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
+                &[],
+            )
+            .await
+            .map_err(|_| {
+                RagError::ConnectionFailed(
+                    "pgvector extension not installed. Run: CREATE EXTENSION vector;".into(),
+                )
+            })?;
+
         Ok(Self { pool, config })
     }
-    
+
     /// Connect using configuration loaded from file and/or environment
     pub async fn connect_with_config(config_path: Option<&str>) -> RagResult<Self> {
         let config = RagConfig::load(config_path)?;
         Self::connect(config).await
     }
-    
+
     /// Create the embeddings table if it doesn't exist
     pub async fn create_table(&self) -> RagResult<()> {
-        let client = self.pool.get().await
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let create_table = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -521,10 +636,12 @@ impl RagStore {
             self.config.table_name(),
             self.config.embedding_dim()
         );
-        
-        client.execute(&create_table, &[]).await
+
+        client
+            .execute(&create_table, &[])
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         // Create index for fast similarity search
         let create_index = format!(
             r#"
@@ -535,13 +652,13 @@ impl RagStore {
             self.config.table_name(),
             self.config.distance_metric().index_ops()
         );
-        
+
         // Index creation may fail if table is empty, that's okay
         let _ = client.execute(&create_index, &[]).await;
-        
+
         Ok(())
     }
-    
+
     /// Insert a document with its embedding
     pub async fn insert(&self, doc: NewDocument) -> RagResult<i64> {
         if doc.embedding.len() != self.config.embedding_dim() {
@@ -550,52 +667,61 @@ impl RagStore {
                 actual: doc.embedding.len(),
             });
         }
-        
-        let client = self.pool.get().await
+
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let embedding = Vector::from(doc.embedding);
-        
+
         let query = format!(
             "INSERT INTO {} (content, embedding, metadata) VALUES ($1, $2, $3) RETURNING id",
             self.config.table_name()
         );
-        
-        let row = client.query_one(&query, &[&doc.content, &embedding, &doc.metadata]).await
+
+        let row = client
+            .query_one(&query, &[&doc.content, &embedding, &doc.metadata])
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         Ok(row.get(0))
     }
-    
+
     /// Insert multiple documents in a batch
     pub async fn insert_batch(&self, docs: Vec<NewDocument>) -> RagResult<Vec<i64>> {
         let mut ids = Vec::with_capacity(docs.len());
-        
+
         // TODO: Use COPY for better performance with large batches
         for doc in docs {
             let id = self.insert(doc).await?;
             ids.push(id);
         }
-        
+
         Ok(ids)
     }
-    
+
     /// Search for similar documents using vector similarity
-    pub async fn search(&self, query_embedding: &[f32], limit: Option<usize>) -> RagResult<Vec<Document>> {
+    pub async fn search(
+        &self,
+        query_embedding: &[f32],
+        limit: Option<usize>,
+    ) -> RagResult<Vec<Document>> {
         self.search_with_filter(query_embedding, limit, None).await
     }
-    
+
     /// Search for similar documents with metadata filtering
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust,ignore
     /// use llama_gguf::rag::{RagStore, MetadataFilter};
-    /// 
+    ///
     /// // Search with a simple filter
     /// let filter = MetadataFilter::eq("type", "documentation");
     /// let results = store.search_with_filter(&embedding, Some(10), Some(filter)).await?;
-    /// 
+    ///
     /// // Search with multiple filters
     /// let filter = MetadataFilter::and(vec![
     ///     MetadataFilter::eq("source", "docs"),
@@ -615,23 +741,26 @@ impl RagStore {
                 actual: query_embedding.len(),
             });
         }
-        
-        let client = self.pool.get().await
+
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let embedding = Vector::from(query_embedding.to_vec());
         let limit = limit.unwrap_or(self.config.max_results()) as i64;
         let operator = self.config.distance_metric().operator();
-        
+
         // For cosine distance, convert to similarity (1 - distance)
         let score_expr = match self.config.distance_metric() {
             super::DistanceMetric::Cosine => format!("1 - (embedding {} $1)", operator),
             super::DistanceMetric::L2 => format!("1 / (1 + (embedding {} $1))", operator),
             super::DistanceMetric::InnerProduct => format!("-(embedding {} $1)", operator),
         };
-        
+
         let min_sim = self.config.min_similarity();
-        
+
         // Build the WHERE clause
         let (filter_clause, filter_params) = if let Some(f) = filter {
             let (sql, params) = f.to_sql(3); // Start after $1 (embedding), $2 (min_sim), $3 (limit)
@@ -639,7 +768,7 @@ impl RagStore {
         } else {
             (String::new(), Vec::new())
         };
-        
+
         let query = format!(
             r#"
             SELECT id, content, metadata, {} as score
@@ -654,7 +783,7 @@ impl RagStore {
             filter_clause,
             operator
         );
-        
+
         // Build params dynamically
         use tokio_postgres::types::ToSql;
         let mut params: Vec<&(dyn ToSql + Sync)> = vec![&embedding, &min_sim, &limit];
@@ -662,110 +791,144 @@ impl RagStore {
         for p in &filter_param_refs {
             params.push(p);
         }
-        
-        let rows = client.query(&query, &params).await
+
+        let rows = client
+            .query(&query, &params)
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
-        let docs = rows.iter().map(|row| {
-            Document {
+
+        let docs = rows
+            .iter()
+            .map(|row| Document {
                 id: row.get(0),
                 content: row.get(1),
                 metadata: row.get(2),
                 score: Some(row.get(3)),
-            }
-        }).collect();
-        
+            })
+            .collect();
+
         Ok(docs)
     }
-    
+
     /// Count documents matching a filter
     pub async fn count_with_filter(&self, filter: Option<MetadataFilter>) -> RagResult<i64> {
-        let client = self.pool.get().await
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let (filter_clause, filter_params) = if let Some(f) = filter {
             let (sql, params) = f.to_sql(0);
             (format!(" WHERE {}", sql), params)
         } else {
             (String::new(), Vec::new())
         };
-        
+
         let query = format!(
             "SELECT COUNT(*) FROM {}{}",
             self.config.table_name(),
             filter_clause
         );
-        
+
         use tokio_postgres::types::ToSql;
         let filter_param_refs: Vec<&str> = filter_params.iter().map(|s| s.as_str()).collect();
-        let params: Vec<&(dyn ToSql + Sync)> = filter_param_refs.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-        
-        let row = client.query_one(&query, &params).await
+        let params: Vec<&(dyn ToSql + Sync)> = filter_param_refs
+            .iter()
+            .map(|p| p as &(dyn ToSql + Sync))
+            .collect();
+
+        let row = client
+            .query_one(&query, &params)
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         Ok(row.get(0))
     }
-    
+
     /// Delete documents matching a filter
     pub async fn delete_with_filter(&self, filter: MetadataFilter) -> RagResult<u64> {
-        let client = self.pool.get().await
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let (filter_sql, filter_params) = filter.to_sql(0);
-        
+
         let query = format!(
             "DELETE FROM {} WHERE {}",
             self.config.table_name(),
             filter_sql
         );
-        
+
         use tokio_postgres::types::ToSql;
         let filter_param_refs: Vec<&str> = filter_params.iter().map(|s| s.as_str()).collect();
-        let params: Vec<&(dyn ToSql + Sync)> = filter_param_refs.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-        
-        let affected = client.execute(&query, &params).await
+        let params: Vec<&(dyn ToSql + Sync)> = filter_param_refs
+            .iter()
+            .map(|p| p as &(dyn ToSql + Sync))
+            .collect();
+
+        let affected = client
+            .execute(&query, &params)
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         Ok(affected)
     }
-    
+
     /// List unique values for a metadata field
-    pub async fn list_metadata_values(&self, field: &str, limit: Option<usize>) -> RagResult<Vec<String>> {
-        let client = self.pool.get().await
+    pub async fn list_metadata_values(
+        &self,
+        field: &str,
+        limit: Option<usize>,
+    ) -> RagResult<Vec<String>> {
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let limit = limit.unwrap_or(100) as i64;
-        
+
         let query = format!(
             "SELECT DISTINCT metadata->>'{}' as val FROM {} WHERE metadata ? '{}' ORDER BY val LIMIT $1",
             escape_field(field),
             self.config.table_name(),
             escape_field(field)
         );
-        
-        let rows = client.query(&query, &[&limit]).await
+
+        let rows = client
+            .query(&query, &[&limit])
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
-        let values = rows.iter()
+
+        let values = rows
+            .iter()
             .filter_map(|row| row.get::<_, Option<String>>(0))
             .collect();
-        
+
         Ok(values)
     }
-    
+
     /// Get a document by ID
     pub async fn get(&self, id: i64) -> RagResult<Option<Document>> {
-        let client = self.pool.get().await
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let query = format!(
             "SELECT id, content, metadata FROM {} WHERE id = $1",
             self.config.table_name()
         );
-        
-        let row = client.query_opt(&query, &[&id]).await
+
+        let row = client
+            .query_opt(&query, &[&id])
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         Ok(row.map(|r| Document {
             id: r.get(0),
             content: r.get(1),
@@ -773,43 +936,58 @@ impl RagStore {
             score: None,
         }))
     }
-    
+
     /// Delete a document by ID
     pub async fn delete(&self, id: i64) -> RagResult<bool> {
-        let client = self.pool.get().await
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let query = format!("DELETE FROM {} WHERE id = $1", self.config.table_name());
-        let affected = client.execute(&query, &[&id]).await
+        let affected = client
+            .execute(&query, &[&id])
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         Ok(affected > 0)
     }
-    
+
     /// Count total documents
     pub async fn count(&self) -> RagResult<i64> {
-        let client = self.pool.get().await
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let query = format!("SELECT COUNT(*) FROM {}", self.config.table_name());
-        let row = client.query_one(&query, &[]).await
+        let row = client
+            .query_one(&query, &[])
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         Ok(row.get(0))
     }
-    
+
     /// Clear all documents from the table
     pub async fn clear(&self) -> RagResult<u64> {
-        let client = self.pool.get().await
+        let client = self
+            .pool
+            .get()
+            .await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let query = format!("DELETE FROM {}", self.config.table_name());
-        let affected = client.execute(&query, &[]).await
+        let affected = client
+            .execute(&query, &[])
+            .await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         Ok(affected)
     }
-    
+
     /// Get the configuration
     pub fn config(&self) -> &RagConfig {
         &self.config
@@ -834,31 +1012,31 @@ impl RagContextBuilder {
             include_scores: false,
         }
     }
-    
+
     /// Set the separator between documents
     pub fn with_separator(mut self, sep: impl Into<String>) -> Self {
         self.separator = sep.into();
         self
     }
-    
+
     /// Set approximate maximum tokens (characters / 4)
     pub fn with_max_tokens(mut self, max: usize) -> Self {
         self.max_tokens = Some(max);
         self
     }
-    
+
     /// Include similarity scores in output
     pub fn with_scores(mut self, include: bool) -> Self {
         self.include_scores = include;
         self
     }
-    
+
     /// Build the context string
     pub fn build(self) -> String {
         let mut parts = Vec::new();
         let mut total_chars = 0;
         let max_chars = self.max_tokens.map(|t| t * 4);
-        
+
         for doc in &self.docs {
             let part = if self.include_scores {
                 if let Some(score) = doc.score {
@@ -869,19 +1047,20 @@ impl RagContextBuilder {
             } else {
                 doc.content.clone()
             };
-            
+
             if let Some(max) = max_chars
-                && total_chars + part.len() > max {
-                    break;
-                }
-            
+                && total_chars + part.len() > max
+            {
+                break;
+            }
+
             total_chars += part.len() + self.separator.len();
             parts.push(part);
         }
-        
+
         parts.join(&self.separator)
     }
-    
+
     /// Build a prompt with context and question
     pub fn build_prompt(self, question: &str) -> String {
         let context = self.build();
@@ -890,8 +1069,7 @@ impl RagContextBuilder {
             Context:\n{}\n\n\
             Question: {}\n\n\
             Answer:",
-            context,
-            question
+            context, question
         )
     }
 }

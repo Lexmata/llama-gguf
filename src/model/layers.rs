@@ -27,9 +27,7 @@ impl Linear {
     /// Create a new linear layer
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> ModelResult<Self> {
         if weight.ndim() != 2 {
-            return Err(ModelError::ConfigError(
-                "Linear weight must be 2D".into(),
-            ));
+            return Err(ModelError::ConfigError("Linear weight must be 2D".into()));
         }
 
         // GGUF convention: [in_features, out_features]
@@ -37,13 +35,14 @@ impl Linear {
         let out_features = weight.shape()[1];
 
         if let Some(ref b) = bias
-            && b.shape() != [out_features] {
-                return Err(ModelError::TensorShapeMismatch {
-                    name: "bias".into(),
-                    expected: vec![out_features],
-                    got: b.shape().to_vec(),
-                });
-            }
+            && b.shape() != [out_features]
+        {
+            return Err(ModelError::TensorShapeMismatch {
+                name: "bias".into(),
+                expected: vec![out_features],
+                got: b.shape().to_vec(),
+            });
+        }
 
         Ok(Self {
             weight,
@@ -124,9 +123,7 @@ impl RMSNorm {
     /// Create a new RMS normalization layer
     pub fn new(weight: Tensor, eps: f32) -> ModelResult<Self> {
         if weight.ndim() != 1 {
-            return Err(ModelError::ConfigError(
-                "RMSNorm weight must be 1D".into(),
-            ));
+            return Err(ModelError::ConfigError("RMSNorm weight must be 1D".into()));
         }
 
         let hidden_size = weight.shape()[0];
@@ -185,8 +182,9 @@ impl Attention {
     ) -> Self {
         Self::with_rope_type(wq, wk, wv, wo, num_heads, num_kv_heads, head_dim, false)
     }
-    
+
     /// Create a new attention layer with explicit RoPE type
+    #[allow(clippy::too_many_arguments)]
     pub fn with_rope_type(
         wq: Linear,
         wk: Linear,
@@ -223,6 +221,7 @@ impl Attention {
     ///
     /// # Returns
     /// Output tensor [seq_len, hidden_size]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: &Tensor,
@@ -258,14 +257,20 @@ impl Attention {
         self.wk.forward(&x_vec, &mut k, backend)?;
         self.wv.forward(&x_vec, &mut v, backend)?;
 
-
         // Reshape to [num_heads, 1, head_dim] for RoPE
         let mut q_reshaped = q.reshape(vec![self.num_heads, 1, self.head_dim])?;
         let mut k_reshaped = k.reshape(vec![self.num_kv_heads, 1, self.head_dim])?;
         let v_reshaped = v.reshape(vec![self.num_kv_heads, 1, self.head_dim])?;
 
         // Apply RoPE to current Q and K
-        backend.rope(&mut q_reshaped, &mut k_reshaped, pos, freq_base, freq_scale, self.use_neox_rope)?;
+        backend.rope(
+            &mut q_reshaped,
+            &mut k_reshaped,
+            pos,
+            freq_base,
+            freq_scale,
+            self.use_neox_rope,
+        )?;
 
         // Get cache dimensions before mutable borrow
         let max_seq_len = k_cache.shape()[1];
@@ -339,7 +344,13 @@ impl Attention {
 
         // Compute attention using full cached K, V
         let mut attn_out = Tensor::zeros(vec![self.num_heads, 1, self.head_dim], DType::F32);
-        backend.attention(&q_reshaped, &k_for_attn, &v_for_attn, &mut attn_out, self.scale)?;
+        backend.attention(
+            &q_reshaped,
+            &k_for_attn,
+            &v_for_attn,
+            &mut attn_out,
+            self.scale,
+        )?;
 
         // Reshape back to [hidden_size]
         let attn_out_flat = attn_out.reshape(vec![self.num_heads * self.head_dim])?;
@@ -428,6 +439,7 @@ pub struct TransformerLayer {
 
 impl TransformerLayer {
     /// Forward pass with residual connections
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: &Tensor,
@@ -445,13 +457,7 @@ impl TransformerLayer {
         self.attn_norm.forward(x, &mut norm_out, backend)?;
 
         let attn_out = self.attention.forward(
-            &norm_out,
-            k_cache,
-            v_cache,
-            pos,
-            freq_base,
-            freq_scale,
-            backend,
+            &norm_out, k_cache, v_cache, pos, freq_base, freq_scale, backend,
         )?;
 
         // Residual connection for attention

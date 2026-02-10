@@ -57,10 +57,7 @@ impl OnnxFile {
     /// Open and parse an ONNX file
     pub fn open<P: AsRef<Path>>(path: P) -> OnnxResult<Self> {
         let path = path.as_ref();
-        let base_dir = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let data = std::fs::read(path)?;
         let model = proto::ModelProto::decode(data.as_slice())?;
         Ok(Self { model, base_dir })
@@ -151,7 +148,11 @@ impl OnnxFile {
                                 s.dim
                                     .iter()
                                     .map(|d| match &d.value {
-                                        Some(proto::tensor_shape_proto::dimension::Value::DimValue(v)) => *v,
+                                        Some(
+                                            proto::tensor_shape_proto::dimension::Value::DimValue(
+                                                v,
+                                            ),
+                                        ) => *v,
                                         _ => -1,
                                     })
                                     .collect()
@@ -333,15 +334,15 @@ fn extract_external_tensor_bytes(
 /// Convert an ONNX data type ID to our DType
 pub fn onnx_dtype_to_dtype(onnx_type: i32) -> OnnxResult<DType> {
     match onnx_type {
-        1 => Ok(DType::F32),     // FLOAT
-        2 => Ok(DType::U8),      // UINT8
-        3 => Ok(DType::I8),      // INT8
-        5 => Ok(DType::I16),     // INT16
-        6 => Ok(DType::I32),     // INT32
-        7 => Ok(DType::I64),     // INT64
-        10 => Ok(DType::F16),    // FLOAT16
-        11 => Ok(DType::F64),    // DOUBLE
-        16 => Ok(DType::BF16),   // BFLOAT16
+        1 => Ok(DType::F32),   // FLOAT
+        2 => Ok(DType::U8),    // UINT8
+        3 => Ok(DType::I8),    // INT8
+        5 => Ok(DType::I16),   // INT16
+        6 => Ok(DType::I32),   // INT32
+        7 => Ok(DType::I64),   // INT64
+        10 => Ok(DType::F16),  // FLOAT16
+        11 => Ok(DType::F64),  // DOUBLE
+        16 => Ok(DType::BF16), // BFLOAT16
         other => Err(OnnxError::UnsupportedDataType(other)),
     }
 }
@@ -359,11 +360,8 @@ pub fn onnx_dtype_to_dtype(onnx_type: i32) -> OnnxResult<DType> {
 /// 3. Returns a map: opaque_name -> logical_hf_name
 pub fn trace_graph_tensor_names(onnx: &OnnxFile) -> OnnxResult<HashMap<String, String>> {
     let graph = onnx.graph()?;
-    let init_names: std::collections::HashSet<&str> = graph
-        .initializer
-        .iter()
-        .map(|i| i.name.as_str())
-        .collect();
+    let init_names: std::collections::HashSet<&str> =
+        graph.initializer.iter().map(|i| i.name.as_str()).collect();
 
     let mut name_map: HashMap<String, String> = HashMap::new();
 

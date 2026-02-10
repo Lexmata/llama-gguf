@@ -53,7 +53,14 @@ impl DType {
             // K-quants: 256 elements per block
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
             // IQ types: 256 elements per block
-            Self::IQ2XXS | Self::IQ2XS | Self::IQ2S | Self::IQ3XXS | Self::IQ3S | Self::IQ4XS | Self::IQ4NL | Self::IQ1S => 256,
+            Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ2S
+            | Self::IQ3XXS
+            | Self::IQ3S
+            | Self::IQ4XS
+            | Self::IQ4NL
+            | Self::IQ1S => 256,
         }
     }
 

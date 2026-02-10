@@ -24,16 +24,10 @@ use crate::backend::{Backend, BackendError, BackendResult};
 use crate::tensor::{DType, Tensor};
 
 /// Metal backend configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MetalConfig {
     /// Device index to use (0 = system default GPU)
     pub device_index: usize,
-}
-
-impl Default for MetalConfig {
-    fn default() -> Self {
-        Self { device_index: 0 }
-    }
 }
 
 /// Metal GPU backend
@@ -237,10 +231,9 @@ impl Backend for MetalBackend {
         use_neox: bool,
     ) -> BackendResult<()> {
         match ops::rope(&self.ctx, q, k, pos, freq_base, freq_scale, use_neox) {
-            Err(BackendError::Unsupported(_)) => {
-                self.cpu_fallback
-                    .rope(q, k, pos, freq_base, freq_scale, use_neox)
-            }
+            Err(BackendError::Unsupported(_)) => self
+                .cpu_fallback
+                .rope(q, k, pos, freq_base, freq_scale, use_neox),
             other => other,
         }
     }

@@ -8,11 +8,11 @@ use std::path::Path;
 use crate::gguf::{GgufFile, MetadataValue};
 use crate::tensor::{DType, Tensor};
 
+use super::Architecture;
 use super::config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType, RopeType};
 use super::error::{ModelError, ModelResult};
 use super::layers::{Attention, FeedForward, Linear, RMSNorm, TransformerLayer};
 use super::llama::LlamaModel;
-use super::Architecture;
 
 /// Model loader for GGUF files
 pub struct ModelLoader {
@@ -63,9 +63,8 @@ impl ModelLoader {
         };
 
         // Helper to get f32 metadata with default
-        let get_f32_or = |key: &str, default: f32| -> f32 {
-            gguf.data.get_f32(key).unwrap_or(default)
-        };
+        let get_f32_or =
+            |key: &str, default: f32| -> f32 { gguf.data.get_f32(key).unwrap_or(default) };
 
         // Get core configuration
         // Try multiple methods to determine vocab size
@@ -75,9 +74,10 @@ impl ModelLoader {
             .unwrap_or_else(|_| {
                 // Fallback: get vocab size from tokenizer tokens array length
                 if let Some(tokens) = gguf.data.metadata.get("tokenizer.ggml.tokens")
-                    && let MetadataValue::Array(arr) = tokens {
-                        return arr.values.len();
-                    }
+                    && let MetadataValue::Array(arr) = tokens
+                {
+                    return arr.values.len();
+                }
                 // Last resort: infer from embedding tensor shape
                 if let Some(emb_info) = gguf.data.get_tensor("token_embd.weight") {
                     // Shape is [hidden_size, vocab_size] in llama.cpp convention
@@ -103,15 +103,14 @@ impl ModelLoader {
         let intermediate_size = get_u32(&format!("{}.feed_forward_length", arch))
             .unwrap_or((hidden_size * 4 * 2 / 3) as u32) as usize;
 
-        let max_seq_len = get_u32(&format!("{}.context_length", arch))
-            .unwrap_or(2048) as usize;
+        let max_seq_len = get_u32(&format!("{}.context_length", arch)).unwrap_or(2048) as usize;
 
         let norm_eps = get_f32_or(&format!("{}.attention.layer_norm_rms_epsilon", arch), 1e-5);
 
         // Parse RoPE configuration
         let freq_base = get_f32_or(&format!("{}.rope.freq_base", arch), 10000.0);
         let freq_scale = get_f32_or(&format!("{}.rope.scale_linear", arch), 1.0);
-        
+
         // Determine RoPE type based on architecture
         // Qwen2 uses NeoX style (type 2), most others use Normal style (type 0)
         let rope_type = match architecture {
@@ -143,7 +142,9 @@ impl ModelLoader {
             hidden_act: ActivationType::SiLU,
             attention_bias: false,
             mlp_bias: false,
-            tie_word_embeddings: gguf.data.get_string("general.tie_word_embeddings")
+            tie_word_embeddings: gguf
+                .data
+                .get_string("general.tie_word_embeddings")
                 .map(|s| s == "true")
                 .unwrap_or(false),
         })
@@ -177,13 +178,14 @@ impl ModelLoader {
 
         // Load output projection (may be tied to embeddings)
         // Check if output.weight exists - if not, use weight tying
-        let output = if self.config.tie_word_embeddings || self.try_load_tensor("output.weight").is_none() {
-            // Use embedding weights as output (weight tying)
-            Linear::new(token_embedding.clone(), None)?
-        } else {
-            let output_weight = self.load_tensor("output.weight")?;
-            Linear::new(output_weight, None)?
-        };
+        let output =
+            if self.config.tie_word_embeddings || self.try_load_tensor("output.weight").is_none() {
+                // Use embedding weights as output (weight tying)
+                Linear::new(token_embedding.clone(), None)?
+            } else {
+                let output_weight = self.load_tensor("output.weight")?;
+                Linear::new(output_weight, None)?
+            };
 
         LlamaModel::new(
             self.config,
@@ -273,10 +275,12 @@ impl ModelLoader {
         let shape: Vec<usize> = tensor_info.dims.iter().map(|&d| d as usize).collect();
         let dtype = DType::from(tensor_info.dtype);
 
-        Tensor::new(tensor_data.to_vec(), shape, dtype).ok().map(|mut t| {
-            t.set_name(name);
-            t
-        })
+        Tensor::new(tensor_data.to_vec(), shape, dtype)
+            .ok()
+            .map(|mut t| {
+                t.set_name(name);
+                t
+            })
     }
 
     /// Load a tensor from the GGUF file
@@ -299,10 +303,10 @@ impl ModelLoader {
         // This is necessary because the GGUF file is dropped after build_model() returns
         // and the memory-mapped data would become invalid
         let mut tensor = Tensor::new(tensor_data.to_vec(), shape, dtype)?;
-        
+
         // Store the GGUF tensor name for GPU weight lookup
         tensor.set_name(name);
-        
+
         Ok(tensor)
     }
 }

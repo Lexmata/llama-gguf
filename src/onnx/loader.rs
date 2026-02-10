@@ -42,10 +42,7 @@ impl OnnxModelLoader {
         let onnx = OnnxFile::open(path)?;
 
         // Find and load config.json from the same directory
-        let config_path = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("config.json");
+        let config_path = path.parent().unwrap_or(Path::new(".")).join("config.json");
 
         let hf_config = HfConfig::from_file(&config_path)?;
         let architecture = hf_config.architecture();
@@ -151,14 +148,13 @@ impl OnnxModelLoader {
         let norm = RMSNorm::new(norm_weight, self.config.norm_eps)?;
 
         // Load output projection (may be tied to embeddings)
-        let output = if self.config.tie_word_embeddings
-            || name_map.resolve("output.weight").is_none()
-        {
-            Linear::new(token_embedding.clone(), None)?
-        } else {
-            let output_weight = self.load_mapped_tensor(&name_map, "output.weight")?;
-            Linear::new(output_weight, None)?
-        };
+        let output =
+            if self.config.tie_word_embeddings || name_map.resolve("output.weight").is_none() {
+                Linear::new(token_embedding.clone(), None)?
+            } else {
+                let output_weight = self.load_mapped_tensor(&name_map, "output.weight")?;
+                Linear::new(output_weight, None)?
+            };
 
         let model = LlamaModel::new(
             self.config,
@@ -549,7 +545,7 @@ fn f16_bits_to_f32(h: u16) -> f32 {
                 e += 1;
             }
             m &= 0x3FF; // Remove implicit leading 1
-            let exp = (127 - 15 - e + 1) as u32;
+            let exp = 127 - 15 - e + 1;
             (sign << 31) | (exp << 23) | (m << 13)
         }
     } else if exponent == 31 {

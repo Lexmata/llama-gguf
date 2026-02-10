@@ -180,8 +180,14 @@ mod tests {
     fn test_from_gguf_str() {
         assert_eq!(Architecture::from_gguf_str("llama"), Architecture::Llama);
         assert_eq!(Architecture::from_gguf_str("LLAMA"), Architecture::Llama);
-        assert_eq!(Architecture::from_gguf_str("mistral"), Architecture::Mistral);
-        assert_eq!(Architecture::from_gguf_str("unknown_arch"), Architecture::Unknown);
+        assert_eq!(
+            Architecture::from_gguf_str("mistral"),
+            Architecture::Mistral
+        );
+        assert_eq!(
+            Architecture::from_gguf_str("unknown_arch"),
+            Architecture::Unknown
+        );
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! Vulkan device initialization, memory management, and command submission.
 
 use ash::vk;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc};
 use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::{
+    Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
+};
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::sync::Mutex;
 use std::mem::ManuallyDrop;
+use std::sync::Mutex;
 
 use crate::backend::BackendError;
 
@@ -52,8 +54,9 @@ impl VulkanContext {
 
     unsafe fn init(device_index: usize, enable_validation: bool) -> Result<Self, BackendError> {
         // Load Vulkan runtime library
-        let entry = ash::Entry::load()
-            .map_err(|e| BackendError::InitializationFailed(format!("Failed to load Vulkan library: {}", e)))?;
+        let entry = ash::Entry::load().map_err(|e| {
+            BackendError::InitializationFailed(format!("Failed to load Vulkan library: {}", e))
+        })?;
 
         // Application info
         let app_name = c"llama-gguf";
@@ -72,9 +75,9 @@ impl VulkanContext {
             let validation = c"VK_LAYER_KHRONOS_validation";
             // Check if validation layer is available
             if let Ok(available) = entry.enumerate_instance_layer_properties() {
-                let has_validation = available.iter().any(|l| {
-                    CStr::from_ptr(l.layer_name.as_ptr()) == validation
-                });
+                let has_validation = available
+                    .iter()
+                    .any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation);
                 if has_validation {
                     layers.push(validation.as_ptr());
                 }
@@ -85,14 +88,14 @@ impl VulkanContext {
             .application_info(&app_info)
             .enabled_layer_names(&layers);
 
-        let instance = entry
-            .create_instance(&instance_info, None)
-            .map_err(|e| BackendError::InitializationFailed(format!("Vulkan instance creation failed: {}", e)))?;
+        let instance = entry.create_instance(&instance_info, None).map_err(|e| {
+            BackendError::InitializationFailed(format!("Vulkan instance creation failed: {}", e))
+        })?;
 
         // Enumerate physical devices
-        let physical_devices = instance
-            .enumerate_physical_devices()
-            .map_err(|e| BackendError::InitializationFailed(format!("Failed to enumerate GPUs: {}", e)))?;
+        let physical_devices = instance.enumerate_physical_devices().map_err(|e| {
+            BackendError::InitializationFailed(format!("Failed to enumerate GPUs: {}", e))
+        })?;
 
         if physical_devices.is_empty() {
             return Err(BackendError::InitializationFailed(
@@ -145,7 +148,9 @@ impl VulkanContext {
 
         let device = instance
             .create_device(physical_device, &device_create_info, None)
-            .map_err(|e| BackendError::InitializationFailed(format!("Device creation failed: {}", e)))?;
+            .map_err(|e| {
+                BackendError::InitializationFailed(format!("Device creation failed: {}", e))
+            })?;
 
         let compute_queue = device.get_device_queue(queue_family_index, 0);
 
@@ -154,9 +159,9 @@ impl VulkanContext {
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
-        let command_pool = device
-            .create_command_pool(&pool_info, None)
-            .map_err(|e| BackendError::InitializationFailed(format!("Command pool creation failed: {}", e)))?;
+        let command_pool = device.create_command_pool(&pool_info, None).map_err(|e| {
+            BackendError::InitializationFailed(format!("Command pool creation failed: {}", e))
+        })?;
 
         // Create memory allocator
         let allocator = Allocator::new(&AllocatorCreateDesc {
@@ -167,7 +172,9 @@ impl VulkanContext {
             buffer_device_address: false,
             allocation_sizes: Default::default(),
         })
-        .map_err(|e| BackendError::InitializationFailed(format!("Allocator creation failed: {}", e)))?;
+        .map_err(|e| {
+            BackendError::InitializationFailed(format!("Allocator creation failed: {}", e))
+        })?;
 
         // Create descriptor pool (large enough for many operations)
         let pool_sizes = [vk::DescriptorPoolSize {
@@ -182,7 +189,9 @@ impl VulkanContext {
 
         let descriptor_pool = device
             .create_descriptor_pool(&desc_pool_info, None)
-            .map_err(|e| BackendError::InitializationFailed(format!("Descriptor pool failed: {}", e)))?;
+            .map_err(|e| {
+                BackendError::InitializationFailed(format!("Descriptor pool failed: {}", e))
+            })?;
 
         // Load and compile compute pipelines
         let mut pipelines = HashMap::new();
@@ -216,23 +225,87 @@ impl VulkanContext {
     ) -> Result<(), BackendError> {
         // Each shader: (name, spir-v bytes, num_bindings, push_constant_size)
         let shader_defs: Vec<(&str, &[u8], u32, u32)> = vec![
-            ("add", include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")), 3, 4),
-            ("mul", include_bytes!(concat!(env!("OUT_DIR"), "/mul.spv")), 3, 4),
-            ("scale", include_bytes!(concat!(env!("OUT_DIR"), "/scale.spv")), 2, 8),
-            ("silu", include_bytes!(concat!(env!("OUT_DIR"), "/silu.spv")), 2, 4),
-            ("gelu", include_bytes!(concat!(env!("OUT_DIR"), "/gelu.spv")), 2, 4),
-            ("softmax_max", include_bytes!(concat!(env!("OUT_DIR"), "/softmax_max.spv")), 2, 4),
-            ("softmax_exp", include_bytes!(concat!(env!("OUT_DIR"), "/softmax_exp.spv")), 2, 8),
-            ("softmax_div", include_bytes!(concat!(env!("OUT_DIR"), "/softmax_div.spv")), 1, 8),
-            ("rms_norm_sum", include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_sum.spv")), 2, 4),
-            ("rms_norm_scale", include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_scale.spv")), 3, 8),
-            ("vec_mat", include_bytes!(concat!(env!("OUT_DIR"), "/vec_mat.spv")), 3, 8),
-            ("rope", include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")), 2, 28),
+            (
+                "add",
+                include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")),
+                3,
+                4,
+            ),
+            (
+                "mul",
+                include_bytes!(concat!(env!("OUT_DIR"), "/mul.spv")),
+                3,
+                4,
+            ),
+            (
+                "scale",
+                include_bytes!(concat!(env!("OUT_DIR"), "/scale.spv")),
+                2,
+                8,
+            ),
+            (
+                "silu",
+                include_bytes!(concat!(env!("OUT_DIR"), "/silu.spv")),
+                2,
+                4,
+            ),
+            (
+                "gelu",
+                include_bytes!(concat!(env!("OUT_DIR"), "/gelu.spv")),
+                2,
+                4,
+            ),
+            (
+                "softmax_max",
+                include_bytes!(concat!(env!("OUT_DIR"), "/softmax_max.spv")),
+                2,
+                4,
+            ),
+            (
+                "softmax_exp",
+                include_bytes!(concat!(env!("OUT_DIR"), "/softmax_exp.spv")),
+                2,
+                8,
+            ),
+            (
+                "softmax_div",
+                include_bytes!(concat!(env!("OUT_DIR"), "/softmax_div.spv")),
+                1,
+                8,
+            ),
+            (
+                "rms_norm_sum",
+                include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_sum.spv")),
+                2,
+                4,
+            ),
+            (
+                "rms_norm_scale",
+                include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_scale.spv")),
+                3,
+                8,
+            ),
+            (
+                "vec_mat",
+                include_bytes!(concat!(env!("OUT_DIR"), "/vec_mat.spv")),
+                3,
+                8,
+            ),
+            (
+                "rope",
+                include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")),
+                2,
+                28,
+            ),
         ];
 
         for (name, spirv_bytes, num_bindings, push_constant_size) in shader_defs {
-            let pipeline =
-                Self::create_compute_pipeline(device, spirv_bytes, num_bindings, push_constant_size)?;
+            let pipeline = Self::create_compute_pipeline(
+                device,
+                spirv_bytes,
+                num_bindings,
+                push_constant_size,
+            )?;
             pipelines.insert(name.to_string(), pipeline);
         }
 
@@ -258,7 +331,9 @@ impl VulkanContext {
 
             let shader_module = device
                 .create_shader_module(&shader_info, None)
-                .map_err(|e| BackendError::InitializationFailed(format!("Shader module failed: {}", e)))?;
+                .map_err(|e| {
+                    BackendError::InitializationFailed(format!("Shader module failed: {}", e))
+                })?;
 
             // Descriptor set layout
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..num_bindings)
@@ -271,12 +346,13 @@ impl VulkanContext {
                 })
                 .collect();
 
-            let desc_layout_info =
-                vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            let desc_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
             let descriptor_set_layout = device
                 .create_descriptor_set_layout(&desc_layout_info, None)
-                .map_err(|e| BackendError::InitializationFailed(format!("Desc layout failed: {}", e)))?;
+                .map_err(|e| {
+                    BackendError::InitializationFailed(format!("Desc layout failed: {}", e))
+                })?;
 
             // Pipeline layout
             let desc_layouts = [descriptor_set_layout];
@@ -294,9 +370,12 @@ impl VulkanContext {
                 .set_layouts(&desc_layouts)
                 .push_constant_ranges(&push_constant_range);
 
-            let pipeline_layout = device
-                .create_pipeline_layout(&layout_info, None)
-                .map_err(|e| BackendError::InitializationFailed(format!("Pipeline layout failed: {}", e)))?;
+            let pipeline_layout =
+                device
+                    .create_pipeline_layout(&layout_info, None)
+                    .map_err(|e| {
+                        BackendError::InitializationFailed(format!("Pipeline layout failed: {}", e))
+                    })?;
 
             // Compute pipeline
             let entry_point = c"main";
@@ -312,7 +391,9 @@ impl VulkanContext {
             let pipeline_infos = [pipeline_info];
             let pipeline = device
                 .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
-                .map_err(|e| BackendError::InitializationFailed(format!("Pipeline creation failed: {:?}", e)))?[0];
+                .map_err(|e| {
+                    BackendError::InitializationFailed(format!("Pipeline creation failed: {:?}", e))
+                })?[0];
 
             // Clean up shader module (no longer needed after pipeline creation)
             device.destroy_shader_module(shader_module, None);
@@ -346,13 +427,16 @@ impl VulkanContext {
         unsafe {
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(size)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+                .usage(
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::TRANSFER_DST,
+                )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-            let buffer = self
-                .device
-                .create_buffer(&buffer_info, None)
-                .map_err(|e| BackendError::AllocationFailed(format!("Buffer creation failed: {}", e)))?;
+            let buffer = self.device.create_buffer(&buffer_info, None).map_err(|e| {
+                BackendError::AllocationFailed(format!("Buffer creation failed: {}", e))
+            })?;
 
             let requirements = self.device.get_buffer_memory_requirements(buffer);
 
@@ -371,7 +455,9 @@ impl VulkanContext {
 
             self.device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
-                .map_err(|e| BackendError::AllocationFailed(format!("Bind memory failed: {}", e)))?;
+                .map_err(|e| {
+                    BackendError::AllocationFailed(format!("Bind memory failed: {}", e))
+                })?;
 
             // Copy data
             if let Some(mapped) = allocation.mapped_ptr() {
@@ -397,13 +483,16 @@ impl VulkanContext {
         unsafe {
             let buffer_info = vk::BufferCreateInfo::default()
                 .size(size)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+                .usage(
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::TRANSFER_DST,
+                )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-            let buffer = self
-                .device
-                .create_buffer(&buffer_info, None)
-                .map_err(|e| BackendError::AllocationFailed(format!("Buffer creation failed: {}", e)))?;
+            let buffer = self.device.create_buffer(&buffer_info, None).map_err(|e| {
+                BackendError::AllocationFailed(format!("Buffer creation failed: {}", e))
+            })?;
 
             let requirements = self.device.get_buffer_memory_requirements(buffer);
 
@@ -422,7 +511,9 @@ impl VulkanContext {
 
             self.device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
-                .map_err(|e| BackendError::AllocationFailed(format!("Bind memory failed: {}", e)))?;
+                .map_err(|e| {
+                    BackendError::AllocationFailed(format!("Bind memory failed: {}", e))
+                })?;
 
             Ok(GpuBuffer {
                 buffer,
@@ -472,10 +563,9 @@ impl VulkanContext {
         push_constants: &[u8],
         workgroup_count: (u32, u32, u32),
     ) -> Result<(), BackendError> {
-        let pipeline = self
-            .pipelines
-            .get(pipeline_name)
-            .ok_or_else(|| BackendError::OperationFailed(format!("Pipeline not found: {}", pipeline_name)))?;
+        let pipeline = self.pipelines.get(pipeline_name).ok_or_else(|| {
+            BackendError::OperationFailed(format!("Pipeline not found: {}", pipeline_name))
+        })?;
 
         unsafe {
             // Allocate descriptor set
@@ -484,10 +574,12 @@ impl VulkanContext {
                 .descriptor_pool(self.descriptor_pool)
                 .set_layouts(&layouts);
 
-            let descriptor_set = self
-                .device
-                .allocate_descriptor_sets(&alloc_info)
-                .map_err(|e| BackendError::OperationFailed(format!("Descriptor set alloc failed: {}", e)))?[0];
+            let descriptor_set =
+                self.device
+                    .allocate_descriptor_sets(&alloc_info)
+                    .map_err(|e| {
+                        BackendError::OperationFailed(format!("Descriptor set alloc failed: {}", e))
+                    })?[0];
 
             // Update descriptor set with buffer bindings
             let buffer_infos: Vec<vk::DescriptorBufferInfo> = buffers
@@ -523,7 +615,9 @@ impl VulkanContext {
             let cmd_buf = self
                 .device
                 .allocate_command_buffers(&cmd_alloc_info)
-                .map_err(|e| BackendError::OperationFailed(format!("Command buffer alloc failed: {}", e)))?[0];
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("Command buffer alloc failed: {}", e))
+                })?[0];
 
             // Record commands
             let begin_info = vk::CommandBufferBeginInfo::default()
@@ -531,10 +625,15 @@ impl VulkanContext {
 
             self.device
                 .begin_command_buffer(cmd_buf, &begin_info)
-                .map_err(|e| BackendError::OperationFailed(format!("Begin command buffer failed: {}", e)))?;
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("Begin command buffer failed: {}", e))
+                })?;
 
-            self.device
-                .cmd_bind_pipeline(cmd_buf, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
+            self.device.cmd_bind_pipeline(
+                cmd_buf,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline.pipeline,
+            );
 
             self.device.cmd_bind_descriptor_sets(
                 cmd_buf,
@@ -555,8 +654,12 @@ impl VulkanContext {
                 );
             }
 
-            self.device
-                .cmd_dispatch(cmd_buf, workgroup_count.0, workgroup_count.1, workgroup_count.2);
+            self.device.cmd_dispatch(
+                cmd_buf,
+                workgroup_count.0,
+                workgroup_count.1,
+                workgroup_count.2,
+            );
 
             // Memory barrier to ensure compute writes are visible
             let barrier = vk::MemoryBarrier::default()
@@ -573,23 +676,24 @@ impl VulkanContext {
                 &[],
             );
 
-            self.device
-                .end_command_buffer(cmd_buf)
-                .map_err(|e| BackendError::OperationFailed(format!("End command buffer failed: {}", e)))?;
+            self.device.end_command_buffer(cmd_buf).map_err(|e| {
+                BackendError::OperationFailed(format!("End command buffer failed: {}", e))
+            })?;
 
             // Submit and wait
             let cmd_bufs = [cmd_buf];
             let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
 
             let fence_info = vk::FenceCreateInfo::default();
-            let fence = self
-                .device
-                .create_fence(&fence_info, None)
-                .map_err(|e| BackendError::OperationFailed(format!("Fence creation failed: {}", e)))?;
+            let fence = self.device.create_fence(&fence_info, None).map_err(|e| {
+                BackendError::OperationFailed(format!("Fence creation failed: {}", e))
+            })?;
 
             self.device
                 .queue_submit(self.compute_queue, &[submit_info], fence)
-                .map_err(|e| BackendError::OperationFailed(format!("Queue submit failed: {}", e)))?;
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("Queue submit failed: {}", e))
+                })?;
 
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
@@ -630,8 +734,7 @@ impl Drop for VulkanContext {
 
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device
-                .destroy_command_pool(self.command_pool, None);
+            self.device.destroy_command_pool(self.command_pool, None);
 
             // Drop the allocator BEFORE destroying the device.
             // gpu-allocator needs the device to still be alive to free its memory.

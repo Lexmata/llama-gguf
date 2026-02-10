@@ -6,8 +6,8 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use super::constants::{
-    GgmlType, GgufMetadataValueType, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GGUF_VERSION_V1,
-    GGUF_VERSION_V2, GGUF_VERSION_V3,
+    GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GGUF_VERSION_V1, GGUF_VERSION_V2, GGUF_VERSION_V3,
+    GgmlType, GgufMetadataValueType,
 };
 use super::error::GgufError;
 use super::types::{GgufData, GgufHeader, MetadataArray, MetadataValue, TensorInfo};

@@ -19,15 +19,15 @@
 //! let kb = KnowledgeBase::create(KnowledgeBaseConfig {
 //!     name: "my-kb".into(),
 //!     description: Some("My knowledge base".into()),
-//!     chunking: ChunkingStrategy::FixedSize { 
-//!         max_tokens: 300, 
-//!         overlap_percentage: 20 
+//!     chunking: ChunkingStrategy::FixedSize {
+//!         max_tokens: 300,
+//!         overlap_percentage: 20
 //!     },
 //!     ..Default::default()
 //! }).await?;
 //!
 //! // Ingest data
-//! kb.ingest(DataSource::Directory { 
+//! kb.ingest(DataSource::Directory {
 //!     path: "./docs".into(),
 //!     pattern: Some("**/*.md".into()),
 //! }).await?;
@@ -49,8 +49,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::{
-    Document, MetadataFilter, NewDocument, RagConfig, RagError, RagResult, RagStore,
-    TextChunker,
+    Document, MetadataFilter, NewDocument, RagConfig, RagError, RagResult, RagStore, TextChunker,
 };
 
 // =============================================================================
@@ -229,9 +228,7 @@ pub enum RerankingMethod {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataSource {
     /// Single file
-    File {
-        path: PathBuf,
-    },
+    File { path: PathBuf },
 
     /// Directory of files
     Directory {
@@ -445,10 +442,9 @@ impl KnowledgeBase {
                     .await?;
             }
             DataSource::Url { url, depth: _ } => {
-                result.failures.insert(
-                    url,
-                    "URL ingestion not yet implemented".into(),
-                );
+                result
+                    .failures
+                    .insert(url, "URL ingestion not yet implemented".into());
             }
             DataSource::ObjectStorage {
                 bucket,
@@ -561,7 +557,7 @@ impl KnowledgeBase {
     /// Get statistics about the knowledge base
     pub async fn stats(&self) -> RagResult<KnowledgeBaseStats> {
         let document_count = self.store.count().await? as usize;
-        
+
         Ok(KnowledgeBaseStats {
             name: self.config.name.clone(),
             document_count,

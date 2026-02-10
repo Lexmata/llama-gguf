@@ -7,7 +7,6 @@
 //! - Clustering and classification
 //! - Vector databases
 
-
 use crate::model::{InferenceContext, Model, ModelConfig};
 use crate::tokenizer::Tokenizer;
 
@@ -182,12 +181,11 @@ impl EmbeddingExtractor {
         let dim = embeddings[0].len();
 
         match self.config.pooling {
-            PoolingStrategy::Last => {
-                embeddings.last().cloned().unwrap_or_else(|| vec![0.0; dim])
-            }
-            PoolingStrategy::First => {
-                embeddings.first().cloned().unwrap_or_else(|| vec![0.0; dim])
-            }
+            PoolingStrategy::Last => embeddings.last().cloned().unwrap_or_else(|| vec![0.0; dim]),
+            PoolingStrategy::First => embeddings
+                .first()
+                .cloned()
+                .unwrap_or_else(|| vec![0.0; dim]),
             PoolingStrategy::Mean => {
                 let mut mean = vec![0.0f32; dim];
                 for emb in embeddings {
@@ -303,11 +301,7 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Find k nearest neighbors from a set of embeddings
-pub fn find_nearest(
-    query: &[f32],
-    embeddings: &[Vec<f32>],
-    k: usize,
-) -> Vec<(usize, f32)> {
+pub fn find_nearest(query: &[f32], embeddings: &[Vec<f32>], k: usize) -> Vec<(usize, f32)> {
     let mut scores: Vec<(usize, f32)> = embeddings
         .iter()
         .enumerate()
@@ -353,9 +347,9 @@ mod tests {
     fn test_find_nearest() {
         let query = vec![1.0, 0.0];
         let embeddings = vec![
-            vec![1.0, 0.0],   // Most similar
-            vec![0.0, 1.0],   // Orthogonal
-            vec![0.7, 0.7],   // Somewhat similar
+            vec![1.0, 0.0], // Most similar
+            vec![0.0, 1.0], // Orthogonal
+            vec![0.7, 0.7], // Somewhat similar
         ];
 
         let nearest = find_nearest(&query, &embeddings, 2);
@@ -387,10 +381,7 @@ mod tests {
             hidden_dim: 2,
         };
 
-        let embeddings = vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-        ];
+        let embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
 
         let pooled = extractor.pool_embeddings(&embeddings, 2);
         assert!((pooled[0] - 0.5).abs() < 0.001);

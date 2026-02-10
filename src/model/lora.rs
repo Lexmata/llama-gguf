@@ -128,7 +128,11 @@ impl LoraAdapter {
     ///
     /// For efficiency, we compute: x @ A^T @ B^T * scaling
     /// which is equivalent to: (x @ A^T) @ B^T * scaling
-    pub fn apply(&self, x: &Tensor, _backend: &dyn Backend) -> Result<Tensor, crate::backend::BackendError> {
+    pub fn apply(
+        &self,
+        x: &Tensor,
+        _backend: &dyn Backend,
+    ) -> Result<Tensor, crate::backend::BackendError> {
         // x: [batch, in_features] or [in_features]
         // A: [rank, in_features] -> A^T: [in_features, rank]
         // B: [out_features, rank] -> B^T: [rank, out_features]
@@ -145,12 +149,12 @@ impl LoraAdapter {
         if x_shape.len() == 1 {
             // x @ A^T: [in_features] @ [in_features, rank] -> [rank]
             let mut intermediate = Tensor::zeros(vec![self.rank], DType::F32);
-            
+
             // Manual matvec with transposed A
             let x_data = x.as_f32()?;
             let a_data = self.lora_a.as_f32()?;
             let inter_data = intermediate.as_f32_mut()?;
-            
+
             for r in 0..self.rank {
                 let mut sum = 0.0f32;
                 for i in 0..in_features {
@@ -243,7 +247,10 @@ impl LoraAdapters {
     /// Expects tensors with naming convention:
     /// - `{layer_name}.lora_a` - A matrix [rank, in_features]
     /// - `{layer_name}.lora_b` - B matrix [out_features, rank]
-    pub fn load_from_gguf(path: impl AsRef<Path>, config: LoraConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load_from_gguf(
+        path: impl AsRef<Path>,
+        config: LoraConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let file = GgufFile::open(path.as_ref())?;
         let mut adapters = HashMap::new();
 
@@ -266,20 +273,21 @@ impl LoraAdapters {
                         // Convert to F32 tensors
                         // For now, assume F32 format. A full implementation would handle
                         // different dtypes based on tensor_info.dtype
-                        let a_shape: Vec<usize> = tensor_info.dims.iter().map(|&d| d as usize).collect();
+                        let a_shape: Vec<usize> =
+                            tensor_info.dims.iter().map(|&d| d as usize).collect();
                         let b_shape: Vec<usize> = b_info.dims.iter().map(|&d| d as usize).collect();
 
                         if let (Ok(a_floats), Ok(b_floats)) = (
                             bytemuck::try_cast_slice::<u8, f32>(a_data),
                             bytemuck::try_cast_slice::<u8, f32>(b_data),
-                        )
-                            && let (Ok(a_tensor), Ok(b_tensor)) = (
-                                Tensor::from_f32(a_floats, a_shape),
-                                Tensor::from_f32(b_floats, b_shape),
-                            ) {
-                                let adapter = LoraAdapter::from_tensors(a_tensor, b_tensor, config.scaling());
-                                adapters.insert(base_name.to_string(), adapter);
-                            }
+                        ) && let (Ok(a_tensor), Ok(b_tensor)) = (
+                            Tensor::from_f32(a_floats, a_shape),
+                            Tensor::from_f32(b_floats, b_shape),
+                        ) {
+                            let adapter =
+                                LoraAdapter::from_tensors(a_tensor, b_tensor, config.scaling());
+                            adapters.insert(base_name.to_string(), adapter);
+                        }
                     }
                 }
             }
