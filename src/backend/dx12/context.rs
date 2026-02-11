@@ -444,6 +444,52 @@ impl Dx12Context {
         }
     }
 
+    /// Create a read-write GPU buffer (upload + default UAV + readback).
+    /// Used for in-place operations like RoPE that modify input data and need to read it back.
+    pub fn create_readwrite_buffer(&self, data: &[f32]) -> Result<GpuBuffer, BackendError> {
+        let size = (data.len() * std::mem::size_of::<f32>()) as u64;
+        let byte_data = bytemuck::cast_slice(data);
+
+        unsafe {
+            let upload_resource = self.create_committed_resource(
+                D3D12_HEAP_TYPE_UPLOAD,
+                size,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?;
+
+            let mut mapped_ptr = std::ptr::null_mut();
+            upload_resource
+                .Map(0, None, Some(&mut mapped_ptr))
+                .map_err(|e| BackendError::AllocationFailed(format!("Map upload failed: {}", e)))?;
+            std::ptr::copy_nonoverlapping(
+                byte_data.as_ptr(),
+                mapped_ptr as *mut u8,
+                byte_data.len(),
+            );
+            upload_resource.Unmap(0, None);
+
+            let default_resource = self.create_committed_resource(
+                D3D12_HEAP_TYPE_DEFAULT,
+                size,
+                D3D12_RESOURCE_STATE_COMMON,
+            )?;
+
+            let readback_resource = self.create_committed_resource(
+                D3D12_HEAP_TYPE_READBACK,
+                size,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+
+            Ok(GpuBuffer {
+                default_resource,
+                upload_resource: Some(upload_resource),
+                readback_resource: Some(readback_resource),
+                size,
+                num_elements: data.len(),
+            })
+        }
+    }
+
     /// Create an output GPU buffer (default heap + readback heap).
     pub fn create_output_buffer(&self, num_floats: usize) -> Result<GpuBuffer, BackendError> {
         let size = (num_floats * std::mem::size_of::<f32>()) as u64;

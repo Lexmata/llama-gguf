@@ -272,9 +272,9 @@ pub fn rope(
     let q_data = q.as_f32_mut()?;
     let k_data = k.as_f32_mut()?;
 
-    // Upload q and k as read-write buffers (RoPE modifies in place)
-    let q_buf = ctx.create_buffer_with_data(q_data)?;
-    let k_buf = ctx.create_buffer_with_data(k_data)?;
+    // Upload q and k as read-write buffers (RoPE modifies in place, needs readback)
+    let q_buf = ctx.create_readwrite_buffer(q_data)?;
+    let k_buf = ctx.create_readwrite_buffer(k_data)?;
 
     // Root constants: [num_q_heads, num_k_heads, head_dim, position, freq_base, freq_scale, use_neox]
     let constants = [
