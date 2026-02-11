@@ -19,6 +19,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
 
@@ -49,6 +51,18 @@ jobs:
         with:
           key: ${{ matrix.runner }}-${{ matrix.features }}
 
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
       - name: Verify Metal toolchain
         if: contains(matrix.features, 'metal')
         run: xcrun --sdk macosx metal --version
@@ -74,12 +88,12 @@ jobs:
         with:
           key: ubuntu-vulkan
 
-      - name: Install Vulkan SDK
+      - name: Install Vulkan SDK and protoc
         run: |
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y vulkan-sdk
+          sudo apt-get install -y vulkan-sdk protobuf-compiler
 
       - name: Verify glslc
         run: glslc --version
@@ -100,6 +114,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-dx12
+
+      - name: Install protoc
+        run: choco install protoc -y
 
       - name: Verify dxc
         run: dxc --version
