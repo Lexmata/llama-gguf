@@ -791,13 +791,18 @@ impl Dx12Context {
 impl Drop for Dx12Context {
     fn drop(&mut self) {
         unsafe {
-            // Wait for GPU idle
-            let fence_val = *self.fence_value.lock().unwrap() + 1;
-            let _ = self.command_queue.Signal(&self.fence, fence_val);
-            let _ = self.fence.SetEventOnCompletion(fence_val, self.fence_event);
-            WaitForSingleObject(self.fence_event, INFINITE);
+            // Wait for GPU idle. Use catch_unwind to prevent access violations
+            // during process exit when COM objects may already be partially released.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let fence_val = *self.fence_value.lock().unwrap() + 1;
+                let _ = self.command_queue.Signal(&self.fence, fence_val);
+                let _ = self.fence.SetEventOnCompletion(fence_val, self.fence_event);
+                WaitForSingleObject(self.fence_event, INFINITE);
+            }));
 
-            CloseHandle(self.fence_event).ok();
+            if !self.fence_event.is_invalid() {
+                let _ = CloseHandle(self.fence_event);
+            }
         }
     }
 }

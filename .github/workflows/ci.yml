@@ -126,7 +126,7 @@ jobs:
         run: cargo build --features dx12
 
       - name: Test
-        run: cargo test --features dx12
+        run: cargo test --features dx12 -- --test-threads=1
 
       - name: DX12 integration tests
-        run: cargo test --features dx12 --test dx12_integration
+        run: cargo test --features dx12 --test dx12_integration -- --test-threads=1
