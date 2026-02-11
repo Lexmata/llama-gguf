@@ -106,11 +106,9 @@ impl Dx12Context {
             let adapter: IDXGIAdapter1 = adapter.cast().map_err(|e| {
                 BackendError::InitializationFailed(format!("Adapter cast failed: {}", e))
             })?;
-            let mut desc = DXGI_ADAPTER_DESC1::default();
-            adapter.GetDesc1(&mut desc).map_err(|e| {
+            adapter.GetDesc1().map_err(|e| {
                 BackendError::InitializationFailed(format!("GetDesc1 failed: {}", e))
-            })?;
-            desc
+            })?
         };
 
         let device_name = String::from_utf16_lossy(
@@ -149,8 +147,13 @@ impl Dx12Context {
         loop {
             match factory.EnumAdapters1(idx) {
                 Ok(adapter) => {
-                    let mut desc = DXGI_ADAPTER_DESC1::default();
-                    adapter.GetDesc1(&mut desc).ok();
+                    let desc = match adapter.GetDesc1() {
+                        Ok(d) => d,
+                        Err(_) => {
+                            idx += 1;
+                            continue;
+                        }
+                    };
 
                     // Skip software/WARP adapters
                     if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {

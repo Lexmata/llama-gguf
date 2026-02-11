@@ -132,8 +132,7 @@ impl Dx12Backend {
             loop {
                 match factory.EnumAdapters1(idx) {
                     Ok(adapter) => {
-                        let mut desc = DXGI_ADAPTER_DESC1::default();
-                        if adapter.GetDesc1(&mut desc).is_ok() {
+                        if let Ok(desc) = adapter.GetDesc1() {
                             let name = String::from_utf16_lossy(
                                 &desc.Description[..desc
                                     .Description
@@ -185,8 +184,7 @@ impl Dx12Backend {
 
             if prefer_warp {
                 let adapter: IDXGIAdapter1 = factory.EnumWarpAdapter().ok()?;
-                let mut desc = DXGI_ADAPTER_DESC1::default();
-                adapter.GetDesc1(&mut desc).ok()?;
+                let desc = adapter.GetDesc1().ok()?;
                 let name = String::from_utf16_lossy(
                     &desc.Description[..desc
                         .Description
@@ -202,8 +200,7 @@ impl Dx12Backend {
             loop {
                 match factory.EnumAdapters1(idx) {
                     Ok(adapter) => {
-                        let mut desc = DXGI_ADAPTER_DESC1::default();
-                        adapter.GetDesc1(&mut desc).ok()?;
+                        let desc = adapter.GetDesc1().ok()?;
                         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
                             if hw_index == device_index {
                                 let name = String::from_utf16_lossy(

@@ -35,21 +35,21 @@ jobs:
           - name: Linux
             runner: ubuntu-latest
             features: default
+            cache_key: ubuntu-default
           - name: macOS ARM
             runner: macos-latest
             features: default,metal
-          - name: macOS Intel
-            runner: macos-13
-            features: default,metal
+            cache_key: macos-arm-metal
           - name: Windows
             runner: windows-latest
             features: default
+            cache_key: windows-default
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.runner }}-${{ matrix.features }}
+          key: ${{ matrix.cache_key }}
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -91,7 +91,7 @@ jobs:
       - name: Install Vulkan SDK and protoc
         run: |
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
           sudo apt-get update
           sudo apt-get install -y vulkan-sdk protobuf-compiler
 
