@@ -15,6 +15,7 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         float val = x[idx];
         float c = 0.7978845608; // sqrt(2/pi)
         float inner = c * (val + 0.044715 * val * val * val);
+        inner = clamp(inner, -10.0, 10.0);
         result[idx] = 0.5 * val * (1.0 + tanh(inner));
     }
 }
