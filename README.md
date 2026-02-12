@@ -1,5 +1,7 @@
 # llama-gguf
 
+[![CI](https://github.com/Lexmata/llama-gguf/actions/workflows/ci.yml/badge.svg)](https://github.com/Lexmata/llama-gguf/actions/workflows/ci.yml)
+
 A high-performance Rust implementation of [llama.cpp](https://github.com/ggerganov/llama.cpp) - an LLM inference engine with full GGUF and ONNX support.
 
 ## Features
@@ -10,7 +12,7 @@ A high-performance Rust implementation of [llama.cpp](https://github.com/ggergan
 - **Quantization** - All K-quant formats (Q2_K through Q8_0) plus F16/F32
 - **HuggingFace Integration** - Download models directly from HuggingFace Hub
 - **Fast CPU Inference** - SIMD-optimized (AVX2, AVX-512, NEON)
-- **CUDA GPU Acceleration** - NVIDIA GPU support with custom CUDA kernels
+- **Multi-GPU Backend Support** - CUDA, Metal, Vulkan, and DirectX 12
 - **Grouped Query Attention** - Efficient KV cache for GQA models
 - **Streaming Output** - Token-by-token generation
 
@@ -208,7 +210,7 @@ Run Options:
       --top-p <P>            Top-p (nucleus) sampling [default: 0.9]
       --repeat-penalty <R>   Repetition penalty [default: 1.1]
   -s, --seed <SEED>          Random seed for reproducibility
-      --gpu                  Use GPU acceleration (requires CUDA build)
+      --gpu                  Use GPU acceleration (CUDA, Metal, DX12, or Vulkan)
 ```
 
 ## ONNX Support
@@ -251,8 +253,14 @@ cargo build --release --no-default-features --features cpu,huggingface,cli,clien
 # With CUDA GPU support (requires CUDA toolkit)
 CUDA_PATH=/opt/cuda cargo build --release --features cuda
 
-# With Vulkan support (experimental)
+# With Metal support (macOS / Apple Silicon)
+cargo build --release --features metal
+
+# With Vulkan support (Linux/Windows, requires Vulkan SDK)
 cargo build --release --features vulkan
+
+# With DirectX 12 support (Windows)
+cargo build --release --features dx12
 
 # With HTTP server
 cargo build --release --features server
@@ -260,36 +268,39 @@ cargo build --release --features server
 
 ## GPU Acceleration
 
-### CUDA (NVIDIA GPUs)
-
-Enable GPU acceleration with the `--gpu` flag:
+Enable GPU acceleration with the `--gpu` flag. The engine automatically selects the best available backend in priority order: CUDA > Metal > DX12 > Vulkan > CPU.
 
 ```bash
-# Build with CUDA support
-CUDA_PATH=/opt/cuda cargo build --release --features cuda
-
-# Run with GPU acceleration
 llama-gguf run model.gguf -p "Hello" --gpu
 ```
 
-**Requirements:**
-- NVIDIA GPU with compute capability 6.0+
-- CUDA Toolkit 12.0+ installed
-- cudarc crate for CUDA bindings
+### Supported Backends
 
-**Currently GPU-accelerated operations:**
+| Backend | Platform | Requirements |
+|---------|----------|-------------|
+| **CUDA** | Linux, Windows | NVIDIA GPU (compute 6.0+), CUDA Toolkit 12.0+ |
+| **Metal** | macOS | Apple Silicon or discrete AMD GPU, Xcode Command Line Tools |
+| **DirectX 12** | Windows | Any DX12-capable GPU, Windows 10+, Windows SDK (dxc.exe) |
+| **Vulkan** | Linux, Windows | Vulkan 1.2+ capable GPU, Vulkan SDK (glslc) |
+
+### GPU-accelerated operations
+
 - Element-wise: add, mul, scale
 - Activations: SiLU, GELU
 - Normalization: RMS norm
 - Softmax
 - Vector-matrix multiplication (f32)
+- Rotary position embeddings (RoPE)
 
-**Still using CPU fallback:**
+### CPU fallback
+
+The following operations currently fall back to CPU across all GPU backends:
+
 - Quantized matrix operations (vec_mat_q)
 - Attention computation
-- RoPE positional embeddings
+- Dequantization
 
-*Note: Performance gains are currently limited as quantized operations remain on CPU. Full GPU acceleration of quantized inference is planned.*
+*Full GPU acceleration of quantized inference is planned.*
 
 ## Performance
 
