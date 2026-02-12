@@ -3,12 +3,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
 use axum::Router;
+use axum::routing::{delete, get, post};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::engine::ChatTemplate;
+use crate::engine::{ChatTemplate, Engine, EngineConfig};
 use crate::gguf::GgufFile;
 use crate::model::ModelLoader;
 use crate::tokenizer::Tokenizer;
@@ -52,6 +52,17 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     let model = loader.build_model()?;
     eprintln!("Model loaded successfully");
 
+    // Select backend (GPU if LLAMA_GPU=1, otherwise CPU)
+    let use_gpu = std::env::var("LLAMA_GPU")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let backend: Arc<dyn crate::Backend> = if use_gpu {
+        Engine::select_gpu_backend(&model)
+    } else {
+        Arc::new(crate::backend::cpu::CpuBackend::new())
+    };
+
     // Extract model name from path
     let model_name = std::path::Path::new(&config.model_path)
         .file_stem()
@@ -66,6 +77,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
         config: model_config,
         model_name,
         chat_template,
+        backend,
         inference_lock: Mutex::new(()),
     });
 
@@ -94,8 +106,8 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
 
     #[cfg(feature = "rag")]
     if let Some(ref db_url) = config.rag_database_url {
-        use crate::rag::RagConfig;
         use super::handlers::RagState;
+        use crate::rag::RagConfig;
 
         eprintln!("RAG enabled with database connection");
 
@@ -107,7 +119,10 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
             // Bedrock-style Knowledge Base APIs
             .route("/knowledgebases", post(handlers::list_knowledge_bases))
             .route("/knowledgebases/:kb_id", get(handlers::get_knowledge_base))
-            .route("/knowledgebases/:kb_id", delete(handlers::delete_knowledge_base))
+            .route(
+                "/knowledgebases/:kb_id",
+                delete(handlers::delete_knowledge_base),
+            )
             // Retrieval APIs
             .route("/retrieve", post(handlers::retrieve))
             .route("/ingest", post(handlers::ingest))
@@ -115,7 +130,10 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
 
         // RAG + Model routes (need both states)
         let rag_gen_routes = Router::new()
-            .route("/retrieveAndGenerate", post(handlers::retrieve_and_generate))
+            .route(
+                "/retrieveAndGenerate",
+                post(handlers::retrieve_and_generate),
+            )
             .with_state((app_state.clone(), rag_state));
 
         app = app

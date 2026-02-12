@@ -1,0 +1,229 @@
+.\" Man page for llama-gguf-rag
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-RAG 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-rag \- retrieval-augmented generation operations
+.SH SYNOPSIS
+.B llama-gguf rag
+\fIACTION\fR
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Manage RAG (Retrieval-Augmented Generation) operations using a PostgreSQL
+database with pgvector for vector storage and similarity search.
+.PP
+Requires the \fBrag\fR feature to be compiled in.
+.SH BASIC ACTIONS
+.TP
+.BR init
+Initialize the RAG database table.
+.RS
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Path to TOML configuration file.
+.TP
+.BR \-\-database-url " " \fIURL\fR
+PostgreSQL connection string (overrides config file).
+.TP
+.BR \-\-table " " \fINAME\fR
+Embeddings table name.
+.TP
+.BR \-\-dim " " \fIN\fR
+Embedding dimension.
+.RE
+.TP
+.BR index " " \fIPATH\fR
+Index documents into the vector store.
+.RS
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Path to TOML configuration file.
+.TP
+.BR \-\-database-url " " \fIURL\fR
+PostgreSQL connection string.
+.TP
+.BR \-\-table " " \fINAME\fR
+Embeddings table name.
+.TP
+.BR \-\-chunk-size " " \fIN\fR
+Chunk size in characters. Default: 500.
+.TP
+.BR \-\-chunk-overlap " " \fIN\fR
+Chunk overlap in characters. Default: 50.
+.RE
+.TP
+.BR search " " \fIQUERY\fR
+Search the vector store for relevant documents.
+.RS
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Path to TOML configuration file.
+.TP
+.BR \-l ", " \-\-limit " " \fIN\fR
+Number of results to return.
+.TP
+.BR \-f ", " \-\-filter " " \fIFILTER\fR
+Metadata filter (can be specified multiple times).
+.RE
+.TP
+.BR list-values " " \fIFIELD\fR
+List unique values for a metadata field.
+.TP
+.BR delete
+Delete documents matching a filter.
+.RS
+.TP
+.BR \-f ", " \-\-filter " " \fIFILTER\fR
+Metadata filter (required).
+.TP
+.BR \-\-force
+Skip confirmation prompt.
+.RE
+.TP
+.BR stats
+Show database statistics.
+.TP
+.BR gen-config
+Generate an example configuration file.
+.SH KNOWLEDGE BASE ACTIONS
+These actions provide a higher-level interface similar to AWS Bedrock:
+.TP
+.BR kb-create " " \fINAME\fR
+Create a new knowledge base.
+.RS
+.TP
+.BR \-d ", " \-\-description " " \fITEXT\fR
+Knowledge base description.
+.TP
+.BR \-\-chunking " " \fISTRATEGY\fR
+Chunking strategy: none, fixed, semantic, hierarchical. Default: fixed.
+.TP
+.BR \-\-max-tokens " " \fIN\fR
+Maximum tokens per chunk. Default: 300.
+.TP
+.BR \-\-overlap " " \fIN\fR
+Overlap percentage. Default: 20.
+.RE
+.TP
+.BR kb-ingest " " \fIPATH\fR
+Ingest data into a knowledge base.
+.RS
+.TP
+.BR \-n ", " \-\-name " " \fINAME\fR
+Knowledge base name (required).
+.TP
+.BR \-\-pattern " " \fIPATTERN\fR
+File pattern for directories (e.g., "*.md").
+.TP
+.BR \-\-recursive
+Recursive directory search. Default: true.
+.RE
+.TP
+.BR kb-retrieve " " \fIQUERY\fR
+Query a knowledge base (retrieve only).
+.RS
+.TP
+.BR \-n ", " \-\-name " " \fINAME\fR
+Knowledge base name (required).
+.TP
+.BR \-l ", " \-\-limit " " \fIN\fR
+Maximum results. Default: 5.
+.TP
+.BR \-\-min-score " " \fISCORE\fR
+Minimum similarity score. Default: 0.5.
+.RE
+.TP
+.BR kb-rag " " \fIQUERY\fR
+Retrieve and generate (full RAG pipeline).
+.RS
+.TP
+.BR \-n ", " \-\-name " " \fINAME\fR
+Knowledge base name (required).
+.TP
+.BR \-\-prompt-template " " \fITEMPLATE\fR
+Custom prompt template using {context} and {query} placeholders.
+.TP
+.BR \-\-citations
+Show citations. Default: true.
+.RE
+.TP
+.BR kb-stats
+Show knowledge base statistics.
+.TP
+.BR kb-delete
+Delete a knowledge base.
+.SH FILTER SYNTAX
+Metadata filters support the following operators:
+.TP
+.B field=value
+Exact match.
+.TP
+.B field!=value
+Not equal.
+.TP
+.B field>value, field>=value, field<value, field<=value
+Numeric comparisons.
+.TP
+.B field~value
+Contains (substring match).
+.TP
+.B field^value
+Starts with.
+.TP
+.B field$value
+Ends with.
+.TP
+.B field?
+Field exists.
+.TP
+.B !field?
+Field does not exist.
+.SH EXAMPLES
+Initialize RAG database:
+.PP
+.RS
+.B llama-gguf rag init --database-url postgres://user:pass@localhost/ragdb
+.RE
+.PP
+Index documents:
+.PP
+.RS
+.B llama-gguf rag index ./documents --chunk-size 1000
+.RE
+.PP
+Search with filter:
+.PP
+.RS
+.B llama-gguf rag search "legal precedent" -f "source=contracts" -l 10
+.RE
+.PP
+Create knowledge base:
+.PP
+.RS
+.B llama-gguf rag kb-create legal-docs -d "Legal documents" --chunking semantic
+.RE
+.PP
+Ingest into knowledge base:
+.PP
+.RS
+.B llama-gguf rag kb-ingest ./contracts -n legal-docs --pattern "*.pdf"
+.RE
+.PP
+Query knowledge base:
+.PP
+.RS
+.B llama-gguf rag kb-retrieve "breach of contract" -n legal-docs
+.RE
+.SH ENVIRONMENT
+.TP
+.B RAG_DATABASE_URL
+PostgreSQL connection string.
+.SH FILES
+.TP
+.I rag.toml
+Default RAG configuration file.
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-serve (1),
+.BR llama-gguf-embed (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

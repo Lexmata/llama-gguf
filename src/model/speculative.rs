@@ -7,7 +7,6 @@
 //! Reference: "Fast Inference from Transformers via Speculative Decoding"
 //! https://arxiv.org/abs/2211.17192
 
-
 use crate::model::{InferenceContext, Model};
 use crate::sampling::Sampler;
 use crate::tensor::Tensor;
@@ -109,6 +108,7 @@ impl SpeculativeDecoder {
     ///
     /// # Returns
     /// Vector of generated token IDs
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &mut self,
         draft_model: &dyn Model,
@@ -134,9 +134,10 @@ impl SpeculativeDecoder {
                     break;
                 }
 
-                let last_token = draft_tokens.last().copied().unwrap_or_else(|| {
-                    *output_tokens.last().unwrap_or(&0)
-                });
+                let last_token = draft_tokens
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| *output_tokens.last().unwrap_or(&0));
 
                 // Get draft model logits
                 let logits = draft_model.forward(&[last_token], draft_ctx)?;

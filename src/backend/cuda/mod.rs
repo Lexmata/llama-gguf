@@ -14,21 +14,21 @@
 //! - Build with `--features cuda`
 
 #[cfg(feature = "cuda")]
-mod kernels;
-#[cfg(feature = "cuda")]
-mod memory;
-#[cfg(feature = "cuda")]
-pub mod gpu_model;
-#[cfg(feature = "cuda")]
-pub mod gpu_ops;
-#[cfg(feature = "cuda")]
-pub mod gpu_inference;
-#[cfg(feature = "cuda")]
 pub mod dequant_weights;
 #[cfg(feature = "cuda")]
 pub mod fast_inference;
 #[cfg(feature = "cuda")]
+pub mod gpu_inference;
+#[cfg(feature = "cuda")]
+pub mod gpu_model;
+#[cfg(feature = "cuda")]
 pub mod gpu_only;
+#[cfg(feature = "cuda")]
+pub mod gpu_ops;
+#[cfg(feature = "cuda")]
+mod kernels;
+#[cfg(feature = "cuda")]
+mod memory;
 
 use crate::backend::{Backend, BackendError, BackendResult};
 use crate::tensor::{DType, Tensor};
@@ -92,9 +92,9 @@ impl CudaBackend {
     pub fn with_config(config: CudaConfig) -> Result<Self, BackendError> {
         let device = CudaDevice::new(config.device_index)
             .map_err(|e| BackendError::InitializationFailed(format!("CUDA init failed: {}", e)))?;
-        
+
         let kernels = CudaKernels::new(device.clone())?;
-        
+
         Ok(Self {
             device,
             kernels,
@@ -123,7 +123,7 @@ impl CudaBackend {
     pub fn device_name(&self) -> String {
         "CUDA disabled".to_string()
     }
-    
+
     /// Load dequantized model weights onto GPU for accelerated inference
     #[cfg(feature = "cuda")]
     pub fn load_model_weights(
@@ -140,25 +140,29 @@ impl CudaBackend {
         self.gpu_weights = Some(store);
         Ok(())
     }
-    
+
     /// Check if GPU weights are loaded
     #[cfg(feature = "cuda")]
     pub fn has_gpu_weights(&self) -> bool {
         self.gpu_weights.is_some()
     }
-    
+
     /// Get VRAM usage of loaded weights
     #[cfg(feature = "cuda")]
     pub fn gpu_weight_vram(&self) -> usize {
-        self.gpu_weights.as_ref().map(|w| w.vram_usage()).unwrap_or(0)
+        self.gpu_weights
+            .as_ref()
+            .map(|w| w.vram_usage())
+            .unwrap_or(0)
     }
-    
+
     /// Get GPU hit/miss statistics
     #[cfg(feature = "cuda")]
     pub fn stats(&self) -> (usize, usize) {
         (
             self.gpu_hits.load(std::sync::atomic::Ordering::Relaxed),
-            self.cpu_fallbacks.load(std::sync::atomic::Ordering::Relaxed),
+            self.cpu_fallbacks
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -177,7 +181,7 @@ impl CudaBackend {
             .dtoh_sync_copy(slice)
             .map_err(|e| BackendError::OperationFailed(format!("GPU read failed: {}", e)))
     }
-    
+
     /// Allocate GPU buffer
     #[cfg(feature = "cuda")]
     fn alloc_gpu(&self, size: usize) -> Result<CudaSlice<f32>, BackendError> {
@@ -254,13 +258,17 @@ impl Backend for CudaBackend {
         // Launch kernel
         let config = launch_config_1d(n, 256);
         unsafe {
-            self.kernels.add_f32.clone().launch(config, (&a_gpu, &b_gpu, &mut out_gpu, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("add kernel failed: {}", e)))?;
+            self.kernels
+                .add_f32
+                .clone()
+                .launch(config, (&a_gpu, &b_gpu, &mut out_gpu, n as i32))
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("add kernel failed: {}", e)))?;
 
         // Copy back
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
-        
+
         Ok(())
     }
 
@@ -276,12 +284,16 @@ impl Backend for CudaBackend {
 
         let config = launch_config_1d(n, 256);
         unsafe {
-            self.kernels.mul_f32.clone().launch(config, (&a_gpu, &b_gpu, &mut out_gpu, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("mul kernel failed: {}", e)))?;
+            self.kernels
+                .mul_f32
+                .clone()
+                .launch(config, (&a_gpu, &b_gpu, &mut out_gpu, n as i32))
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("mul kernel failed: {}", e)))?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
-        
+
         Ok(())
     }
 
@@ -295,12 +307,16 @@ impl Backend for CudaBackend {
 
         let config = launch_config_1d(n, 256);
         unsafe {
-            self.kernels.scale_f32.clone().launch(config, (&a_gpu, scalar, &mut out_gpu, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("scale kernel failed: {}", e)))?;
+            self.kernels
+                .scale_f32
+                .clone()
+                .launch(config, (&a_gpu, scalar, &mut out_gpu, n as i32))
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("scale kernel failed: {}", e)))?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
-        
+
         Ok(())
     }
 
@@ -314,12 +330,16 @@ impl Backend for CudaBackend {
 
         let config = launch_config_1d(n, 256);
         unsafe {
-            self.kernels.silu_f32.clone().launch(config, (&x_gpu, &mut out_gpu, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("silu kernel failed: {}", e)))?;
+            self.kernels
+                .silu_f32
+                .clone()
+                .launch(config, (&x_gpu, &mut out_gpu, n as i32))
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("silu kernel failed: {}", e)))?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
-        
+
         Ok(())
     }
 
@@ -333,12 +353,16 @@ impl Backend for CudaBackend {
 
         let config = launch_config_1d(n, 256);
         unsafe {
-            self.kernels.gelu_f32.clone().launch(config, (&x_gpu, &mut out_gpu, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("gelu kernel failed: {}", e)))?;
+            self.kernels
+                .gelu_f32
+                .clone()
+                .launch(config, (&x_gpu, &mut out_gpu, n as i32))
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("gelu kernel failed: {}", e)))?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
-        
+
         Ok(())
     }
 
@@ -349,13 +373,18 @@ impl Backend for CudaBackend {
 
         let x_gpu = self.to_device(x_data)?;
         let mut out_gpu = self.alloc_gpu(n)?;
-        let mut max_gpu = self.device.alloc_zeros::<f32>(1)
+        let mut max_gpu = self
+            .device
+            .alloc_zeros::<f32>(1)
             .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
-        let mut sum_gpu = self.device.alloc_zeros::<f32>(1)
+        let mut sum_gpu = self
+            .device
+            .alloc_zeros::<f32>(1)
             .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
 
         // Initialize max to negative infinity
-        self.device.htod_sync_copy_into(&[f32::NEG_INFINITY], &mut max_gpu)
+        self.device
+            .htod_sync_copy_into(&[f32::NEG_INFINITY], &mut max_gpu)
             .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
 
         let block_size = 256;
@@ -363,16 +392,26 @@ impl Backend for CudaBackend {
 
         // Pass 1: Find max
         unsafe {
-            self.kernels.softmax_max.clone().launch(config.clone(), (&x_gpu, &mut max_gpu, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("softmax_max kernel failed: {}", e)))?;
+            self.kernels
+                .softmax_max
+                .clone()
+                .launch(config.clone(), (&x_gpu, &mut max_gpu, n as i32))
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("softmax_max kernel failed: {}", e)))?;
 
         // Read max value
         let max_val = self.from_device(&max_gpu)?[0];
 
         // Pass 2: Compute exp and sum
         unsafe {
-            self.kernels.softmax_exp_sum.clone().launch(config.clone(), (&x_gpu, &mut out_gpu, &mut sum_gpu, max_val, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("softmax_exp_sum kernel failed: {}", e)))?;
+            self.kernels.softmax_exp_sum.clone().launch(
+                config.clone(),
+                (&x_gpu, &mut out_gpu, &mut sum_gpu, max_val, n as i32),
+            )
+        }
+        .map_err(|e| {
+            BackendError::OperationFailed(format!("softmax_exp_sum kernel failed: {}", e))
+        })?;
 
         // Read sum
         let sum_val = self.from_device(&sum_gpu)?[0];
@@ -381,16 +420,26 @@ impl Backend for CudaBackend {
         // Pass 3: Normalize
         let config = launch_config_1d(n, 256);
         unsafe {
-            self.kernels.softmax_div.clone().launch(config, (&mut out_gpu, sum_inv, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("softmax_div kernel failed: {}", e)))?;
+            self.kernels
+                .softmax_div
+                .clone()
+                .launch(config, (&mut out_gpu, sum_inv, n as i32))
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("softmax_div kernel failed: {}", e)))?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
-        
+
         Ok(())
     }
 
-    fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32, out: &mut Tensor) -> BackendResult<()> {
+    fn rms_norm(
+        &self,
+        x: &Tensor,
+        weight: &Tensor,
+        eps: f32,
+        out: &mut Tensor,
+    ) -> BackendResult<()> {
         let x_data = x.as_f32()?;
         let w_data = weight.as_f32()?;
         let out_data = out.as_f32_mut()?;
@@ -399,7 +448,9 @@ impl Backend for CudaBackend {
         let x_gpu = self.to_device(x_data)?;
         let w_gpu = self.to_device(w_data)?;
         let mut out_gpu = self.alloc_gpu(n)?;
-        let mut sum_sq_gpu = self.device.alloc_zeros::<f32>(1)
+        let mut sum_sq_gpu = self
+            .device
+            .alloc_zeros::<f32>(1)
             .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
 
         let block_size = 256;
@@ -407,8 +458,14 @@ impl Backend for CudaBackend {
 
         // Pass 1: Compute sum of squares
         unsafe {
-            self.kernels.rms_norm_sum_sq.clone().launch(config, (&x_gpu, &mut sum_sq_gpu, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("rms_norm_sum_sq kernel failed: {}", e)))?;
+            self.kernels
+                .rms_norm_sum_sq
+                .clone()
+                .launch(config, (&x_gpu, &mut sum_sq_gpu, n as i32))
+        }
+        .map_err(|e| {
+            BackendError::OperationFailed(format!("rms_norm_sum_sq kernel failed: {}", e))
+        })?;
 
         // Read sum and compute RMS inverse
         let sum_sq = self.from_device(&sum_sq_gpu)?[0];
@@ -418,12 +475,18 @@ impl Backend for CudaBackend {
         // Pass 2: Normalize and scale
         let config = launch_config_1d(n, 256);
         unsafe {
-            self.kernels.rms_norm_scale.clone().launch(config, (&x_gpu, &w_gpu, &mut out_gpu, rms_inv, n as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("rms_norm_scale kernel failed: {}", e)))?;
+            self.kernels
+                .rms_norm_scale
+                .clone()
+                .launch(config, (&x_gpu, &w_gpu, &mut out_gpu, rms_inv, n as i32))
+        }
+        .map_err(|e| {
+            BackendError::OperationFailed(format!("rms_norm_scale kernel failed: {}", e))
+        })?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
-        
+
         Ok(())
     }
 
@@ -444,29 +507,38 @@ impl Backend for CudaBackend {
                     // GPU-accelerated path: weight is already on GPU
                     let a_data = a.as_f32()?;
                     let out_data = out.as_f32_mut()?;
-                    
+
                     let k = gpu_weight.shape[0];
                     let n_out = gpu_weight.shape[1];
-                    
+
                     let a_gpu = self.to_device(a_data)?;
                     let mut out_gpu = self.alloc_gpu(n_out)?;
-                    
+
                     let config = launch_config_1d(n_out, 256);
                     unsafe {
                         self.kernels.vec_mat_f32.clone().launch(
-                            config, 
-                            (&a_gpu, &gpu_weight.data, &mut out_gpu, k as i32, n_out as i32)
+                            config,
+                            (
+                                &a_gpu,
+                                &gpu_weight.data,
+                                &mut out_gpu,
+                                k as i32,
+                                n_out as i32,
+                            ),
                         )
-                    }.map_err(|e| BackendError::OperationFailed(format!("vec_mat kernel failed: {}", e)))?;
-                    
+                    }
+                    .map_err(|e| {
+                        BackendError::OperationFailed(format!("vec_mat kernel failed: {}", e))
+                    })?;
+
                     let result = self.from_device(&out_gpu)?;
                     out_data.copy_from_slice(&result);
-                    
+
                     return Ok(());
                 }
             }
         }
-        
+
         // Standard path: upload weight from CPU each time
         let a_data = a.as_f32()?;
         let b_data = b.as_f32()?;
@@ -482,8 +554,12 @@ impl Backend for CudaBackend {
         // Use our custom kernel for vec_mat
         let config = launch_config_1d(n_out, 256);
         unsafe {
-            self.kernels.vec_mat_f32.clone().launch(config, (&a_gpu, &b_gpu, &mut out_gpu, k as i32, n_out as i32))
-        }.map_err(|e| BackendError::OperationFailed(format!("vec_mat kernel failed: {}", e)))?;
+            self.kernels.vec_mat_f32.clone().launch(
+                config,
+                (&a_gpu, &b_gpu, &mut out_gpu, k as i32, n_out as i32),
+            )
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("vec_mat kernel failed: {}", e)))?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
@@ -504,48 +580,60 @@ impl Backend for CudaBackend {
         if let Some(ref gpu_weights) = self.gpu_weights {
             if let Some(weight_name) = b.name() {
                 if let Some(gpu_weight) = gpu_weights.get(weight_name) {
-                    self.gpu_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    
+                    self.gpu_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                     // GPU-accelerated path: weight is already dequantized on GPU
                     let a_data = a.as_f32()?;
                     let out_data = out.as_f32_mut()?;
-                    
+
                     // a: [k], b: [k, n], out: [n]
                     let k = gpu_weight.shape[0];
                     let n_out = gpu_weight.shape[1];
-                    
+
                     // Verify dimensions match
                     if a_data.len() != k {
                         return Err(BackendError::OperationFailed(format!(
                             "vec_mat_q (GPU) dimension mismatch: expected {}, got {}",
-                            k, a_data.len()
+                            k,
+                            a_data.len()
                         )));
                     }
-                    
+
                     // Upload input vector
                     let a_gpu = self.to_device(a_data)?;
                     let mut out_gpu = self.alloc_gpu(n_out)?;
-                    
+
                     // Launch vec_mat kernel
                     let config = launch_config_1d(n_out, 256);
                     unsafe {
                         self.kernels.vec_mat_f32.clone().launch(
-                            config, 
-                            (&a_gpu, &gpu_weight.data, &mut out_gpu, k as i32, n_out as i32)
+                            config,
+                            (
+                                &a_gpu,
+                                &gpu_weight.data,
+                                &mut out_gpu,
+                                k as i32,
+                                n_out as i32,
+                            ),
                         )
-                    }.map_err(|e| BackendError::OperationFailed(format!("vec_mat kernel failed: {}", e)))?;
-                    
+                    }
+                    .map_err(|e| {
+                        BackendError::OperationFailed(format!("vec_mat kernel failed: {}", e))
+                    })?;
+
                     // Copy result back
                     let result = self.from_device(&out_gpu)?;
                     out_data.copy_from_slice(&result);
-                    
+
                     return Ok(());
                 }
             }
         }
-        
+
         // Fallback to CPU for weights not in GPU store
-        self.cpu_fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.cpu_fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.cpu_backend.vec_mat_q(a, b, out)
     }
 
@@ -561,7 +649,7 @@ impl Backend for CudaBackend {
         // Get dimensions - for single position inference, q/k are [num_heads, head_dim]
         // or [num_heads, 1, head_dim]
         let q_shape = q.shape();
-        
+
         // Handle different tensor layouts
         let (num_heads, head_dim) = if q_shape.len() == 2 {
             (q_shape[0], q_shape[1])
@@ -570,37 +658,48 @@ impl Backend for CudaBackend {
             (q_shape[0], q_shape[2])
         } else {
             // Fall back to CPU for complex shapes
-            return self.cpu_backend.rope(q, k, pos, freq_base, freq_scale, use_neox);
+            return self
+                .cpu_backend
+                .rope(q, k, pos, freq_base, freq_scale, use_neox);
         };
-        
+
         let q_data = q.as_f32_mut()?;
         let k_data = k.as_f32_mut()?;
-        
+
         // Upload to GPU
         let mut q_gpu = self.to_device(q_data)?;
         let mut k_gpu = self.to_device(k_data)?;
-        
+
         // Launch kernel - one block per head, threads for dimension pairs
         let config = LaunchConfig {
             grid_dim: (num_heads as u32, 1, 1),
             block_dim: ((head_dim / 2) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        
+
         unsafe {
             self.kernels.rope_single_pos.clone().launch(
                 config,
-                (&mut q_gpu, &mut k_gpu, num_heads as i32, head_dim as i32, 
-                 pos as i32, freq_base, freq_scale, if use_neox { 1i32 } else { 0i32 })
+                (
+                    &mut q_gpu,
+                    &mut k_gpu,
+                    num_heads as i32,
+                    head_dim as i32,
+                    pos as i32,
+                    freq_base,
+                    freq_scale,
+                    if use_neox { 1i32 } else { 0i32 },
+                ),
             )
-        }.map_err(|e| BackendError::OperationFailed(format!("rope kernel failed: {}", e)))?;
-        
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("rope kernel failed: {}", e)))?;
+
         // Copy back
         let q_result = self.from_device(&q_gpu)?;
         let k_result = self.from_device(&k_gpu)?;
         q_data.copy_from_slice(&q_result);
         k_data.copy_from_slice(&k_result);
-        
+
         Ok(())
     }
 
@@ -659,7 +758,13 @@ impl Backend for CudaBackend {
         Err(BackendError::NotAvailable("CUDA".to_string()))
     }
 
-    fn rms_norm(&self, _x: &Tensor, _weight: &Tensor, _eps: f32, _out: &mut Tensor) -> BackendResult<()> {
+    fn rms_norm(
+        &self,
+        _x: &Tensor,
+        _weight: &Tensor,
+        _eps: f32,
+        _out: &mut Tensor,
+    ) -> BackendResult<()> {
         Err(BackendError::NotAvailable("CUDA".to_string()))
     }
 
@@ -687,11 +792,26 @@ impl Backend for CudaBackend {
         Err(BackendError::NotAvailable("CUDA".to_string()))
     }
 
-    fn rope(&self, _q: &mut Tensor, _k: &mut Tensor, _pos: usize, _freq_base: f32, _freq_scale: f32, _use_neox: bool) -> BackendResult<()> {
+    fn rope(
+        &self,
+        _q: &mut Tensor,
+        _k: &mut Tensor,
+        _pos: usize,
+        _freq_base: f32,
+        _freq_scale: f32,
+        _use_neox: bool,
+    ) -> BackendResult<()> {
         Err(BackendError::NotAvailable("CUDA".to_string()))
     }
 
-    fn attention(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor, _out: &mut Tensor, _scale: f32) -> BackendResult<()> {
+    fn attention(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _out: &mut Tensor,
+        _scale: f32,
+    ) -> BackendResult<()> {
         Err(BackendError::NotAvailable("CUDA".to_string()))
     }
 }
@@ -721,7 +841,7 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     #[cfg(feature = "cuda")]
     fn test_cuda_add() {
@@ -729,20 +849,20 @@ mod tests {
             Ok(b) => b,
             Err(_) => return,
         };
-        
+
         let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], vec![4]).unwrap();
         let b = Tensor::from_f32(&[0.5, 0.5, 0.5, 0.5], vec![4]).unwrap();
         let mut out = Tensor::zeros(vec![4], DType::F32);
-        
+
         backend.add(&a, &b, &mut out).unwrap();
-        
+
         let result = out.as_f32().unwrap();
         assert!((result[0] - 1.5).abs() < 1e-5);
         assert!((result[1] - 2.5).abs() < 1e-5);
         assert!((result[2] - 3.5).abs() < 1e-5);
         assert!((result[3] - 4.5).abs() < 1e-5);
     }
-    
+
     #[test]
     #[cfg(feature = "cuda")]
     fn test_cuda_silu() {
@@ -750,12 +870,12 @@ mod tests {
             Ok(b) => b,
             Err(_) => return,
         };
-        
+
         let x = Tensor::from_f32(&[0.0, 1.0, -1.0, 2.0], vec![4]).unwrap();
         let mut out = Tensor::zeros(vec![4], DType::F32);
-        
+
         backend.silu(&x, &mut out).unwrap();
-        
+
         let result = out.as_f32().unwrap();
         // SiLU(0) = 0
         assert!(result[0].abs() < 1e-5);

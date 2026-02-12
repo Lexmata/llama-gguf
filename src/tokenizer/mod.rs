@@ -94,7 +94,7 @@ pub struct Tokenizer {
     /// Reverse vocabulary (token id -> token string)
     id_to_token: Vec<String>,
     /// Token scores for SentencePiece
-    scores: Vec<f32>,
+    _scores: Vec<f32>,
     /// Merge pairs for BPE with priority (lower = merge first)
     /// Maps (token1_id, token2_id) -> (merged_token_id, priority)
     merges: HashMap<(u32, u32), (u32, usize)>,
@@ -146,7 +146,7 @@ impl Tokenizer {
         Ok(Self {
             token_to_id,
             id_to_token,
-            scores,
+            _scores: scores,
             merges,
             special_tokens,
             tokenizer_type,
@@ -172,15 +172,13 @@ impl Tokenizer {
                         _ => {
                             return Err(TokenizerError::MissingData(
                                 "Expected string tokens".into(),
-                            ))
+                            ));
                         }
                     }
                 }
                 Ok(tokens)
             }
-            _ => Err(TokenizerError::MissingData(
-                "Expected token array".into(),
-            )),
+            _ => Err(TokenizerError::MissingData("Expected token array".into())),
         }
     }
 
@@ -246,13 +244,13 @@ impl Tokenizer {
                     if parts.len() == 2
                         && let (Some(&id1), Some(&id2)) =
                             (token_to_id.get(parts[0]), token_to_id.get(parts[1]))
-                        {
-                            // The merged result is typically the concatenation
-                            let merged = format!("{}{}", parts[0], parts[1]);
-                            if let Some(&merged_id) = token_to_id.get(&merged) {
-                                merges.insert((id1, id2), (merged_id, priority));
-                            }
+                    {
+                        // The merged result is typically the concatenation
+                        let merged = format!("{}{}", parts[0], parts[1]);
+                        if let Some(&merged_id) = token_to_id.get(&merged) {
+                            merges.insert((id1, id2), (merged_id, priority));
                         }
+                    }
                 }
             }
         }
@@ -263,8 +261,14 @@ impl Tokenizer {
     /// Load special tokens from GGUF
     fn load_special_tokens(gguf: &GgufFile) -> SpecialTokens {
         SpecialTokens {
-            bos_token_id: gguf.data.get_u32("tokenizer.ggml.bos_token_id").unwrap_or(1),
-            eos_token_id: gguf.data.get_u32("tokenizer.ggml.eos_token_id").unwrap_or(2),
+            bos_token_id: gguf
+                .data
+                .get_u32("tokenizer.ggml.bos_token_id")
+                .unwrap_or(1),
+            eos_token_id: gguf
+                .data
+                .get_u32("tokenizer.ggml.eos_token_id")
+                .unwrap_or(2),
             pad_token_id: gguf.data.get_u32("tokenizer.ggml.padding_token_id"),
             unk_token_id: gguf.data.get_u32("tokenizer.ggml.unknown_token_id"),
         }
@@ -292,21 +296,21 @@ impl Tokenizer {
     /// SentencePiece encoding using greedy longest-match algorithm
     fn encode_sentencepiece(&self, text: &str) -> TokenizerResult<Vec<u32>> {
         let mut result = Vec::new();
-        
+
         // Add space prefix for LLaMA-style tokenizers
         let text_with_prefix = format!(" {}", text);
         let chars: Vec<char> = text_with_prefix.chars().collect();
         let mut pos = 0;
-        
+
         while pos < chars.len() {
             let mut best_len = 0;
             let mut best_id = None;
-            
+
             // Try to find the longest matching token starting at current position
             // Try lengths from longest to shortest for efficiency
             for end in (pos + 1..=chars.len()).rev() {
                 let substr: String = chars[pos..end].iter().collect();
-                
+
                 // Try with SentencePiece space marker
                 let spm_str = substr.replace(' ', "▁");
                 if let Some(&id) = self.token_to_id.get(&spm_str) {
@@ -314,7 +318,7 @@ impl Tokenizer {
                     best_id = Some(id);
                     break; // Found longest match
                 }
-                
+
                 // Try original string
                 if let Some(&id) = self.token_to_id.get(&substr) {
                     best_len = end - pos;
@@ -322,7 +326,7 @@ impl Tokenizer {
                     break; // Found longest match
                 }
             }
-            
+
             if let Some(id) = best_id {
                 result.push(id);
                 pos += best_len;
@@ -330,23 +334,23 @@ impl Tokenizer {
                 // Fallback: try single character with byte fallback
                 let ch = chars[pos];
                 let ch_str = ch.to_string();
-                
+
                 // Try as SentencePiece space
-                if ch == ' ' {
-                    if let Some(&id) = self.token_to_id.get("▁") {
-                        result.push(id);
-                        pos += 1;
-                        continue;
-                    }
+                if ch == ' '
+                    && let Some(&id) = self.token_to_id.get("▁")
+                {
+                    result.push(id);
+                    pos += 1;
+                    continue;
                 }
-                
+
                 // Try as regular character
                 if let Some(&id) = self.token_to_id.get(&ch_str) {
                     result.push(id);
                     pos += 1;
                     continue;
                 }
-                
+
                 // Byte-level fallback
                 for byte in ch_str.as_bytes() {
                     let byte_token = format!("<0x{:02X}>", byte);
@@ -359,7 +363,7 @@ impl Tokenizer {
                 pos += 1;
             }
         }
-        
+
         Ok(result)
     }
 
@@ -367,7 +371,7 @@ impl Tokenizer {
     fn encode_bpe(&self, text: &str) -> TokenizerResult<Vec<u32>> {
         // For LLaMA-style tokenizers, we first try to match whole words/subwords
         // then fall back to character-level
-        
+
         let mut result = Vec::new();
 
         // Split text preserving whitespace (add space prefix for LLaMA)
@@ -404,9 +408,10 @@ impl Tokenizer {
                 for i in 0..tokens.len() - 1 {
                     let pair = (tokens[i], tokens[i + 1]);
                     if let Some(&(merged_id, priority)) = self.merges.get(&pair)
-                        && (best_merge.is_none() || priority < best_merge.unwrap().2) {
-                            best_merge = Some((i, merged_id, priority));
-                        }
+                        && (best_merge.is_none() || priority < best_merge.unwrap().2)
+                    {
+                        best_merge = Some((i, merged_id, priority));
+                    }
                 }
 
                 // Apply the best merge if found
@@ -434,13 +439,12 @@ impl Tokenizer {
 
         for ch in text.chars() {
             current.push(ch);
-            
+
             // Check if current string exists in vocab or if it's a word boundary
-            if (ch.is_whitespace() || ch.is_ascii_punctuation())
-                && !current.is_empty() {
-                    segments.push(current.clone());
-                    current.clear();
-                }
+            if (ch.is_whitespace() || ch.is_ascii_punctuation()) && !current.is_empty() {
+                segments.push(current.clone());
+                current.clear();
+            }
         }
 
         if !current.is_empty() {
@@ -456,7 +460,7 @@ impl Tokenizer {
 
         for ch in text.chars() {
             let ch_str = ch.to_string();
-            
+
             // First try direct character lookup
             if let Some(&id) = self.token_to_id.get(&ch_str) {
                 tokens.push(id);
@@ -465,10 +469,11 @@ impl Tokenizer {
 
             // Try SentencePiece format (▁ prefix for space)
             if ch == ' '
-                && let Some(&id) = self.token_to_id.get("▁") {
-                    tokens.push(id);
-                    continue;
-                }
+                && let Some(&id) = self.token_to_id.get("▁")
+            {
+                tokens.push(id);
+                continue;
+            }
 
             // Try byte fallback
             for byte in ch_str.as_bytes() {
@@ -523,21 +528,24 @@ impl Tokenizer {
             }
 
             if let Some(pad_id) = self.special_tokens.pad_token_id
-                && token_id == pad_id {
-                    continue;
-                }
+                && token_id == pad_id
+            {
+                continue;
+            }
 
-            let token_str = self
-                .id_to_token
-                .get(token_id as usize)
-                .ok_or_else(|| TokenizerError::InvalidToken(format!("Unknown token ID: {}", token_id)))?;
+            let token_str = self.id_to_token.get(token_id as usize).ok_or_else(|| {
+                TokenizerError::InvalidToken(format!("Unknown token ID: {}", token_id))
+            })?;
 
             // Handle byte tokens - collect into buffer for proper UTF-8 decoding
-            if token_str.starts_with("<0x") && token_str.ends_with('>') && token_str.len() == 6
-                && let Ok(byte) = u8::from_str_radix(&token_str[3..5], 16) {
-                    byte_buffer.push(byte);
-                    continue;
-                }
+            if token_str.starts_with("<0x")
+                && token_str.ends_with('>')
+                && token_str.len() == 6
+                && let Ok(byte) = u8::from_str_radix(&token_str[3..5], 16)
+            {
+                byte_buffer.push(byte);
+                continue;
+            }
 
             // Flush byte buffer before adding text
             if !byte_buffer.is_empty() {
@@ -552,14 +560,14 @@ impl Tokenizer {
 
             // Handle BPE special characters
             let decoded = token_str
-                .replace("▁", " ")   // SentencePiece space
-                .replace("Ġ", " ")   // GPT-2 style space  
-                .replace("Ċ", "\n")  // GPT-2 style newline
+                .replace("▁", " ") // SentencePiece space
+                .replace("Ġ", " ") // GPT-2 style space
+                .replace("Ċ", "\n") // GPT-2 style newline
                 .replace("ĉ", "\t"); // GPT-2 style tab
 
             // Debug: uncomment to see token decoding
             // eprintln!("Token {}: '{}' -> '{}' bytes:{:?}", token_id, token_str, decoded, token_str.as_bytes());
-            
+
             text.push_str(&decoded);
         }
 
@@ -604,6 +612,208 @@ impl Tokenizer {
             || id == self.special_tokens.eos_token_id
             || self.special_tokens.pad_token_id == Some(id)
             || self.special_tokens.unk_token_id == Some(id)
+    }
+
+    /// Load tokenizer from a HuggingFace `tokenizer.json` file
+    ///
+    /// This parses the JSON format used by HuggingFace tokenizers (the `tokenizers` library).
+    /// Supports BPE models which cover LLaMA, Mistral, Qwen, and most modern LLMs.
+    pub fn from_hf_json(path: impl AsRef<std::path::Path>) -> TokenizerResult<Self> {
+        let path = path.as_ref();
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| TokenizerError::MissingData(format!("{}: {}", path.display(), e)))?;
+
+        Self::from_hf_json_str(&data)
+    }
+
+    /// Parse tokenizer from a HuggingFace tokenizer.json string
+    pub fn from_hf_json_str(json: &str) -> TokenizerResult<Self> {
+        let root: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| TokenizerError::EncodingError(format!("Invalid tokenizer.json: {}", e)))?;
+
+        // Extract the model section
+        let model = root
+            .get("model")
+            .ok_or_else(|| TokenizerError::MissingData("model section in tokenizer.json".into()))?;
+
+        let model_type = model.get("type").and_then(|v| v.as_str()).unwrap_or("BPE");
+
+        let tokenizer_type = match model_type {
+            "BPE" => TokenizerType::BPE,
+            "Unigram" => TokenizerType::SentencePiece,
+            "WordPiece" => TokenizerType::WordPiece,
+            _ => TokenizerType::Unknown,
+        };
+
+        // Parse vocabulary from model.vocab
+        // HF BPE vocab is an object: { "token": id, ... }
+        let vocab_obj = model
+            .get("vocab")
+            .ok_or_else(|| TokenizerError::MissingData("model.vocab in tokenizer.json".into()))?;
+
+        let vocab_map = vocab_obj
+            .as_object()
+            .ok_or_else(|| TokenizerError::MissingData("model.vocab should be an object".into()))?;
+
+        let vocab_size = vocab_map.len();
+        let mut token_to_id = HashMap::with_capacity(vocab_size);
+        let mut id_to_token = vec![String::new(); vocab_size];
+
+        for (token, id_val) in vocab_map {
+            let id = id_val.as_u64().ok_or_else(|| {
+                TokenizerError::MissingData(format!("Invalid vocab ID for '{}'", token))
+            })? as u32;
+            token_to_id.insert(token.clone(), id);
+            if (id as usize) < id_to_token.len() {
+                id_to_token[id as usize] = token.clone();
+            }
+        }
+
+        // Parse BPE merges from model.merges
+        let mut merges = HashMap::new();
+        if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
+            for (priority, merge_val) in merges_arr.iter().enumerate() {
+                if let Some(merge_str) = merge_val.as_str() {
+                    let parts: Vec<&str> = merge_str.split(' ').collect();
+                    if parts.len() == 2
+                        && let (Some(&id1), Some(&id2)) =
+                            (token_to_id.get(parts[0]), token_to_id.get(parts[1]))
+                    {
+                        let merged = format!("{}{}", parts[0], parts[1]);
+                        if let Some(&merged_id) = token_to_id.get(&merged) {
+                            merges.insert((id1, id2), (merged_id, priority));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Parse special tokens from added_tokens
+        let mut bos_token_id: Option<u32> = None;
+        let mut eos_token_id: Option<u32> = None;
+        let mut pad_token_id: Option<u32> = None;
+        let mut unk_token_id: Option<u32> = None;
+
+        if let Some(added_tokens) = root.get("added_tokens").and_then(|v| v.as_array()) {
+            for token_obj in added_tokens {
+                let content = token_obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let id = token_obj
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let special = token_obj
+                    .get("special")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if special && let Some(id) = id {
+                    // Detect special token roles by common names
+                    let content_lower = content.to_lowercase();
+                    if content_lower.contains("bos")
+                        || content == "<s>"
+                        || content == "<|begin_of_text|>"
+                        || content == "<|startoftext|>"
+                    {
+                        bos_token_id = Some(id);
+                    }
+                    if content_lower.contains("eos")
+                        || content == "</s>"
+                        || content == "<|end_of_text|>"
+                        || content == "<|endoftext|>"
+                        || content == "<|eot_id|>"
+                    {
+                        eos_token_id = Some(id);
+                    }
+                    if content_lower.contains("pad") || content == "<pad>" {
+                        pad_token_id = Some(id);
+                    }
+                    if content_lower.contains("unk") || content == "<unk>" {
+                        unk_token_id = Some(id);
+                    }
+
+                    // Make sure the special token is in the vocab
+                    token_to_id.insert(content.to_string(), id);
+                    if (id as usize) < id_to_token.len() {
+                        id_to_token[id as usize] = content.to_string();
+                    }
+                }
+            }
+        }
+
+        // Also check post_processor for special token IDs
+        if let Some(post_proc) = root.get("post_processor") {
+            // TemplateProcessing format
+            if let Some(special_tokens_map) = post_proc.get("special_tokens") {
+                if let Some(bos_obj) = special_tokens_map
+                    .get("<s>")
+                    .or_else(|| special_tokens_map.get("<|begin_of_text|>"))
+                    && let Some(ids) = bos_obj.get("ids").and_then(|v| v.as_array())
+                    && let Some(id) = ids.first().and_then(|v| v.as_u64())
+                {
+                    bos_token_id = bos_token_id.or(Some(id as u32));
+                }
+                if let Some(eos_obj) = special_tokens_map
+                    .get("</s>")
+                    .or_else(|| special_tokens_map.get("<|end_of_text|>"))
+                    && let Some(ids) = eos_obj.get("ids").and_then(|v| v.as_array())
+                    && let Some(id) = ids.first().and_then(|v| v.as_u64())
+                {
+                    eos_token_id = eos_token_id.or(Some(id as u32));
+                }
+            }
+        }
+
+        let special_tokens = SpecialTokens {
+            bos_token_id: bos_token_id.unwrap_or(1),
+            eos_token_id: eos_token_id.unwrap_or(2),
+            pad_token_id,
+            unk_token_id,
+        };
+
+        // Build token types (all normal for HF tokenizer, mark specials as Control)
+        let mut token_types = vec![TokenType::Normal; vocab_size];
+        for &id in [special_tokens.bos_token_id, special_tokens.eos_token_id].iter() {
+            if (id as usize) < token_types.len() {
+                token_types[id as usize] = TokenType::Control;
+            }
+        }
+        if let Some(pad_id) = special_tokens.pad_token_id
+            && (pad_id as usize) < token_types.len()
+        {
+            token_types[pad_id as usize] = TokenType::Control;
+        }
+        if let Some(unk_id) = special_tokens.unk_token_id
+            && (unk_id as usize) < token_types.len()
+        {
+            token_types[unk_id as usize] = TokenType::Control;
+        }
+
+        // Mark byte tokens
+        for (token, &id) in &token_to_id {
+            if token.starts_with("<0x")
+                && token.ends_with('>')
+                && token.len() == 6
+                && (id as usize) < token_types.len()
+            {
+                token_types[id as usize] = TokenType::Byte;
+            }
+        }
+
+        let scores = vec![0.0; vocab_size];
+
+        Ok(Self {
+            token_to_id,
+            id_to_token,
+            _scores: scores,
+            merges,
+            special_tokens,
+            tokenizer_type,
+            vocab_size,
+            token_types,
+        })
     }
 }
 

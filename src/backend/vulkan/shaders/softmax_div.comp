@@ -1,0 +1,18 @@
+#version 450
+
+// Pass 3: Normalize by dividing by sum
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Data { float data[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    float inv_sum;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < n) {
+        data[idx] *= inv_sum;
+    }
+}

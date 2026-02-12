@@ -20,7 +20,7 @@ pub mod batch;
 mod handlers;
 mod types;
 
-pub use api::{run_server, ServerConfig};
+pub use api::{ServerConfig, run_server};
 pub use batch::{
     BatchConfig, BatchScheduler, FinishReason, GenerationEvent, GenerationRequest, RequestId,
     SharedBatchScheduler, new_batch_scheduler,

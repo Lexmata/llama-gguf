@@ -64,8 +64,14 @@ pub enum EngineError {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
-    /// Path to the GGUF model file.
+    /// Path to the model file (GGUF or ONNX).
     pub model_path: String,
+
+    /// Optional path to a tokenizer file.
+    ///
+    /// For ONNX models, this defaults to `tokenizer.json` in the same directory.
+    /// Can also point to a GGUF file to extract just the tokenizer.
+    pub tokenizer_path: Option<String>,
 
     /// Temperature for sampling (0.0 = greedy, higher = more random).
     pub temperature: f32,
@@ -93,6 +99,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             model_path: String::new(),
+            tokenizer_path: None,
             temperature: 0.7,
             top_k: 40,
             top_p: 0.95,
@@ -146,6 +153,16 @@ pub enum ChatTemplate {
 }
 
 impl ChatTemplate {
+    /// Detect chat template from model type string (for ONNX models without GGUF metadata).
+    pub fn detect_from_model_type(model_type: Option<&str>) -> Self {
+        match model_type {
+            Some("qwen2" | "qwen") => ChatTemplate::ChatML,
+            Some("llama" | "codellama") => ChatTemplate::Llama2,
+            Some("mistral" | "mixtral") => ChatTemplate::Llama2,
+            _ => ChatTemplate::None,
+        }
+    }
+
     /// Detect chat template from GGUF metadata.
     pub fn detect(gguf: &GgufFile) -> Self {
         if let Some(template) = gguf.data.get_string("tokenizer.chat_template") {
@@ -212,7 +229,10 @@ impl ChatTemplate {
                 )
             }
             ChatTemplate::None => {
-                format!("System: {}\n\nUser: {}\n\nAssistant:", system_prompt, user_message)
+                format!(
+                    "System: {}\n\nUser: {}\n\nAssistant:",
+                    system_prompt, user_message
+                )
             }
         }
     }
@@ -259,7 +279,7 @@ impl ChatTemplate {
 /// `Engine` is `Send + Sync` safe for the immutable model and config, but the
 /// mutable inference context and sampler are created per-call via internal state.
 pub struct Engine {
-    gguf: GgufFile,
+    gguf: Option<GgufFile>,
     model: Box<dyn Model>,
     tokenizer: Tokenizer,
     config: ModelConfig,
@@ -273,21 +293,52 @@ pub struct Engine {
 impl Engine {
     /// Load a model and create an inference engine.
     ///
-    /// This opens the GGUF file, loads the tokenizer and model weights,
+    /// This opens the model file (GGUF or ONNX), loads the tokenizer and model weights,
     /// and selects the appropriate backend (CPU or GPU).
+    ///
+    /// Format is auto-detected by file extension:
+    /// - `.gguf` -- GGUF format (default)
+    /// - `.onnx` -- ONNX format (requires `onnx` feature, companion config.json + tokenizer.json)
     pub fn load(config: EngineConfig) -> Result<Self, EngineError> {
         if config.model_path.is_empty() {
             return Err(EngineError::Other("model_path is required".into()));
         }
 
-        tracing::info!("Loading model from: {}", config.model_path);
+        let path = std::path::Path::new(&config.model_path);
+
+        // Detect format by extension
+        match path.extension().and_then(|e| e.to_str()) {
+            #[cfg(feature = "onnx")]
+            Some("onnx") => Self::load_onnx(config),
+            #[cfg(not(feature = "onnx"))]
+            Some("onnx") => Err(EngineError::Other(
+                "ONNX support requires the `onnx` feature. Build with: cargo build --features onnx"
+                    .into(),
+            )),
+            _ => Self::load_gguf(config),
+        }
+    }
+
+    /// Load from a GGUF model file (existing path).
+    fn load_gguf(config: EngineConfig) -> Result<Self, EngineError> {
+        tracing::info!("Loading GGUF model from: {}", config.model_path);
 
         // Load GGUF file
         let gguf = GgufFile::open(&config.model_path)?;
 
         // Load tokenizer
         tracing::info!("Loading tokenizer...");
-        let tokenizer = Tokenizer::from_gguf(&gguf)?;
+        let tokenizer = if let Some(ref tok_path) = config.tokenizer_path {
+            // User-specified tokenizer (could be a tokenizer.json or a GGUF file)
+            if tok_path.ends_with(".json") {
+                Tokenizer::from_hf_json(tok_path)?
+            } else {
+                let tok_gguf = GgufFile::open(tok_path)?;
+                Tokenizer::from_gguf(&tok_gguf)?
+            }
+        } else {
+            Tokenizer::from_gguf(&gguf)?
+        };
         tracing::info!("Vocabulary size: {}", tokenizer.vocab_size);
 
         // Load model weights
@@ -307,33 +358,7 @@ impl Engine {
         // Select backend -- must happen before boxing the model so CUDA can
         // access the concrete LlamaModel type for weight upload.
         let backend: Arc<dyn Backend> = if config.use_gpu {
-            #[cfg(feature = "cuda")]
-            {
-                match crate::backend::cuda::CudaBackend::new() {
-                    Ok(mut cuda) => {
-                        tracing::info!("Using CUDA backend: {}", cuda.device_name());
-                        if let Err(e) = cuda.load_model_weights(&concrete_model) {
-                            tracing::warn!(
-                                "Failed to load GPU weights ({}), using quantized ops",
-                                e
-                            );
-                        }
-                        Arc::new(cuda)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to initialize CUDA ({}), falling back to CPU",
-                            e
-                        );
-                        Arc::new(crate::backend::cpu::CpuBackend::new())
-                    }
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                tracing::warn!("CUDA not compiled in, falling back to CPU");
-                Arc::new(crate::backend::cpu::CpuBackend::new())
-            }
+            Self::select_gpu_backend(&concrete_model)
         } else {
             Arc::new(crate::backend::cpu::CpuBackend::new())
         };
@@ -364,7 +389,7 @@ impl Engine {
         tracing::info!("Engine ready");
 
         Ok(Self {
-            gguf,
+            gguf: Some(gguf),
             model,
             tokenizer,
             config: model_config,
@@ -374,6 +399,180 @@ impl Engine {
             add_bos,
             engine_config: config,
         })
+    }
+
+    /// Load from an ONNX model file with companion config.json and tokenizer.json.
+    #[cfg(feature = "onnx")]
+    fn load_onnx(config: EngineConfig) -> Result<Self, EngineError> {
+        use crate::onnx::OnnxModelLoader;
+
+        tracing::info!("Loading ONNX model from: {}", config.model_path);
+
+        let model_dir = std::path::Path::new(&config.model_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+
+        // Load model via ONNX loader
+        let loader = OnnxModelLoader::load(&config.model_path)
+            .map_err(|e| EngineError::Other(format!("ONNX load error: {}", e)))?;
+        let model_config = loader.config().clone();
+        let hf_config = loader.hf_config().clone();
+
+        tracing::info!(
+            "Model: {} layers, {} heads, {} hidden dim, {} ctx",
+            model_config.num_layers,
+            model_config.num_heads,
+            model_config.hidden_size,
+            model_config.max_seq_len,
+        );
+
+        let concrete_model = loader
+            .build_model()
+            .map_err(|e| EngineError::Other(format!("ONNX model build error: {}", e)))?;
+
+        // Load tokenizer
+        tracing::info!("Loading tokenizer...");
+        let tokenizer = if let Some(ref tok_path) = config.tokenizer_path {
+            if tok_path.ends_with(".json") {
+                Tokenizer::from_hf_json(tok_path)?
+            } else {
+                let tok_gguf = GgufFile::open(tok_path)?;
+                Tokenizer::from_gguf(&tok_gguf)?
+            }
+        } else {
+            // Look for tokenizer.json in the same directory
+            let tokenizer_path = model_dir.join("tokenizer.json");
+            if tokenizer_path.exists() {
+                tracing::info!("Using tokenizer.json from: {}", tokenizer_path.display());
+                Tokenizer::from_hf_json(&tokenizer_path)?
+            } else {
+                return Err(EngineError::Other(format!(
+                    "No tokenizer found. ONNX models require a tokenizer.json file \
+                     in the same directory as the model, or specify --tokenizer <path>. \
+                     Looked for: {}",
+                    tokenizer_path.display()
+                )));
+            }
+        };
+        tracing::info!("Vocabulary size: {}", tokenizer.vocab_size);
+
+        // Select backend
+        let backend: Arc<dyn Backend> = if config.use_gpu {
+            Self::select_gpu_backend(&concrete_model)
+        } else {
+            Arc::new(crate::backend::cpu::CpuBackend::new())
+        };
+
+        let model: Box<dyn Model> = Box::new(concrete_model);
+
+        // Infer chat template from model type
+        let chat_template = ChatTemplate::detect_from_model_type(hf_config.model_type.as_deref());
+        tracing::info!("Chat template: {:?}", chat_template);
+
+        // For ONNX models, default to adding BOS
+        let add_bos = true;
+
+        let sampler_config = SamplerConfig {
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            repeat_penalty: config.repeat_penalty,
+            seed: config.seed,
+            ..Default::default()
+        };
+
+        tracing::info!("Engine ready (ONNX)");
+
+        Ok(Self {
+            gguf: None,
+            model,
+            tokenizer,
+            config: model_config,
+            backend,
+            sampler_config,
+            chat_template,
+            add_bos,
+            engine_config: config,
+        })
+    }
+
+    /// Select the best available GPU backend.
+    ///
+    /// Priority: CUDA > Metal > DX12 > Vulkan > CPU fallback.
+    pub fn select_gpu_backend(_model: &crate::model::LlamaModel) -> Arc<dyn Backend> {
+        // Try CUDA first (NVIDIA GPUs)
+        #[cfg(feature = "cuda")]
+        {
+            match crate::backend::cuda::CudaBackend::new() {
+                Ok(mut cuda) => {
+                    tracing::info!("Using CUDA backend: {}", cuda.device_name());
+                    if let Err(e) = cuda.load_model_weights(model) {
+                        tracing::warn!("Failed to load GPU weights ({}), using quantized ops", e);
+                    }
+                    return Arc::new(cuda);
+                }
+                Err(e) => {
+                    tracing::info!("CUDA not available ({}), trying Metal...", e);
+                }
+            }
+        }
+
+        // Try Metal (native macOS / Apple Silicon)
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            match crate::backend::metal::MetalBackend::new() {
+                Ok(metal) => {
+                    tracing::info!("Using Metal backend: {}", metal.device_name());
+                    return Arc::new(metal);
+                }
+                Err(e) => {
+                    tracing::info!("Metal not available ({}), trying DX12...", e);
+                }
+            }
+        }
+
+        // Try DX12 (native Windows GPU compute)
+        #[cfg(all(feature = "dx12", target_os = "windows"))]
+        {
+            match crate::backend::dx12::Dx12Backend::new() {
+                Ok(dx12) => {
+                    tracing::info!("Using DX12 backend: {}", dx12.device_name());
+                    return Arc::new(dx12);
+                }
+                Err(e) => {
+                    tracing::info!("DX12 not available ({}), trying Vulkan...", e);
+                }
+            }
+        }
+
+        // Try Vulkan (cross-platform: AMD, Intel, NVIDIA, etc.)
+        #[cfg(feature = "vulkan")]
+        {
+            match crate::backend::vulkan::VulkanBackend::new() {
+                Ok(vk) => {
+                    tracing::info!("Using Vulkan backend: {}", vk.device_name());
+                    return Arc::new(vk);
+                }
+                Err(e) => {
+                    tracing::warn!("Vulkan not available ({}), falling back to CPU", e);
+                }
+            }
+        }
+
+        // Fallback message when no GPU backend is compiled
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "vulkan",
+            all(feature = "metal", target_os = "macos"),
+            all(feature = "dx12", target_os = "windows")
+        )))]
+        {
+            tracing::warn!(
+                "No GPU backend compiled. Build with --features cuda, --features metal, --features dx12, or --features vulkan"
+            );
+        }
+
+        Arc::new(crate::backend::cpu::CpuBackend::new())
     }
 
     /// Get the model configuration.
@@ -386,9 +585,9 @@ impl Engine {
         &self.chat_template
     }
 
-    /// Get the GGUF file metadata.
-    pub fn gguf(&self) -> &GgufFile {
-        &self.gguf
+    /// Get the GGUF file metadata (None for ONNX-loaded models).
+    pub fn gguf(&self) -> Option<&GgufFile> {
+        self.gguf.as_ref()
     }
 
     /// Get the tokenizer.
@@ -419,10 +618,10 @@ impl Engine {
 
         for _ in 0..max_tokens {
             // Check if we hit EOS
-            if let Some(&last) = tokens.last() {
-                if last == self.tokenizer.special_tokens.eos_token_id {
-                    break;
-                }
+            if let Some(&last) = tokens.last()
+                && last == self.tokenizer.special_tokens.eos_token_id
+            {
+                break;
             }
 
             // Run forward pass
@@ -474,11 +673,7 @@ impl Engine {
     ///
     /// Each item in the returned iterator is a `Result<String, EngineError>` containing
     /// the decoded text of one or more tokens.
-    pub fn generate_streaming(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-    ) -> GenerationStream<'_> {
+    pub fn generate_streaming(&self, prompt: &str, max_tokens: usize) -> GenerationStream<'_> {
         GenerationStream::new(self, prompt, max_tokens)
     }
 
@@ -542,11 +737,11 @@ impl<'a> Iterator for GenerationStream<'a> {
         }
 
         // Check EOS from last token
-        if let Some(&last) = self.tokens.last() {
-            if last == self.engine.tokenizer.special_tokens.eos_token_id {
-                self.done = true;
-                return None;
-            }
+        if let Some(&last) = self.tokens.last()
+            && last == self.engine.tokenizer.special_tokens.eos_token_id
+        {
+            self.done = true;
+            return None;
         }
 
         // Forward pass
@@ -738,10 +933,7 @@ impl ChatEngine {
     ///
     /// Returns an iterator of `Result<String, EngineError>` where each item is
     /// a decoded token chunk.
-    pub fn chat_streaming(
-        &mut self,
-        message: &str,
-    ) -> Result<ChatStream<'_>, EngineError> {
+    pub fn chat_streaming(&mut self, message: &str) -> Result<ChatStream<'_>, EngineError> {
         let max_tokens = self.engine.engine_config.max_tokens;
 
         // Format the message
@@ -841,11 +1033,14 @@ impl<'a> Iterator for ChatStream<'a> {
             }
         }
 
-        let last_token = *self
-            .chat_engine
-            .conversation_tokens
-            .last()
-            .unwrap_or(&self.chat_engine.engine.tokenizer.special_tokens.bos_token_id);
+        let last_token = *self.chat_engine.conversation_tokens.last().unwrap_or(
+            &self
+                .chat_engine
+                .engine
+                .tokenizer
+                .special_tokens
+                .bos_token_id,
+        );
 
         let logits = match self
             .chat_engine
@@ -866,7 +1061,14 @@ impl<'a> Iterator for ChatStream<'a> {
             .sample(&logits, &self.chat_engine.conversation_tokens);
 
         // Check for EOS
-        if next_token == self.chat_engine.engine.tokenizer.special_tokens.eos_token_id {
+        if next_token
+            == self
+                .chat_engine
+                .engine
+                .tokenizer
+                .special_tokens
+                .eos_token_id
+        {
             self.done = true;
             return None;
         }

@@ -11,8 +11,7 @@
 use std::collections::HashSet;
 
 /// Grammar constraint for token sampling
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum Grammar {
     /// JSON output constraint
     Json(JsonGrammar),
@@ -26,7 +25,6 @@ pub enum Grammar {
     #[default]
     None,
 }
-
 
 /// JSON grammar constraint
 #[derive(Debug, Clone)]
@@ -79,9 +77,9 @@ struct RegexState {
     /// Current position in pattern matching
     position: usize,
     /// Whether we're in a character class
-    in_class: bool,
+    _in_class: bool,
     /// Minimum remaining characters needed
-    min_remaining: usize,
+    _min_remaining: usize,
 }
 
 impl RegexGrammar {
@@ -189,7 +187,7 @@ pub enum GbnfElement {
 #[derive(Debug, Clone, Default)]
 struct GbnfState {
     /// Stack of rule states
-    stack: Vec<(String, usize, usize)>, // (rule_name, alt_idx, elem_idx)
+    _stack: Vec<(String, usize, usize)>, // (rule_name, alt_idx, elem_idx)
 }
 
 impl GbnfGrammar {
@@ -434,9 +432,9 @@ impl GrammarSampler {
             let would_be = format!("{}{}", self.generated, token);
 
             // Check if this could lead to any choice
-            let could_match = choices.iter().any(|choice| {
-                choice.starts_with(&would_be) || would_be.starts_with(choice)
-            });
+            let could_match = choices
+                .iter()
+                .any(|choice| choice.starts_with(&would_be) || would_be.starts_with(choice));
 
             mask[i] = could_match;
         }

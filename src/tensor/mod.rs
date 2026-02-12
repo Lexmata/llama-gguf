@@ -9,7 +9,7 @@ mod error;
 pub mod quant;
 mod storage;
 
-pub use core::{compute_strides, Tensor};
+pub use core::{Tensor, compute_strides};
 pub use dtype::DType;
 pub use error::TensorError;
 pub use storage::TensorStorage;

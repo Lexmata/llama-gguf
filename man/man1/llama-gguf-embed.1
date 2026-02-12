@@ -1,0 +1,53 @@
+.\" Man page for llama-gguf-embed
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-EMBED 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-embed \- extract embeddings from text
+.SH SYNOPSIS
+.B llama-gguf embed
+[\fIOPTIONS\fR]
+\fIMODEL\fR
+.SH DESCRIPTION
+Extract vector embeddings from input text using a GGUF model. Embeddings
+can be used for semantic search, clustering, similarity comparison, and
+other NLP tasks.
+.SH ARGUMENTS
+.TP
+.I MODEL
+Path to the GGUF model file.
+.SH OPTIONS
+.TP
+.BR \-t ", " \-\-text " " \fITEXT\fR
+Text to embed. Required.
+.TP
+.BR \-\-format " " \fIFORMAT\fR
+Output format. Default: json.
+.RS
+.IP \fBjson\fR
+JSON object with text, dimension, and embedding array.
+.IP \fBraw\fR
+One value per line, suitable for piping to other tools.
+.RE
+.SH EXAMPLES
+Extract embeddings in JSON format:
+.PP
+.RS
+.B llama-gguf embed model.gguf --text "Hello, world!"
+.RE
+.PP
+Extract embeddings in raw format:
+.PP
+.RS
+.B llama-gguf embed model.gguf --text "Hello" --format raw
+.RE
+.PP
+Save embeddings to file:
+.PP
+.RS
+.B llama-gguf embed model.gguf --text "Sample text" > embedding.json
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-rag (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

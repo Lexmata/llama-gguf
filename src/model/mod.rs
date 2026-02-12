@@ -24,7 +24,7 @@ pub use architecture::Architecture;
 pub use cache::{
     CachedPrefix, PrefixId, PrefixSharing, PromptCache, PromptCacheConfig, PromptCacheStats,
 };
-pub use config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType};
+pub use config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType, RopeType};
 pub use embeddings::{
     EmbeddingConfig, EmbeddingError, EmbeddingExtractor, PoolingStrategy, TruncationStrategy,
     cosine_similarity, dot_product, euclidean_distance, find_nearest,
@@ -32,7 +32,7 @@ pub use embeddings::{
 pub use error::{ModelError, ModelResult};
 pub use layers::TransformerLayer;
 pub use llama::LlamaModel;
-pub use loader::{load_llama_model, ModelLoader};
+pub use loader::{ModelLoader, load_llama_model};
 pub use lora::{LoraAdapter, LoraAdapters, LoraConfig};
 pub use moe::{MoeConfig, MoeExpert, MoeLayer, MoeRouter, MoeStats};
 pub use speculative::{SpeculativeConfig, SpeculativeDecoder, SpeculativeStats};

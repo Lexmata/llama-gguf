@@ -43,8 +43,7 @@ impl Default for RopeConfig {
 }
 
 /// RoPE scaling types for extended context
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RopeScalingType {
     /// No scaling
     #[default]
@@ -56,7 +55,6 @@ pub enum RopeScalingType {
     /// Dynamic NTK-aware scaling
     DynamicNtk,
 }
-
 
 /// Full model configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,8 +190,7 @@ impl ModelConfig {
 }
 
 /// Activation function types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ActivationType {
     /// Gaussian Error Linear Unit
     GELU,
@@ -207,7 +204,6 @@ pub enum ActivationType {
     /// Squared ReLU
     ReLUSquared,
 }
-
 
 #[cfg(test)]
 mod tests {

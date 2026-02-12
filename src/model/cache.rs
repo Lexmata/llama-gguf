@@ -44,11 +44,7 @@ pub struct CachedPrefix {
 
 impl CachedPrefix {
     /// Create a new cached prefix
-    pub fn new(
-        tokens: Vec<u32>,
-        k_cache: Vec<Tensor>,
-        v_cache: Vec<Tensor>,
-    ) -> Self {
+    pub fn new(tokens: Vec<u32>, k_cache: Vec<Tensor>, v_cache: Vec<Tensor>) -> Self {
         let seq_len = tokens.len();
         Self {
             tokens,
@@ -182,10 +178,11 @@ impl PromptCache {
 
         // Update access time for matched entry
         if let Some((ref id, _)) = best_match
-            && let Some(entry) = self.entries.get_mut(id) {
-                entry.last_access = std::time::Instant::now();
-                entry.ref_count += 1;
-            }
+            && let Some(entry) = self.entries.get_mut(id)
+        {
+            entry.last_access = std::time::Instant::now();
+            entry.ref_count += 1;
+        }
 
         best_match
     }
@@ -288,17 +285,19 @@ impl PrefixSharing {
         };
 
         // Copy cached KV to current cache
-        for (layer_idx, (cached_k, cached_v)) in prefix.k_cache.iter().zip(prefix.v_cache.iter()).enumerate() {
+        for (layer_idx, (cached_k, cached_v)) in
+            prefix.k_cache.iter().zip(prefix.v_cache.iter()).enumerate()
+        {
             if layer_idx < k_cache.len() {
                 // Copy cached data
                 let k_src = cached_k.data();
                 let v_src = cached_v.data();
-                
+
                 if let Some(k_dst) = k_cache[layer_idx].data_mut() {
                     let copy_len = k_src.len().min(k_dst.len());
                     k_dst[..copy_len].copy_from_slice(&k_src[..copy_len]);
                 }
-                
+
                 if let Some(v_dst) = v_cache[layer_idx].data_mut() {
                     let copy_len = v_src.len().min(v_dst.len());
                     v_dst[..copy_len].copy_from_slice(&v_src[..copy_len]);

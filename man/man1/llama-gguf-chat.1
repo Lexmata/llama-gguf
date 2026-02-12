@@ -1,0 +1,93 @@
+.\" Man page for llama-gguf-chat
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-CHAT 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-chat \- interactive chat mode with local or remote LLM
+.SH SYNOPSIS
+.B llama-gguf chat
+[\fIOPTIONS\fR]
+[\fIMODEL\fR]
+.SH DESCRIPTION
+Start an interactive chat session with an LLM. Can use either a local
+GGUF model file or connect to a remote OpenAI-compatible server.
+.PP
+In chat mode, conversation history is maintained, and responses are
+formatted using the model's chat template.
+.SH ARGUMENTS
+.TP
+.I MODEL
+Path to the GGUF model file. Not required when using \fB--server\fR.
+.SH OPTIONS
+.TP
+.BR \-\-server " " \fIURL\fR
+Connect to a remote OpenAI-compatible server instead of loading a local
+model. Example: \fB--server http://localhost:8080\fR.
+Can also be set via the \fBLLAMA_SERVER\fR environment variable.
+.TP
+.BR \-\-system " " \fITEXT\fR
+System prompt that defines the assistant's behavior. Default:
+"You are a helpful AI assistant."
+.TP
+.BR \-n ", " \-\-n-predict " " \fIN\fR
+Maximum tokens to generate per response. Default: 512.
+.TP
+.BR \-t ", " \-\-temperature " " \fIT\fR
+Sampling temperature. Default: 0.7.
+.TP
+.BR \-\-top-k " " \fIK\fR
+Top-K sampling parameter. Default: 40.
+.TP
+.BR \-\-top-p " " \fIP\fR
+Top-P (nucleus) sampling parameter. Default: 0.9.
+.TP
+.BR \-\-repeat-penalty " " \fIR\fR
+Repetition penalty. Default: 1.1.
+.TP
+.BR \-\-seed " " \fISEED\fR
+Random seed for reproducible output.
+.SH CHAT COMMANDS
+While in chat mode, the following commands are available:
+.TP
+.B /clear
+Clear conversation history and start fresh.
+.TP
+.B /system
+Display the current system prompt.
+.TP
+.B /help
+Show available commands.
+.TP
+.BR /quit ", " /exit ", " /q
+Exit chat mode.
+.SH EXAMPLES
+Start chat with a local model:
+.PP
+.RS
+.B llama-gguf chat model.gguf
+.RE
+.PP
+Chat with custom system prompt:
+.PP
+.RS
+.B llama-gguf chat model.gguf --system "You are a pirate. Respond in pirate speak."
+.RE
+.PP
+Connect to a remote server:
+.PP
+.RS
+.B llama-gguf chat --server http://192.168.1.100:8080
+.RE
+.PP
+Using environment variable for server:
+.PP
+.RS
+.B export LLAMA_SERVER=http://localhost:8080
+.br
+.B llama-gguf chat
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-run (1),
+.BR llama-gguf-serve (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

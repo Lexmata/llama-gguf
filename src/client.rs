@@ -144,12 +144,11 @@ impl RemoteChatClient {
         let health_url = format!("{}/health", base_url);
         let model_name = match client.get(&health_url).send() {
             Ok(resp) if resp.status().is_success() => {
-                let health: HealthResponse =
-                    resp.json().unwrap_or(HealthResponse {
-                        status: "ok".to_string(),
-                        model: "unknown".to_string(),
-                        context_size: 0,
-                    });
+                let health: HealthResponse = resp.json().unwrap_or(HealthResponse {
+                    status: "ok".to_string(),
+                    model: "unknown".to_string(),
+                    context_size: 0,
+                });
                 eprintln!("Connected to server: {}", base_url);
                 eprintln!("Model: {} (context: {})", health.model, health.context_size);
                 health.model
@@ -247,19 +246,19 @@ impl RemoteChatClient {
                     break;
                 }
 
-                if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data) {
-                    if let Some(choice) = chunk.choices.first() {
-                        if let Some(delta) = &choice.delta {
-                            if let Some(content) = &delta.content {
-                                print!("{}", content);
-                                io::stdout().flush()?;
-                                full_response.push_str(content);
-                            }
-                        }
-                        // Check for finish
-                        if choice.finish_reason.is_some() {
-                            break;
-                        }
+                if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data)
+                    && let Some(choice) = chunk.choices.first()
+                {
+                    if let Some(delta) = &choice.delta
+                        && let Some(content) = &delta.content
+                    {
+                        print!("{}", content);
+                        io::stdout().flush()?;
+                        full_response.push_str(content);
+                    }
+                    // Check for finish
+                    if choice.finish_reason.is_some() {
+                        break;
                     }
                 }
             }

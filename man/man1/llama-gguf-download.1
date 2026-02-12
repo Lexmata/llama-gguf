@@ -1,0 +1,66 @@
+.\" Man page for llama-gguf-download
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-DOWNLOAD 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-download \- download a model from HuggingFace Hub
+.SH SYNOPSIS
+.B llama-gguf download
+[\fIOPTIONS\fR]
+\fIREPO\fR
+.SH DESCRIPTION
+Download GGUF model files from HuggingFace Hub. If no specific file is
+specified, lists all available GGUF files in the repository.
+.PP
+Requires the \fBhuggingface\fR feature to be compiled in.
+.SH ARGUMENTS
+.TP
+.I REPO
+HuggingFace repository identifier. Format: \fBowner/repo-name\fR.
+Example: \fBQwen/Qwen2.5-0.5B-Instruct-GGUF\fR.
+.SH OPTIONS
+.TP
+.BR \-f ", " \-\-file " " \fIFILENAME\fR
+Specific file to download from the repository. If not specified, lists
+all available GGUF files.
+.TP
+.BR \-o ", " \-\-output " " \fIDIR\fR
+Download directory. If not specified, uses the system cache directory
+(typically \fI~/.cache/llama-gguf/\fR).
+.TP
+.BR \-\-force
+Force re-download even if the file already exists in the cache.
+.SH EXAMPLES
+List available GGUF files in a repository:
+.PP
+.RS
+.B llama-gguf download Qwen/Qwen2.5-0.5B-Instruct-GGUF
+.RE
+.PP
+Download a specific quantized model:
+.PP
+.RS
+.B llama-gguf download Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q4_k_m.gguf
+.RE
+.PP
+Download to a custom directory:
+.PP
+.RS
+.B llama-gguf download TheBloke/Mistral-7B-v0.1-GGUF -f mistral-7b-v0.1.Q4_K_M.gguf -o ./models
+.RE
+.PP
+Force re-download:
+.PP
+.RS
+.B llama-gguf download Qwen/Qwen2.5-0.5B-Instruct-GGUF -f model.gguf --force
+.RE
+.SH FILES
+.TP
+.I ~/.cache/llama-gguf/
+Default model cache directory. Downloaded models are organized by
+repository name.
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-models (1),
+.BR llama-gguf-run (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

@@ -384,8 +384,8 @@ unsafe fn sum_f32_avx2(a: &[f32]) -> f32 {
 
     let mut result = hsum_avx2(sum);
 
-    for i in (chunks * 8)..n {
-        result += a[i];
+    for item in a.iter().take(n).skip(chunks * 8) {
+        result += item;
     }
 
     result
@@ -460,8 +460,8 @@ unsafe fn max_f32_avx2(a: &[f32]) -> f32 {
 
     let mut result = _mm_cvtss_f32(max32);
 
-    for i in (chunks * 8)..n {
-        result = result.max(a[i]);
+    for item in a.iter().take(n).skip(chunks * 8) {
+        result = result.max(*item);
     }
 
     result
@@ -565,8 +565,8 @@ unsafe fn softmax_inplace_avx2(x: &mut [f32], max_val: f32) {
         _mm256_storeu_ps(x.as_mut_ptr().add(offset), result);
     }
 
-    for i in (chunks * 8)..n {
-        x[i] *= inv_sum;
+    for item in x.iter_mut().take(n).skip(chunks * 8) {
+        *item *= inv_sum;
     }
 }
 
@@ -636,8 +636,8 @@ unsafe fn sum_of_squares_avx2(x: &[f32]) -> f32 {
 
     let mut result = hsum_avx2(sum);
 
-    for i in (chunks * 8)..n {
-        result += x[i] * x[i];
+    for item in x.iter().take(n).skip(chunks * 8) {
+        result += item * item;
     }
 
     result
@@ -842,29 +842,29 @@ unsafe fn dot_q4_0_neon(weights: &[BlockQ4_0], x: &[f32]) -> f32 {
         // Each block has 16 bytes = 32 nibbles = 32 values
         for chunk in 0..4 {
             let chunk_offset = chunk * 4;
-            
+
             // Extract 4 lo nibbles and 4 hi nibbles
             let mut lo_vals = [0.0f32; 4];
             let mut hi_vals = [0.0f32; 4];
-            
+
             for i in 0..4 {
                 let byte = block.qs[chunk_offset + i];
                 lo_vals[i] = ((byte & 0x0F) as i32 - 8) as f32;
                 hi_vals[i] = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
             }
-            
+
             // Load x values
             let x_lo = vld1q_f32(x.as_ptr().add(offset + chunk_offset));
             let x_hi = vld1q_f32(x.as_ptr().add(offset + chunk_offset + 16));
-            
+
             // Load quantized values as f32
             let q_lo = vld1q_f32(lo_vals.as_ptr());
             let q_hi = vld1q_f32(hi_vals.as_ptr());
-            
+
             // Compute: sum += d * q * x
             let scaled_lo = vmulq_f32(q_lo, vd);
             let scaled_hi = vmulq_f32(q_hi, vd);
-            
+
             sum = vfmaq_f32(sum, scaled_lo, x_lo);
             sum = vfmaq_f32(sum, scaled_hi, x_hi);
         }

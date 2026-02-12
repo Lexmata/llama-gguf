@@ -6,7 +6,6 @@
 use cudarc::driver::{CudaDevice, CudaSlice};
 use std::sync::Arc;
 
-
 use crate::backend::{BackendError, BackendResult};
 use crate::tensor::{DType, Tensor};
 
@@ -25,7 +24,7 @@ impl GpuWeight {
     pub fn from_tensor(device: &Arc<CudaDevice>, tensor: &Tensor) -> BackendResult<Self> {
         let shape = tensor.shape().to_vec();
         let numel: usize = shape.iter().product();
-        
+
         // Get F32 data, dequantizing if needed
         let f32_data: Vec<f32> = if tensor.dtype() == DType::F32 {
             tensor.as_f32()?.to_vec()
@@ -35,11 +34,12 @@ impl GpuWeight {
             crate::backend::cpu::ops::dequantize(tensor, &mut dequant)?;
             dequant.as_f32()?.to_vec()
         };
-        
+
         // Upload to GPU
-        let data = device.htod_sync_copy(&f32_data)
+        let data = device
+            .htod_sync_copy(&f32_data)
             .map_err(|e| BackendError::AllocationFailed(format!("GPU upload failed: {}", e)))?;
-        
+
         Ok(Self { data, shape, numel })
     }
 }
@@ -59,22 +59,25 @@ pub struct GpuLinear {
 impl GpuLinear {
     /// Create from CPU linear layer
     pub fn from_linear(
-        device: &Arc<CudaDevice>, 
-        weight: &Tensor, 
-        bias: Option<&Tensor>
+        device: &Arc<CudaDevice>,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
     ) -> BackendResult<Self> {
         let gpu_weight = GpuWeight::from_tensor(device, weight)?;
         let in_features = gpu_weight.shape[0];
         let out_features = gpu_weight.shape[1];
-        
+
         let gpu_bias = if let Some(b) = bias {
             let bias_data = b.as_f32()?;
-            Some(device.htod_sync_copy(bias_data)
-                .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?)
+            Some(
+                device
+                    .htod_sync_copy(bias_data)
+                    .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
+            )
         } else {
             None
         };
-        
+
         Ok(Self {
             weight: gpu_weight,
             bias: gpu_bias,
@@ -96,13 +99,18 @@ pub struct GpuRMSNorm {
 
 impl GpuRMSNorm {
     /// Create from CPU RMSNorm
-    pub fn from_rms_norm(device: &Arc<CudaDevice>, weight: &Tensor, eps: f32) -> BackendResult<Self> {
+    pub fn from_rms_norm(
+        device: &Arc<CudaDevice>,
+        weight: &Tensor,
+        eps: f32,
+    ) -> BackendResult<Self> {
         let weight_data = weight.as_f32()?;
         let hidden_size = weight_data.len();
-        
-        let gpu_weight = device.htod_sync_copy(weight_data)
+
+        let gpu_weight = device
+            .htod_sync_copy(weight_data)
             .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
-        
+
         Ok(Self {
             weight: gpu_weight,
             eps,
@@ -125,9 +133,9 @@ pub struct GpuAttention {
 
 /// GPU-resident FFN layer
 pub struct GpuFFN {
-    pub w1: GpuLinear,  // gate
-    pub w2: GpuLinear,  // down
-    pub w3: GpuLinear,  // up
+    pub w1: GpuLinear, // gate
+    pub w2: GpuLinear, // down
+    pub w3: GpuLinear, // up
 }
 
 /// GPU-resident transformer layer
@@ -156,14 +164,21 @@ pub struct GpuKVCache {
 
 impl GpuKVCache {
     /// Create new KV cache
-    pub fn new(device: &Arc<CudaDevice>, num_kv_heads: usize, max_seq_len: usize, head_dim: usize) -> BackendResult<Self> {
+    pub fn new(
+        device: &Arc<CudaDevice>,
+        num_kv_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+    ) -> BackendResult<Self> {
         let cache_size = num_kv_heads * max_seq_len * head_dim;
-        
-        let k_cache = device.alloc_zeros::<f32>(cache_size)
+
+        let k_cache = device
+            .alloc_zeros::<f32>(cache_size)
             .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
-        let v_cache = device.alloc_zeros::<f32>(cache_size)
+        let v_cache = device
+            .alloc_zeros::<f32>(cache_size)
             .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
-        
+
         Ok(Self {
             k_cache,
             v_cache,
@@ -173,7 +188,7 @@ impl GpuKVCache {
             head_dim,
         })
     }
-    
+
     /// Reset cache
     pub fn reset(&mut self) {
         self.pos = 0;
@@ -219,9 +234,9 @@ pub struct GpuScratchBuffers {
     pub ffn_up: CudaSlice<f32>,
     pub ffn_out: CudaSlice<f32>,
     /// Query/Key/Value projections
-    pub q: CudaSlice<f32>,  // [num_heads * head_dim]
-    pub k: CudaSlice<f32>,  // [num_kv_heads * head_dim]
-    pub v: CudaSlice<f32>,  // [num_kv_heads * head_dim]
+    pub q: CudaSlice<f32>, // [num_heads * head_dim]
+    pub k: CudaSlice<f32>, // [num_kv_heads * head_dim]
+    pub v: CudaSlice<f32>, // [num_kv_heads * head_dim]
     /// Attention scores [num_heads, kv_len]
     pub attn_scores: CudaSlice<f32>,
     /// Output logits [vocab_size]
@@ -240,27 +255,38 @@ impl GpuScratchBuffers {
         vocab_size: usize,
     ) -> BackendResult<Self> {
         Ok(Self {
-            hidden: device.alloc_zeros::<f32>(hidden_size)
+            hidden: device
+                .alloc_zeros::<f32>(hidden_size)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            residual: device.alloc_zeros::<f32>(hidden_size)
+            residual: device
+                .alloc_zeros::<f32>(hidden_size)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            attn_out: device.alloc_zeros::<f32>(hidden_size)
+            attn_out: device
+                .alloc_zeros::<f32>(hidden_size)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            ffn_gate: device.alloc_zeros::<f32>(intermediate_size)
+            ffn_gate: device
+                .alloc_zeros::<f32>(intermediate_size)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            ffn_up: device.alloc_zeros::<f32>(intermediate_size)
+            ffn_up: device
+                .alloc_zeros::<f32>(intermediate_size)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            ffn_out: device.alloc_zeros::<f32>(hidden_size)
+            ffn_out: device
+                .alloc_zeros::<f32>(hidden_size)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            q: device.alloc_zeros::<f32>(num_heads * head_dim)
+            q: device
+                .alloc_zeros::<f32>(num_heads * head_dim)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            k: device.alloc_zeros::<f32>(num_kv_heads * head_dim)
+            k: device
+                .alloc_zeros::<f32>(num_kv_heads * head_dim)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            v: device.alloc_zeros::<f32>(num_kv_heads * head_dim)
+            v: device
+                .alloc_zeros::<f32>(num_kv_heads * head_dim)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            attn_scores: device.alloc_zeros::<f32>(num_heads * max_seq_len)
+            attn_scores: device
+                .alloc_zeros::<f32>(num_heads * max_seq_len)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
-            logits: device.alloc_zeros::<f32>(vocab_size)
+            logits: device
+                .alloc_zeros::<f32>(vocab_size)
                 .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?,
         })
     }

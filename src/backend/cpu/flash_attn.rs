@@ -149,8 +149,8 @@ pub fn flash_attention(
                         if score > max_score {
                             // New maximum - rescale previous accumulations
                             let rescale = (max_score - score).exp();
-                            for d in 0..head_dim {
-                                output[d] *= rescale;
+                            for out_val in output.iter_mut().take(head_dim) {
+                                *out_val *= rescale;
                             }
                             sum_exp *= rescale;
                             max_score = score;

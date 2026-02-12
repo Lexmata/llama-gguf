@@ -1,0 +1,189 @@
+.\" Man page for llama-gguf
+.\" Copyright (c) 2026 Lexmata LLC
+.\" Licensed under MIT OR Apache-2.0
+.TH LLAMA-GGUF 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf \- high-performance LLM inference engine with GGUF support
+.SH SYNOPSIS
+.B llama-gguf
+[\fB\-c\fR \fICONFIG\fR]
+\fICOMMAND\fR
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B llama-gguf
+is a high-performance Rust implementation of llama.cpp, providing LLM inference
+capabilities with full GGUF file format support. It supports multiple model
+architectures including LLaMA, Mistral, Qwen2, TinyLlama, and DeepSeek.
+.PP
+The tool provides commands for running inference, interactive chat, serving
+an OpenAI-compatible HTTP API, model quantization, benchmarking, and more.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Path to TOML configuration file. If not specified, searches for
+\fIllama-gguf.toml\fR, \fIconfig/llama-gguf.toml\fR, or \fI.llama-gguf.toml\fR
+in the current directory. Can also be set via the \fBLLAMA_CONFIG\fR
+environment variable.
+.TP
+.BR \-h ", " \-\-help
+Print help information.
+.TP
+.BR \-V ", " \-\-version
+Print version information.
+.SH COMMANDS
+.TP
+.BR info " " \fIMODEL\fR
+Show information about a GGUF model file. See \fBllama-gguf-info\fR(1).
+.TP
+.BR run " " \fIMODEL\fR
+Run inference on a model. See \fBllama-gguf-run\fR(1).
+.TP
+.BR chat " " [\fIMODEL\fR]
+Interactive chat mode with local or remote model. See \fBllama-gguf-chat\fR(1).
+.TP
+.BR serve " " \fIMODEL\fR
+Start HTTP server with OpenAI-compatible API. See \fBllama-gguf-serve\fR(1).
+Requires the \fBserver\fR feature.
+.TP
+.BR quantize " " \fIINPUT\fR " " \fIOUTPUT\fR
+Quantize a model to a different format. See \fBllama-gguf-quantize\fR(1).
+.TP
+.BR sysinfo
+Show system information and capabilities. See \fBllama-gguf-sysinfo\fR(1).
+.TP
+.BR bench " " \fIMODEL\fR
+Benchmark model performance. See \fBllama-gguf-bench\fR(1).
+.TP
+.BR embed " " \fIMODEL\fR
+Extract embeddings from text. See \fBllama-gguf-embed\fR(1).
+.TP
+.BR download " " \fIREPO\fR
+Download a model from HuggingFace Hub. See \fBllama-gguf-download\fR(1).
+Requires the \fBhuggingface\fR feature.
+.TP
+.BR models " " \fIACTION\fR
+Manage local model cache. See \fBllama-gguf-models\fR(1).
+Requires the \fBhuggingface\fR feature.
+.TP
+.BR rag " " \fIACTION\fR
+RAG (Retrieval-Augmented Generation) operations. See \fBllama-gguf-rag\fR(1).
+Requires the \fBrag\fR feature.
+.TP
+.BR init-config
+Generate an example TOML configuration file.
+.SH CONFIGURATION
+Configuration can be provided via command-line arguments, environment variables,
+or a TOML configuration file. The precedence order is:
+.PP
+.RS
+CLI arguments > Environment variables > Config file > Defaults
+.RE
+.PP
+Generate an example configuration file with:
+.PP
+.RS
+.B llama-gguf init-config
+.RE
+.SH SUPPORTED MODELS
+.TS
+tab(;);
+l l l.
+\fBModel\fR;\fBRoPE Type\fR;\fBNotes\fR
+LLaMA/LLaMA2/LLaMA3;Normal;Standard architecture
+Mistral;Normal;Use [INST]...[/INST] format
+Qwen2/Qwen2.5;NeoX;Uses attention biases
+TinyLlama;Normal;GQA with 4 KV heads
+DeepSeek-Coder;Normal;Linear RoPE scaling
+.TE
+.SH QUANTIZATION FORMATS
+.TS
+tab(;);
+l l l.
+\fBFormat\fR;\fBBits\fR;\fBQuality\fR
+Q2_K;2;Low
+Q3_K;3;Fair
+Q4_K_M;4;Good
+Q5_K_M;5;Better
+Q6_K;6;High
+Q8_0;8;Excellent
+F16;16;Full precision
+.TE
+.SH EXAMPLES
+Show model information:
+.PP
+.RS
+.B llama-gguf info model.gguf
+.RE
+.PP
+Run inference with custom parameters:
+.PP
+.RS
+.B llama-gguf run model.gguf -p "Hello, world!" -n 50 --temperature 0.7
+.RE
+.PP
+Start interactive chat:
+.PP
+.RS
+.B llama-gguf chat model.gguf --system "You are a helpful assistant."
+.RE
+.PP
+Connect to a remote server:
+.PP
+.RS
+.B llama-gguf chat --server http://localhost:8080
+.RE
+.PP
+Start HTTP server:
+.PP
+.RS
+.B llama-gguf serve model.gguf --host 0.0.0.0 --port 8080
+.RE
+.PP
+Download a model from HuggingFace:
+.PP
+.RS
+.B llama-gguf download Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q4_k_m.gguf
+.RE
+.SH ENVIRONMENT
+.TP
+.B LLAMA_CONFIG
+Path to configuration file (overridden by \fB--config\fR).
+.TP
+.B LLAMA_SERVER
+URL of remote server for chat mode (overridden by \fB--server\fR).
+.TP
+.B RAG_DATABASE_URL
+PostgreSQL connection string for RAG operations.
+.SH FILES
+.TP
+.I llama-gguf.toml
+Default configuration file in current directory.
+.TP
+.I ~/.cache/llama-gguf/
+Default model cache directory.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error occurred (invalid arguments, model load failure, etc.).
+.SH SEE ALSO
+.BR llama-gguf-info (1),
+.BR llama-gguf-run (1),
+.BR llama-gguf-chat (1),
+.BR llama-gguf-serve (1),
+.BR llama-gguf-quantize (1),
+.BR llama-gguf-bench (1),
+.BR llama-gguf-embed (1),
+.BR llama-gguf-download (1),
+.BR llama-gguf-models (1),
+.BR llama-gguf-rag (1),
+.BR llama-gguf-sysinfo (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>
+.SH BUGS
+Report bugs at: https://github.com/Lexmata/llama-gguf/issues
+.SH COPYRIGHT
+Copyright \(co 2026 Lexmata LLC.
+Licensed under MIT OR Apache-2.0.

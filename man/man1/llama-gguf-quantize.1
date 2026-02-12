@@ -1,0 +1,63 @@
+.\" Man page for llama-gguf-quantize
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-QUANTIZE 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-quantize \- quantize a model to a different format
+.SH SYNOPSIS
+.B llama-gguf quantize
+[\fIOPTIONS\fR]
+\fIINPUT\fR
+\fIOUTPUT\fR
+.SH DESCRIPTION
+Analyze and quantize a GGUF model to a different quantization format.
+Quantization reduces model size at the cost of some accuracy.
+.PP
+.B Note:
+Full quantization output is not yet implemented. This command currently
+analyzes the model and estimates the output size.
+.SH ARGUMENTS
+.TP
+.I INPUT
+Path to the input GGUF model file.
+.TP
+.I OUTPUT
+Path for the output quantized model file.
+.SH OPTIONS
+.TP
+.BR \-t ", " \-\-qtype " " \fITYPE\fR
+Target quantization type. Default: q4_0.
+Supported types: q4_0, q4_1, q5_0, q5_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k.
+.TP
+.BR \-\-threads " " \fIN\fR
+Number of threads to use for quantization.
+.SH QUANTIZATION TYPES
+.TS
+tab(;);
+l l l l.
+\fBType\fR;\fBBits\fR;\fBQuality\fR;\fBSize (7B)\fR
+q2_k;2;Low;~2.5 GB
+q3_k;3;Fair;~3.0 GB
+q4_0;4;Good;~3.8 GB
+q4_k;4;Good+;~4.0 GB
+q5_0;5;Better;~4.5 GB
+q5_k;5;Better+;~5.0 GB
+q6_k;6;High;~5.5 GB
+q8_0;8;Excellent;~7.0 GB
+.TE
+.SH EXAMPLES
+Quantize to Q4_0:
+.PP
+.RS
+.B llama-gguf quantize model-f16.gguf model-q4_0.gguf -t q4_0
+.RE
+.PP
+Quantize to Q5_K with custom thread count:
+.PP
+.RS
+.B llama-gguf quantize model-f16.gguf model-q5k.gguf -t q5_k --threads 8
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-info (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>

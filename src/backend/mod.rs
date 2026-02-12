@@ -3,10 +3,12 @@
 //! This module defines the `Backend` trait which provides an abstraction
 //! over different hardware implementations (CPU, CUDA, Vulkan, Metal, etc.)
 
-mod error;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod dx12;
+mod error;
+pub mod metal;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
 

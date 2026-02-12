@@ -1,0 +1,53 @@
+.\" Man page for llama-gguf-info
+.\" Copyright (c) 2026 Lexmata LLC
+.TH LLAMA-GGUF-INFO 1 "February 2026" "llama-gguf 0.5.2" "User Commands"
+.SH NAME
+llama-gguf-info \- display information about a GGUF model file
+.SH SYNOPSIS
+.B llama-gguf info
+[\fB\-v\fR]
+\fIMODEL\fR
+.SH DESCRIPTION
+Display detailed information about a GGUF model file, including architecture,
+model parameters, tokenizer configuration, and tensor information.
+.SH ARGUMENTS
+.TP
+.I MODEL
+Path to the GGUF model file.
+.SH OPTIONS
+.TP
+.BR \-v ", " \-\-verbose
+Show all metadata and complete tensor listing. Without this flag, only
+the first 10 tensors are displayed.
+.SH OUTPUT
+The command displays information in sections:
+.TP
+.B General
+Model architecture, name, author, quantization version, and file type.
+.TP
+.B Model Parameters
+Context length, embedding size, feed-forward size, layer count,
+attention heads, KV heads, RMS norm epsilon, and RoPE frequency base.
+.TP
+.B Tokenizer
+Tokenizer model type, BOS/EOS/PAD token IDs.
+.TP
+.B Tensors
+List of model tensors with their names, dimensions, and data types.
+.SH EXAMPLES
+Show basic model information:
+.PP
+.RS
+.B llama-gguf info model.gguf
+.RE
+.PP
+Show all metadata and tensors:
+.PP
+.RS
+.B llama-gguf info -v model.gguf
+.RE
+.SH SEE ALSO
+.BR llama-gguf (1),
+.BR llama-gguf-run (1)
+.SH AUTHORS
+Lexmata LLC <jquinn@lexmata.ai>
