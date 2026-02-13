@@ -370,6 +370,35 @@ pub struct RetrieveAndGenerateResponse {
 }
 
 // =============================================================================
+// Reranking
+// =============================================================================
+
+/// Rerank retrieved chunks according to the given reranking configuration.
+///
+/// - `ScoreBased` — sort by score descending.
+/// - `RRF { k }` — sort by score descending (RRF scoring already happened at store level).
+/// - `CrossEncoder { model_path }` — log a warning and fall back to score-based sort.
+pub fn rerank(mut chunks: Vec<RetrievedChunk>, config: &RerankingConfig) -> Vec<RetrievedChunk> {
+    match &config.method {
+        RerankingMethod::ScoreBased => {
+            chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        RerankingMethod::RRF { k: _ } => {
+            // RRF scoring already happened at the store level; just sort by score descending.
+            chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        RerankingMethod::CrossEncoder { model_path } => {
+            tracing::warn!(
+                "CrossEncoder reranking with model '{}' is not yet implemented; falling back to score-based sort",
+                model_path
+            );
+            chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    chunks
+}
+
+// =============================================================================
 // Knowledge Base Implementation
 // =============================================================================
 
@@ -502,11 +531,16 @@ impl KnowledgeBase {
         };
 
         // Convert to retrieved chunks
-        let chunks = docs
+        let mut chunks: Vec<RetrievedChunk> = docs
             .into_iter()
             .filter(|d| d.score.unwrap_or(0.0) >= config.min_score)
             .map(|d| self.doc_to_chunk(d))
             .collect();
+
+        // Apply reranking if configured
+        if let Some(reranking_config) = &self.config.reranking {
+            chunks = rerank(chunks, reranking_config);
+        }
 
         Ok(RetrievalResponse {
             chunks,
@@ -1019,5 +1053,52 @@ impl KnowledgeBaseBuilder {
         }
 
         Ok(kb)
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rerank_score_based() {
+        let low = RetrievedChunk {
+            content: "low score chunk".into(),
+            score: 0.3,
+            source: SourceLocation {
+                source_type: "document".into(),
+                uri: "low.txt".into(),
+                location: None,
+            },
+            metadata: None,
+        };
+        let high = RetrievedChunk {
+            content: "high score chunk".into(),
+            score: 0.9,
+            source: SourceLocation {
+                source_type: "document".into(),
+                uri: "high.txt".into(),
+                location: None,
+            },
+            metadata: None,
+        };
+
+        // Feed them in low-first order
+        let chunks = vec![low, high];
+        let config = RerankingConfig {
+            num_candidates: 10,
+            method: RerankingMethod::ScoreBased,
+        };
+
+        let result = rerank(chunks, &config);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].content, "high score chunk");
+        assert_eq!(result[1].content, "low score chunk");
+        assert!(result[0].score > result[1].score);
     }
 }
