@@ -58,7 +58,7 @@ impl EmbeddingGenerator {
     pub fn embed(&self, text: &str) -> RagResult<Vec<f32>> {
         let mut ctx = InferenceContext::new(self.model.config(), Arc::clone(&self.backend));
         self.extractor
-            .embed_text(self.model.as_ref(), &*self.tokenizer, &mut ctx, text)
+            .embed_text(self.model.as_ref(), &self.tokenizer, &mut ctx, text)
             .map_err(|e| RagError::EmbeddingError(e.to_string()))
     }
 
@@ -66,7 +66,7 @@ impl EmbeddingGenerator {
     pub fn embed_batch(&self, texts: &[&str]) -> RagResult<Vec<Vec<f32>>> {
         let mut ctx = InferenceContext::new(self.model.config(), Arc::clone(&self.backend));
         self.extractor
-            .embed_batch(self.model.as_ref(), &*self.tokenizer, &mut ctx, texts)
+            .embed_batch(self.model.as_ref(), &self.tokenizer, &mut ctx, texts)
             .map_err(|e| RagError::EmbeddingError(e.to_string()))
     }
 
