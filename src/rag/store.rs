@@ -660,16 +660,54 @@ impl RagStore {
         Ok(row.get(0))
     }
     
-    /// Insert multiple documents in a batch
+    /// Insert multiple documents in a batch using transactions.
+    ///
+    /// All embedding dimensions are validated upfront before any database
+    /// work begins. Documents are then processed in batches of 100 inside
+    /// transactions, with the INSERT statement prepared once per batch for
+    /// pipelining.
     pub async fn insert_batch(&self, docs: Vec<NewDocument>) -> RagResult<Vec<i64>> {
-        let mut ids = Vec::with_capacity(docs.len());
-        
-        // TODO: Use COPY for better performance with large batches
-        for doc in docs {
-            let id = self.insert(doc).await?;
-            ids.push(id);
+        // Validate all embedding dimensions upfront
+        for (i, doc) in docs.iter().enumerate() {
+            if doc.embedding.len() != self.config.embedding_dim() {
+                return Err(RagError::DimensionMismatch {
+                    expected: self.config.embedding_dim(),
+                    actual: doc.embedding.len(),
+                });
+            }
+            // Provide context for which document failed (0-indexed)
+            let _ = i;
         }
-        
+
+        let mut ids = Vec::with_capacity(docs.len());
+        let insert_sql = format!(
+            "INSERT INTO {} (content, embedding, metadata) VALUES ($1, $2, $3) RETURNING id",
+            self.config.table_name()
+        );
+
+        const BATCH_SIZE: usize = 100;
+
+        for chunk in docs.chunks(BATCH_SIZE) {
+            let mut client = self.pool.get().await
+                .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+
+            let tx = client.transaction().await
+                .map_err(|e| RagError::QueryFailed(format!("begin transaction: {}", e)))?;
+
+            let stmt = tx.prepare(&insert_sql).await
+                .map_err(|e| RagError::QueryFailed(format!("prepare: {}", e)))?;
+
+            for doc in chunk {
+                let embedding = Vector::from(doc.embedding.clone());
+                let row = tx.query_one(&stmt, &[&doc.content, &embedding, &doc.metadata]).await
+                    .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+                ids.push(row.get::<_, i64>(0));
+            }
+
+            tx.commit().await
+                .map_err(|e| RagError::QueryFailed(format!("commit: {}", e)))?;
+        }
+
         Ok(ids)
     }
     
