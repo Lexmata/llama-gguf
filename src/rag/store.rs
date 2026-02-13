@@ -659,7 +659,50 @@ impl RagStore {
         
         Ok(row.get(0))
     }
-    
+
+    /// Insert or update a document.
+    ///
+    /// When `id` is `Some` and a row with that ID already exists, the
+    /// content, embedding, and metadata columns are updated. When `id` is
+    /// `None` a new row is inserted. In both cases the row ID is returned.
+    pub async fn upsert(&self, id: Option<i64>, doc: NewDocument) -> RagResult<i64> {
+        if doc.embedding.len() != self.config.embedding_dim() {
+            return Err(RagError::DimensionMismatch {
+                expected: self.config.embedding_dim(),
+                actual: doc.embedding.len(),
+            });
+        }
+
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+
+        let embedding = Vector::from(doc.embedding);
+
+        if let Some(id) = id {
+            let query = format!(
+                r#"INSERT INTO {} (id, content, embedding, metadata)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (id) DO UPDATE
+                   SET content = EXCLUDED.content,
+                       embedding = EXCLUDED.embedding,
+                       metadata = EXCLUDED.metadata
+                   RETURNING id"#,
+                self.config.table_name()
+            );
+            let row = client.query_one(&query, &[&id, &doc.content, &embedding, &doc.metadata]).await
+                .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+            Ok(row.get(0))
+        } else {
+            let query = format!(
+                "INSERT INTO {} (content, embedding, metadata) VALUES ($1, $2, $3) RETURNING id",
+                self.config.table_name()
+            );
+            let row = client.query_one(&query, &[&doc.content, &embedding, &doc.metadata]).await
+                .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+            Ok(row.get(0))
+        }
+    }
+
     /// Insert multiple documents in a batch using transactions.
     ///
     /// All embedding dimensions are validated upfront before any database
@@ -1088,6 +1131,17 @@ impl RagStore {
     /// Get the configuration
     pub fn config(&self) -> &RagConfig {
         &self.config
+    }
+
+    /// Verify the database connection is alive by executing `SELECT 1`.
+    pub async fn health_check(&self) -> RagResult<()> {
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+
+        client.query_one("SELECT 1", &[]).await
+            .map_err(|e| RagError::QueryFailed(format!("health check failed: {}", e)))?;
+
+        Ok(())
     }
 }
 
