@@ -2,6 +2,9 @@
 
 A high-performance Rust implementation of [llama.cpp](https://github.com/ggerganov/llama.cpp) - an LLM inference engine with full GGUF and ONNX support.
 
+[![Crates.io](https://img.shields.io/crates/v/llama-gguf.svg)](https://crates.io/crates/llama-gguf)
+[![License](https://img.shields.io/crates/l/llama-gguf.svg)](LICENSE-MIT)
+
 ## Features
 
 - **Full GGUF Support** - Load any GGUF model file compatible with llama.cpp
@@ -10,11 +13,19 @@ A high-performance Rust implementation of [llama.cpp](https://github.com/ggergan
 - **Quantization** - All K-quant formats (Q2_K through Q8_0) plus F16/F32
 - **HuggingFace Integration** - Download models directly from HuggingFace Hub
 - **Fast CPU Inference** - SIMD-optimized (AVX2, AVX-512, NEON)
-- **CUDA GPU Acceleration** - NVIDIA GPU support with custom CUDA kernels
+- **Multi-GPU Support** - CUDA (NVIDIA), Metal (Apple Silicon), DX12 (Windows), Vulkan (cross-platform)
+- **RAG** - Retrieval-Augmented Generation with PostgreSQL/pgvector vector store
+- **OpenAI-compatible API** - HTTP server with streaming support
 - **Grouped Query Attention** - Efficient KV cache for GQA models
 - **Streaming Output** - Token-by-token generation
 
 ## Installation
+
+### From crates.io
+
+```bash
+cargo install llama-gguf
+```
 
 ### From Source
 
@@ -70,11 +81,9 @@ man llama-gguf-rag       # RAG operations
 
 ### As a Library
 
-Add to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-llama-gguf = { git = "https://github.com/Lexmata/llama-gguf.git" }
+llama-gguf = "0.6"
 ```
 
 ## Quick Start
@@ -95,7 +104,7 @@ llama-gguf download Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q4_
 # Basic text generation (GGUF)
 llama-gguf run model.gguf -p "Hello, world!" -n 50
 
-# ONNX model (requires config.json and tokenizer.json in the same directory)
+# ONNX model (requires config.json and tokenizer.json in same directory)
 llama-gguf run model.onnx -p "Hello, world!" -n 50
 
 # With sampling parameters
@@ -137,6 +146,165 @@ See [MODEL_COMPATIBILITY.md](docs/MODEL_COMPATIBILITY.md) for detailed compatibi
 | Q6_K | 6 | High | ~5.5 GB |
 | Q8_0 | 8 | Excellent | ~7.0 GB |
 | F16 | 16 | Full | ~14 GB |
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `cpu` | ✅ | CPU backend with SIMD (AVX2, AVX-512, NEON) |
+| `huggingface` | ✅ | HuggingFace Hub model downloading |
+| `cli` | ✅ | Command-line interface |
+| `client` | ✅ | HTTP client for remote inference |
+| `onnx` | ✅ | ONNX model loading via HuggingFace Optimum |
+| `cuda` | | NVIDIA GPU acceleration via CUDA |
+| `metal` | | Apple Silicon GPU acceleration via Metal |
+| `dx12` | | Windows GPU acceleration via DirectX 12 |
+| `vulkan` | | Cross-platform GPU acceleration via Vulkan |
+| `server` | | HTTP server with OpenAI-compatible API |
+| `rag` | | RAG with PostgreSQL/pgvector vector store |
+
+## GPU Acceleration
+
+### CUDA (NVIDIA GPUs)
+
+```bash
+CUDA_PATH=/opt/cuda cargo build --release --features cuda
+llama-gguf run model.gguf -p "Hello" --gpu
+```
+
+Requires NVIDIA GPU with compute capability 6.0+ and CUDA Toolkit 12.0+.
+
+### Metal (Apple Silicon / macOS)
+
+```bash
+cargo build --release --features metal
+llama-gguf run model.gguf -p "Hello" --gpu
+```
+
+Requires macOS with Metal-capable GPU.
+
+### DirectX 12 (Windows)
+
+```bash
+cargo build --release --features dx12
+llama-gguf run model.gguf -p "Hello" --gpu
+```
+
+Requires Windows 10+ with a DirectX 12 compatible GPU.
+
+### Vulkan (Cross-platform)
+
+```bash
+cargo build --release --features vulkan
+llama-gguf run model.gguf -p "Hello" --gpu
+```
+
+Requires Vulkan SDK and a Vulkan-capable GPU.
+
+**GPU-accelerated operations:**
+- Element-wise: add, mul, scale
+- Activations: SiLU, GELU
+- Normalization: RMS norm
+- Softmax
+- RoPE positional embeddings
+- Vector-matrix multiplication (f32)
+
+*Note: Quantized matrix operations currently fall back to CPU. Full GPU quantized inference is planned.*
+
+## RAG (Retrieval-Augmented Generation)
+
+pgvector-backed vector store for retrieval-augmented generation. Enable with `--features rag`.
+
+### Setup
+
+Requires PostgreSQL with the [pgvector](https://github.com/pgvector/pgvector) extension:
+
+```bash
+# Docker (quickstart)
+docker run -d --name pgvector -p 5432:5432 \
+  -e POSTGRES_PASSWORD=password \
+  pgvector/pgvector:pg16
+```
+
+### Library Usage
+
+```rust
+use llama_gguf::{RagConfig, RagStore, NewDocument};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = RagConfig::new("postgresql://user:pass@localhost/mydb")
+        .with_table_name("documents")
+        .with_dimensions(384);
+
+    let store = RagStore::new(config).await?;
+    store.create_table().await?;
+
+    // Insert documents
+    let doc = NewDocument {
+        content: "Rust is a systems programming language.".into(),
+        embedding: vec![0.1; 384],
+        metadata: Some(serde_json::json!({"topic": "rust"})),
+    };
+    store.insert(&doc).await?;
+
+    // Semantic search
+    let query_embedding = vec![0.1; 384];
+    let results = store.search(&query_embedding, 10, None).await?;
+
+    for result in results {
+        println!("{}: {}", result.score, result.content);
+    }
+
+    Ok(())
+}
+```
+
+### Features
+
+- **Search modes**: Semantic (vector), keyword (tsvector), and hybrid with Reciprocal Rank Fusion
+- **Distance metrics**: Cosine similarity, L2 distance, inner product
+- **Indexing**: HNSW and IVFFlat with configurable parameters
+- **Metadata filtering**: Eq, In, Range, Contains, and compound AND/OR/NOT filters
+- **KnowledgeBase**: High-level API for document ingestion, chunking, and retrieve-and-generate
+- **Configuration**: TOML files with environment variable overrides
+
+### CLI
+
+```bash
+# Ingest documents
+llama-gguf rag ingest --config rag.toml --source ./docs/
+
+# Search
+llama-gguf rag search --config rag.toml --query "How does authentication work?"
+```
+
+## ONNX Support
+
+llama-gguf can load models exported to ONNX format via [HuggingFace Optimum](https://huggingface.co/docs/optimum/). ONNX support is enabled by default.
+
+**Supported formats:**
+- F32, F16, and BF16 weight tensors (F16/BF16 auto-converted to F32)
+- External data files (`.onnx_data`) for large models
+- Graph-traced tensor name resolution for Optimum exports
+
+**Requirements:**
+
+An ONNX model directory must contain:
+- `model.onnx` — the model graph and weights
+- `config.json` — HuggingFace model configuration
+- `tokenizer.json` — HuggingFace tokenizer
+
+**Exporting a model to ONNX:**
+
+```bash
+pip install optimum[onnxruntime]
+optimum-cli export onnx --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 ./tinyllama-onnx/
+```
+
+```bash
+llama-gguf run ./tinyllama-onnx/model.onnx -p "Hello!" -n 50
+```
 
 ## Library Usage
 
@@ -208,88 +376,8 @@ Run Options:
       --top-p <P>            Top-p (nucleus) sampling [default: 0.9]
       --repeat-penalty <R>   Repetition penalty [default: 1.1]
   -s, --seed <SEED>          Random seed for reproducibility
-      --gpu                  Use GPU acceleration (requires CUDA build)
+      --gpu                  Use GPU acceleration (requires GPU feature)
 ```
-
-## ONNX Support
-
-llama-gguf can load models exported to ONNX format via [HuggingFace Optimum](https://huggingface.co/docs/optimum/). ONNX support is enabled by default.
-
-**Supported formats:**
-- F32, F16, and BF16 weight tensors (F16/BF16 auto-converted to F32)
-- External data files (`.onnx_data`) for large models
-- Graph-traced tensor name resolution for Optimum exports
-
-**Requirements:**
-
-An ONNX model directory must contain:
-- `model.onnx` — the model graph and weights
-- `config.json` — HuggingFace model configuration
-- `tokenizer.json` — HuggingFace tokenizer
-
-**Exporting a model to ONNX:**
-
-```bash
-pip install optimum[onnxruntime]
-optimum-cli export onnx --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 ./tinyllama-onnx/
-```
-
-```bash
-# Run the exported model
-llama-gguf run ./tinyllama-onnx/model.onnx -p "Hello!" -n 50
-```
-
-## Building with Features
-
-```bash
-# CPU + ONNX (default)
-cargo build --release
-
-# Without ONNX support
-cargo build --release --no-default-features --features cpu,huggingface,cli,client
-
-# With CUDA GPU support (requires CUDA toolkit)
-CUDA_PATH=/opt/cuda cargo build --release --features cuda
-
-# With Vulkan support (experimental)
-cargo build --release --features vulkan
-
-# With HTTP server
-cargo build --release --features server
-```
-
-## GPU Acceleration
-
-### CUDA (NVIDIA GPUs)
-
-Enable GPU acceleration with the `--gpu` flag:
-
-```bash
-# Build with CUDA support
-CUDA_PATH=/opt/cuda cargo build --release --features cuda
-
-# Run with GPU acceleration
-llama-gguf run model.gguf -p "Hello" --gpu
-```
-
-**Requirements:**
-- NVIDIA GPU with compute capability 6.0+
-- CUDA Toolkit 12.0+ installed
-- cudarc crate for CUDA bindings
-
-**Currently GPU-accelerated operations:**
-- Element-wise: add, mul, scale
-- Activations: SiLU, GELU
-- Normalization: RMS norm
-- Softmax
-- Vector-matrix multiplication (f32)
-
-**Still using CPU fallback:**
-- Quantized matrix operations (vec_mat_q)
-- Attention computation
-- RoPE positional embeddings
-
-*Note: Performance gains are currently limited as quantized operations remain on CPU. Full GPU acceleration of quantized inference is planned.*
 
 ## Performance
 
@@ -322,6 +410,7 @@ at your option.
 
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) - The original implementation
 - [GGML](https://github.com/ggerganov/ggml) - Tensor library and GGUF format
+- [pgvector](https://github.com/pgvector/pgvector) - PostgreSQL vector similarity search
 
 ---
 
