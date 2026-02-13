@@ -1,6 +1,6 @@
 [package]
 name = "llama-gguf"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Lexmata LLC <jquinn@lexmata.ai>"]
@@ -29,7 +29,7 @@ vulkan-shaders = []  # Enable build-time shader compilation (requires glslc)
 metal = ["dep:metal", "dep:objc"]
 dx12 = ["dep:windows"]
 server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:futures"]
-rag = ["dep:tokio-postgres", "dep:pgvector", "dep:deadpool-postgres", "dep:tokio", "dep:url"]
+rag = ["dep:tokio-postgres", "dep:pgvector", "dep:deadpool-postgres", "dep:tokio", "dep:url", "dep:glob"]
 huggingface = ["dep:reqwest", "dep:indicatif", "dep:directories"]
 onnx = ["dep:prost"]
 
@@ -74,6 +74,7 @@ tokio-postgres = { version = "0.7", optional = true, features = ["with-serde_jso
 pgvector = { version = "0.4", features = ["postgres"], optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 url = { version = "2.5", optional = true }
+glob = { version = "0.3", optional = true }
 toml = "0.8"
 
 # ONNX protobuf support

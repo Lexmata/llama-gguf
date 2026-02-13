@@ -66,24 +66,24 @@
 //!    ```
 
 #[cfg(feature = "rag")]
+mod store;
+#[cfg(feature = "rag")]
 mod config;
 #[cfg(feature = "rag")]
 mod embedding;
 #[cfg(feature = "rag")]
 mod knowledge_base;
-#[cfg(feature = "rag")]
-mod store;
 
 #[cfg(feature = "rag")]
-pub use config::example_config;
+pub use store::*;
 #[cfg(feature = "rag")]
 pub use config::*;
 #[cfg(feature = "rag")]
 pub use embedding::*;
 #[cfg(feature = "rag")]
-pub use knowledge_base::*;
+pub use config::example_config;
 #[cfg(feature = "rag")]
-pub use store::*;
+pub use knowledge_base::*;
 
 use thiserror::Error;
 
@@ -92,18 +92,21 @@ use thiserror::Error;
 pub enum RagError {
     #[error("Database connection failed: {0}")]
     ConnectionFailed(String),
-
+    
     #[error("Query failed: {0}")]
     QueryFailed(String),
-
+    
     #[error("Embedding dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
-
+    
     #[error("Configuration error: {0}")]
     ConfigError(String),
-
+    
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("Embedding error: {0}")]
+    EmbeddingError(String),
 }
 
 pub type RagResult<T> = Result<T, RagError>;

@@ -19,15 +19,15 @@
 //! let kb = KnowledgeBase::create(KnowledgeBaseConfig {
 //!     name: "my-kb".into(),
 //!     description: Some("My knowledge base".into()),
-//!     chunking: ChunkingStrategy::FixedSize {
-//!         max_tokens: 300,
-//!         overlap_percentage: 20
+//!     chunking: ChunkingStrategy::FixedSize { 
+//!         max_tokens: 300, 
+//!         overlap_percentage: 20 
 //!     },
 //!     ..Default::default()
 //! }).await?;
 //!
 //! // Ingest data
-//! kb.ingest(DataSource::Directory {
+//! kb.ingest(DataSource::Directory { 
 //!     path: "./docs".into(),
 //!     pattern: Some("**/*.md".into()),
 //! }).await?;
@@ -47,9 +47,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::backend::Backend;
+use crate::model::LlamaModel;
+use crate::tokenizer::Tokenizer;
 
 use super::{
-    Document, MetadataFilter, NewDocument, RagConfig, RagError, RagResult, RagStore, TextChunker,
+    Document, EmbeddingGenerator, MetadataFilter, NewDocument, RagConfig, RagError, RagResult,
+    RagStore, SearchType, TextChunker,
 };
 
 // =============================================================================
@@ -187,17 +193,6 @@ impl Default for RetrievalConfig {
     }
 }
 
-/// Type of search to perform
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchType {
-    /// Pure semantic/vector search
-    #[default]
-    Semantic,
-    /// Hybrid: combine semantic and keyword search
-    Hybrid,
-}
-
 /// Reranking configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankingConfig {
@@ -228,7 +223,9 @@ pub enum RerankingMethod {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataSource {
     /// Single file
-    File { path: PathBuf },
+    File {
+        path: PathBuf,
+    },
 
     /// Directory of files
     Directory {
@@ -373,6 +370,35 @@ pub struct RetrieveAndGenerateResponse {
 }
 
 // =============================================================================
+// Reranking
+// =============================================================================
+
+/// Rerank retrieved chunks according to the given reranking configuration.
+///
+/// - `ScoreBased` — sort by score descending.
+/// - `RRF { k }` — sort by score descending (RRF scoring already happened at store level).
+/// - `CrossEncoder { model_path }` — log a warning and fall back to score-based sort.
+pub fn rerank(mut chunks: Vec<RetrievedChunk>, config: &RerankingConfig) -> Vec<RetrievedChunk> {
+    match &config.method {
+        RerankingMethod::ScoreBased => {
+            chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        RerankingMethod::RRF { k: _ } => {
+            // RRF scoring already happened at the store level; just sort by score descending.
+            chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        RerankingMethod::CrossEncoder { model_path } => {
+            tracing::warn!(
+                "CrossEncoder reranking with model '{}' is not yet implemented; falling back to score-based sort",
+                model_path
+            );
+            chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    chunks
+}
+
+// =============================================================================
 // Knowledge Base Implementation
 // =============================================================================
 
@@ -380,6 +406,7 @@ pub struct RetrieveAndGenerateResponse {
 pub struct KnowledgeBase {
     config: KnowledgeBaseConfig,
     store: RagStore,
+    embedding_gen: Option<EmbeddingGenerator>,
 }
 
 impl KnowledgeBase {
@@ -388,13 +415,27 @@ impl KnowledgeBase {
         let store = RagStore::connect(config.storage.clone()).await?;
         store.create_table().await?;
 
-        Ok(Self { config, store })
+        Ok(Self {
+            config,
+            store,
+            embedding_gen: None,
+        })
     }
 
     /// Connect to an existing knowledge base
     pub async fn connect(config: KnowledgeBaseConfig) -> RagResult<Self> {
         let store = RagStore::connect(config.storage.clone()).await?;
-        Ok(Self { config, store })
+        Ok(Self {
+            config,
+            store,
+            embedding_gen: None,
+        })
+    }
+
+    /// Attach an embedding generator to this knowledge base
+    pub fn with_embedding_generator(mut self, emb_gen: EmbeddingGenerator) -> Self {
+        self.embedding_gen = Some(emb_gen);
+        self
     }
 
     /// Get the knowledge base name
@@ -442,9 +483,10 @@ impl KnowledgeBase {
                     .await?;
             }
             DataSource::Url { url, depth: _ } => {
-                result
-                    .failures
-                    .insert(url, "URL ingestion not yet implemented".into());
+                result.failures.insert(
+                    url,
+                    "URL ingestion not yet implemented".into(),
+                );
             }
             DataSource::ObjectStorage {
                 bucket,
@@ -469,21 +511,36 @@ impl KnowledgeBase {
     ) -> RagResult<RetrievalResponse> {
         let config = config.unwrap_or_else(|| self.config.retrieval.clone());
 
-        // Generate query embedding (placeholder - returns zeros)
+        // Generate query embedding
         let query_embedding = self.embed_query(query)?;
 
-        // Perform search
-        let docs = self
-            .store
-            .search_with_filter(&query_embedding, Some(config.max_results), config.filter)
-            .await?;
+        // Dispatch to hybrid or semantic search based on configuration
+        let docs = if self.config.storage.search_type() == SearchType::Hybrid {
+            self.store
+                .search_hybrid(
+                    &query_embedding,
+                    query,
+                    Some(config.max_results),
+                    config.filter,
+                )
+                .await?
+        } else {
+            self.store
+                .search_with_filter(&query_embedding, Some(config.max_results), config.filter)
+                .await?
+        };
 
         // Convert to retrieved chunks
-        let chunks = docs
+        let mut chunks: Vec<RetrievedChunk> = docs
             .into_iter()
             .filter(|d| d.score.unwrap_or(0.0) >= config.min_score)
             .map(|d| self.doc_to_chunk(d))
             .collect();
+
+        // Apply reranking if configured
+        if let Some(reranking_config) = &self.config.reranking {
+            chunks = rerank(chunks, reranking_config);
+        }
 
         Ok(RetrievalResponse {
             chunks,
@@ -557,7 +614,7 @@ impl KnowledgeBase {
     /// Get statistics about the knowledge base
     pub async fn stats(&self) -> RagResult<KnowledgeBaseStats> {
         let document_count = self.store.count().await? as usize;
-
+        
         Ok(KnowledgeBaseStats {
             name: self.config.name.clone(),
             document_count,
@@ -633,7 +690,7 @@ impl KnowledgeBase {
     fn walk_directory_recursive(
         &self,
         path: &std::path::Path,
-        _pattern: Option<&str>,
+        pattern: Option<&str>,
     ) -> RagResult<Vec<PathBuf>> {
         let mut files = Vec::new();
 
@@ -653,13 +710,20 @@ impl KnowledgeBase {
         visit_dir(path, &mut files)
             .map_err(|e| RagError::ConfigError(format!("Failed to read directory: {}", e)))?;
 
+        if let Some(pattern) = pattern {
+            files.retain(|f| {
+                let path_str = f.to_string_lossy();
+                matches_glob_pattern(&path_str, pattern)
+            });
+        }
+
         Ok(files)
     }
 
     fn walk_directory_flat(
         &self,
         path: &std::path::Path,
-        _pattern: Option<&str>,
+        pattern: Option<&str>,
     ) -> RagResult<Vec<PathBuf>> {
         let mut files = Vec::new();
 
@@ -671,6 +735,13 @@ impl KnowledgeBase {
             if path.is_file() {
                 files.push(path);
             }
+        }
+
+        if let Some(pattern) = pattern {
+            files.retain(|f| {
+                let path_str = f.to_string_lossy();
+                matches_glob_pattern(&path_str, pattern)
+            });
         }
 
         Ok(files)
@@ -791,15 +862,22 @@ impl KnowledgeBase {
         }
     }
 
-    fn embed_text(&self, _text: &str) -> RagResult<Vec<f32>> {
-        // Placeholder: return zero vector
-        // In practice, use EmbeddingGenerator or external API
-        Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+    fn embed_text(&self, text: &str) -> RagResult<Vec<f32>> {
+        if let Some(emb) = &self.embedding_gen {
+            emb.embed(text)
+        } else {
+            // Fallback: zero vector (for testing without a model)
+            Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+        }
     }
 
-    fn embed_query(&self, _query: &str) -> RagResult<Vec<f32>> {
-        // Placeholder: return zero vector
-        Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+    fn embed_query(&self, query: &str) -> RagResult<Vec<f32>> {
+        if let Some(emb) = &self.embedding_gen {
+            emb.embed(query)
+        } else {
+            // Fallback: zero vector (for testing without a model)
+            Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+        }
     }
 
     fn doc_to_chunk(&self, doc: Document) -> RetrievedChunk {
@@ -866,6 +944,16 @@ fn chrono_now() -> String {
     format!("{}s", duration.as_secs())
 }
 
+/// Check whether a path string matches a glob pattern.
+///
+/// Uses the `glob` crate's `Pattern` for matching. Returns `false` if the
+/// pattern is invalid.
+fn matches_glob_pattern(path: &str, pattern: &str) -> bool {
+    glob::Pattern::new(pattern)
+        .map(|p| p.matches(path))
+        .unwrap_or(false)
+}
+
 // =============================================================================
 // Builder Pattern
 // =============================================================================
@@ -873,6 +961,9 @@ fn chrono_now() -> String {
 /// Builder for KnowledgeBaseConfig
 pub struct KnowledgeBaseBuilder {
     config: KnowledgeBaseConfig,
+    model: Option<Arc<LlamaModel>>,
+    tokenizer: Option<Arc<Tokenizer>>,
+    backend: Option<Arc<dyn Backend>>,
 }
 
 impl KnowledgeBaseBuilder {
@@ -882,7 +973,23 @@ impl KnowledgeBaseBuilder {
                 name: name.into(),
                 ..Default::default()
             },
+            model: None,
+            tokenizer: None,
+            backend: None,
         }
+    }
+
+    /// Set the model, tokenizer, and backend for real embedding generation
+    pub fn with_model(
+        mut self,
+        model: Arc<LlamaModel>,
+        tokenizer: Arc<Tokenizer>,
+        backend: Arc<dyn Backend>,
+    ) -> Self {
+        self.model = Some(model);
+        self.tokenizer = Some(tokenizer);
+        self.backend = Some(backend);
+        self
     }
 
     pub fn description(mut self, desc: impl Into<String>) -> Self {
@@ -960,6 +1067,78 @@ impl KnowledgeBaseBuilder {
     }
 
     pub async fn create(self) -> RagResult<KnowledgeBase> {
-        KnowledgeBase::create(self.config).await
+        let mut kb = KnowledgeBase::create(self.config).await?;
+
+        // Construct EmbeddingGenerator when model, tokenizer, and backend are all provided
+        if let (Some(model), Some(tokenizer), Some(backend)) =
+            (self.model, self.tokenizer, self.backend)
+        {
+            kb.embedding_gen = Some(EmbeddingGenerator::new(model, tokenizer, backend));
+        }
+
+        Ok(kb)
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rerank_score_based() {
+        let low = RetrievedChunk {
+            content: "low score chunk".into(),
+            score: 0.3,
+            source: SourceLocation {
+                source_type: "document".into(),
+                uri: "low.txt".into(),
+                location: None,
+            },
+            metadata: None,
+        };
+        let high = RetrievedChunk {
+            content: "high score chunk".into(),
+            score: 0.9,
+            source: SourceLocation {
+                source_type: "document".into(),
+                uri: "high.txt".into(),
+                location: None,
+            },
+            metadata: None,
+        };
+
+        // Feed them in low-first order
+        let chunks = vec![low, high];
+        let config = RerankingConfig {
+            num_candidates: 10,
+            method: RerankingMethod::ScoreBased,
+        };
+
+        let result = rerank(chunks, &config);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].content, "high score chunk");
+        assert_eq!(result[1].content, "low score chunk");
+        assert!(result[0].score > result[1].score);
+    }
+
+    #[test]
+    fn test_glob_pattern_matching() {
+        // Markdown files match **/*.md
+        assert!(matches_glob_pattern("docs/readme.md", "**/*.md"));
+
+        // Rust source files match **/*.rs
+        assert!(matches_glob_pattern("src/lib.rs", "**/*.rs"));
+
+        // PNG file does NOT match **/*.md
+        assert!(!matches_glob_pattern("image.png", "**/*.md"));
+
+        // Edge cases
+        assert!(matches_glob_pattern("a.md", "**/*.md"));
+        assert!(!matches_glob_pattern("docs/readme.txt", "**/*.md"));
     }
 }
