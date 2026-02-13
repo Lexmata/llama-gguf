@@ -184,87 +184,101 @@ impl MetadataFilter {
     }
     
     /// Convert the filter to a SQL WHERE clause fragment
-    /// 
-    /// Returns the SQL string and a list of parameter values
-    pub fn to_sql(&self, param_offset: usize) -> (String, Vec<String>) {
+    ///
+    /// Returns the SQL string and a list of parameter values.
+    /// Returns an error if any field name contains invalid characters.
+    pub fn to_sql(&self, param_offset: usize) -> RagResult<(String, Vec<String>)> {
         let mut params = Vec::new();
-        let sql = self.to_sql_inner(param_offset, &mut params);
-        (sql, params)
+        let sql = self.to_sql_inner(param_offset, &mut params)?;
+        Ok((sql, params))
     }
-    
-    fn to_sql_inner(&self, param_offset: usize, params: &mut Vec<String>) -> String {
+
+    fn to_sql_inner(&self, param_offset: usize, params: &mut Vec<String>) -> RagResult<String> {
         match self {
             Self::Eq { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("metadata->>'{}' = ${}", escape_field(field), param_idx)
+                Ok(format!("metadata->>'{}' = ${}", field, param_idx))
             }
-            
+
             Self::Ne { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("metadata->>'{}' != ${}", escape_field(field), param_idx)
+                Ok(format!("metadata->>'{}' != ${}", field, param_idx))
             }
-            
+
             Self::Gt { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric > ${}::numeric", escape_field(field), param_idx)
+                Ok(format!("(metadata->>'{}')::numeric > ${}::numeric", field, param_idx))
             }
-            
+
             Self::Gte { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric >= ${}::numeric", escape_field(field), param_idx)
+                Ok(format!("(metadata->>'{}')::numeric >= ${}::numeric", field, param_idx))
             }
-            
+
             Self::Lt { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric < ${}::numeric", escape_field(field), param_idx)
+                Ok(format!("(metadata->>'{}')::numeric < ${}::numeric", field, param_idx))
             }
-            
+
             Self::Lte { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(json_value_to_string(value));
-                format!("(metadata->>'{}')::numeric <= ${}::numeric", escape_field(field), param_idx)
+                Ok(format!("(metadata->>'{}')::numeric <= ${}::numeric", field, param_idx))
             }
-            
+
             Self::Exists { field } => {
-                format!("metadata ? '{}'", escape_field(field))
+                let field = validate_field_name(field)?;
+                Ok(format!("metadata ? '{}'", field))
             }
-            
+
             Self::NotExists { field } => {
-                format!("NOT (metadata ? '{}')", escape_field(field))
+                let field = validate_field_name(field)?;
+                Ok(format!("NOT (metadata ? '{}')", field))
             }
-            
+
             Self::Contains { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(format!("%{}%", value));
-                format!("metadata->>'{}' ILIKE ${}", escape_field(field), param_idx)
+                Ok(format!("metadata->>'{}' ILIKE ${}", field, param_idx))
             }
-            
+
             Self::StartsWith { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(format!("{}%", value));
-                format!("metadata->>'{}' LIKE ${}", escape_field(field), param_idx)
+                Ok(format!("metadata->>'{}' LIKE ${}", field, param_idx))
             }
-            
+
             Self::EndsWith { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(format!("%{}", value));
-                format!("metadata->>'{}' LIKE ${}", escape_field(field), param_idx)
+                Ok(format!("metadata->>'{}' LIKE ${}", field, param_idx))
             }
-            
+
             Self::InArray { field, value } => {
+                let field = validate_field_name(field)?;
                 let param_idx = param_offset + params.len() + 1;
                 params.push(value.clone());
-                format!("metadata->'{}' ? ${}", escape_field(field), param_idx)
+                Ok(format!("metadata->'{}' ? ${}", field, param_idx))
             }
-            
+
             Self::In { field, values } => {
+                let field = validate_field_name(field)?;
                 if values.is_empty() {
-                    return "FALSE".to_string();
+                    return Ok("FALSE".to_string());
                 }
                 let placeholders: Vec<String> = values.iter().enumerate().map(|(i, _v)| {
                     let param_idx = param_offset + params.len() + 1 + i;
@@ -273,12 +287,13 @@ impl MetadataFilter {
                 for v in values {
                     params.push(json_value_to_string(v));
                 }
-                format!("metadata->>'{}' IN ({})", escape_field(field), placeholders.join(", "))
+                Ok(format!("metadata->>'{}' IN ({})", field, placeholders.join(", ")))
             }
-            
+
             Self::NotIn { field, values } => {
+                let field = validate_field_name(field)?;
                 if values.is_empty() {
-                    return "TRUE".to_string();
+                    return Ok("TRUE".to_string());
                 }
                 let placeholders: Vec<String> = values.iter().enumerate().map(|(i, _)| {
                     let param_idx = param_offset + params.len() + 1 + i;
@@ -287,36 +302,38 @@ impl MetadataFilter {
                 for v in values {
                     params.push(json_value_to_string(v));
                 }
-                format!("metadata->>'{}' NOT IN ({})", escape_field(field), placeholders.join(", "))
+                Ok(format!("metadata->>'{}' NOT IN ({})", field, placeholders.join(", ")))
             }
-            
+
             Self::JsonPath { path } => {
-                format!("metadata @? '{}'", path.replace('\'', "''"))
+                Ok(format!("metadata @? '{}'", path.replace('\'', "''")))
             }
-            
+
             Self::And { filters } => {
                 if filters.is_empty() {
-                    return "TRUE".to_string();
+                    return Ok("TRUE".to_string());
                 }
-                let parts: Vec<String> = filters.iter().map(|f| {
-                    f.to_sql_inner(param_offset + params.len(), params)
-                }).collect();
-                format!("({})", parts.join(" AND "))
+                let mut parts = Vec::new();
+                for f in filters {
+                    parts.push(f.to_sql_inner(param_offset + params.len(), params)?);
+                }
+                Ok(format!("({})", parts.join(" AND ")))
             }
-            
+
             Self::Or { filters } => {
                 if filters.is_empty() {
-                    return "FALSE".to_string();
+                    return Ok("FALSE".to_string());
                 }
-                let parts: Vec<String> = filters.iter().map(|f| {
-                    f.to_sql_inner(param_offset + params.len(), params)
-                }).collect();
-                format!("({})", parts.join(" OR "))
+                let mut parts = Vec::new();
+                for f in filters {
+                    parts.push(f.to_sql_inner(param_offset + params.len(), params)?);
+                }
+                Ok(format!("({})", parts.join(" OR ")))
             }
-            
+
             Self::Not { filter } => {
-                let inner = filter.to_sql_inner(param_offset + params.len(), params);
-                format!("NOT ({})", inner)
+                let inner = filter.to_sql_inner(param_offset + params.len(), params)?;
+                Ok(format!("NOT ({})", inner))
             }
         }
     }
@@ -414,9 +431,21 @@ impl MetadataFilter {
     }
 }
 
-/// Escape a field name for safe use in SQL
-fn escape_field(field: &str) -> String {
-    field.replace('\'', "''").replace('"', "\"\"")
+/// Validate a field name for safe use in SQL
+/// Only allows alphanumeric, underscore, and dot characters
+fn validate_field_name(field: &str) -> Result<&str, RagError> {
+    if field.is_empty() {
+        return Err(RagError::QueryFailed("Empty field name".into()));
+    }
+    if field.len() > 128 {
+        return Err(RagError::QueryFailed("Field name too long".into()));
+    }
+    if !field.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        return Err(RagError::QueryFailed(
+            format!("Invalid field name '{}': only alphanumeric, underscore, and dot allowed", field)
+        ));
+    }
+    Ok(field)
 }
 
 /// Convert a JSON value to a string for use as a SQL parameter
@@ -634,7 +663,7 @@ impl RagStore {
         
         // Build the WHERE clause
         let (filter_clause, filter_params) = if let Some(f) = filter {
-            let (sql, params) = f.to_sql(3); // Start after $1 (embedding), $2 (min_sim), $3 (limit)
+            let (sql, params) = f.to_sql(3)?; // Start after $1 (embedding), $2 (min_sim), $3 (limit)
             (format!(" AND {}", sql), params)
         } else {
             (String::new(), Vec::new())
@@ -684,7 +713,7 @@ impl RagStore {
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
         
         let (filter_clause, filter_params) = if let Some(f) = filter {
-            let (sql, params) = f.to_sql(0);
+            let (sql, params) = f.to_sql(0)?;
             (format!(" WHERE {}", sql), params)
         } else {
             (String::new(), Vec::new())
@@ -711,7 +740,7 @@ impl RagStore {
         let client = self.pool.get().await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
         
-        let (filter_sql, filter_params) = filter.to_sql(0);
+        let (filter_sql, filter_params) = filter.to_sql(0)?;
         
         let query = format!(
             "DELETE FROM {} WHERE {}",
@@ -736,11 +765,13 @@ impl RagStore {
         
         let limit = limit.unwrap_or(100) as i64;
         
+        let field = validate_field_name(field)?;
+
         let query = format!(
             "SELECT DISTINCT metadata->>'{}' as val FROM {} WHERE metadata ? '{}' ORDER BY val LIMIT $1",
-            escape_field(field),
+            field,
             self.config.table_name(),
-            escape_field(field)
+            field
         );
         
         let rows = client.query(&query, &[&limit]).await
@@ -893,5 +924,88 @@ impl RagContextBuilder {
             context,
             question
         )
+    }
+}
+
+/// Reciprocal Rank Fusion - merge two ranked result lists
+///
+/// Each input is a list of (id, score) pairs ordered by relevance.
+/// Returns fused results sorted by RRF score, limited to `limit`.
+pub(crate) fn rrf_fuse(
+    vector_results: &[(i64, f32)],
+    keyword_results: &[(i64, f32)],
+    k: u32,
+    limit: usize,
+) -> Vec<(i64, f32)> {
+    use std::collections::HashMap;
+
+    let mut scores: HashMap<i64, f32> = HashMap::new();
+
+    for (rank, (id, _)) in vector_results.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (k as f32 + rank as f32 + 1.0);
+    }
+
+    for (rank, (id, _)) in keyword_results.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (k as f32 + rank as f32 + 1.0);
+    }
+
+    let mut fused: Vec<(i64, f32)> = scores.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused.truncate(limit);
+    fused
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_field_name_valid() {
+        assert!(validate_field_name("source").is_ok());
+        assert!(validate_field_name("my_field").is_ok());
+        assert!(validate_field_name("field123").is_ok());
+        assert!(validate_field_name("a.b").is_ok());
+    }
+
+    #[test]
+    fn test_validate_field_name_rejects_sql_injection() {
+        assert!(validate_field_name("'; DROP TABLE --").is_err());
+        assert!(validate_field_name("field; DELETE").is_err());
+        assert!(validate_field_name("").is_err());
+        assert!(validate_field_name("a\"b").is_err());
+    }
+
+    #[test]
+    fn test_rrf_fusion_basic() {
+        let vector_results = vec![(1i64, 0.95f32), (2, 0.85), (3, 0.75)];
+        let keyword_results = vec![(2i64, 0.9f32), (3, 0.8), (4, 0.7)];
+        let fused = rrf_fuse(&vector_results, &keyword_results, 60, 3);
+        // ID 2 appears in both, should rank highest
+        assert_eq!(fused[0].0, 2);
+        assert!(fused.iter().all(|(_, score)| *score > 0.0));
+        assert!(fused.len() <= 3);
+    }
+
+    #[test]
+    fn test_rrf_fusion_disjoint() {
+        let vector_results = vec![(1i64, 0.9f32)];
+        let keyword_results = vec![(2i64, 0.9f32)];
+        let fused = rrf_fuse(&vector_results, &keyword_results, 60, 10);
+        assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn test_rrf_fusion_empty() {
+        let fused = rrf_fuse(&[], &[], 60, 5);
+        assert!(fused.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_filter_to_sql_validates_fields() {
+        let filter = MetadataFilter::eq("valid_field", "value");
+        assert!(filter.to_sql(0).is_ok());
+
+        let bad_filter = MetadataFilter::eq("'; DROP TABLE", "value");
+        assert!(bad_filter.to_sql(0).is_err());
     }
 }
