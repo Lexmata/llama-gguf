@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::{
-    Document, MetadataFilter, NewDocument, RagConfig, RagError, RagResult, RagStore,
+    Document, MetadataFilter, NewDocument, RagConfig, RagError, RagResult, RagStore, SearchType,
     TextChunker,
 };
 
@@ -186,17 +186,6 @@ impl Default for RetrievalConfig {
             prompt_template: None,
         }
     }
-}
-
-/// Type of search to perform
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchType {
-    /// Pure semantic/vector search
-    #[default]
-    Semantic,
-    /// Hybrid: combine semantic and keyword search
-    Hybrid,
 }
 
 /// Reranking configuration

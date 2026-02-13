@@ -70,10 +70,26 @@ pub struct EmbeddingsConfig {
     /// Name of the embeddings table
     #[serde(default = "default_table_name")]
     pub table_name: String,
-    
+
     /// Embedding vector dimension
     #[serde(default = "default_embedding_dim")]
     pub dimension: usize,
+
+    /// Index type: "hnsw" (default), "ivfflat", or "none"
+    #[serde(default = "default_index_type_str")]
+    pub index_type: String,
+
+    /// HNSW parameter: max number of connections per layer
+    #[serde(default = "default_hnsw_m")]
+    pub hnsw_m: u16,
+
+    /// HNSW parameter: size of the dynamic candidate list for construction
+    #[serde(default = "default_hnsw_ef_construction")]
+    pub hnsw_ef_construction: u16,
+
+    /// IVF-Flat parameter: number of inverted lists
+    #[serde(default = "default_ivfflat_lists")]
+    pub ivfflat_lists: u16,
 }
 
 /// Search configuration
@@ -83,14 +99,30 @@ pub struct SearchConfig {
     /// Maximum number of results to return
     #[serde(default = "default_max_results")]
     pub max_results: usize,
-    
+
     /// Minimum similarity score (0.0 - 1.0)
     #[serde(default = "default_min_similarity")]
     pub min_similarity: f32,
-    
+
     /// Distance metric for similarity search
     #[serde(default)]
     pub distance_metric: DistanceMetric,
+
+    /// Search type: semantic (default) or hybrid
+    #[serde(default)]
+    pub search_type: SearchType,
+
+    /// Reciprocal Rank Fusion k parameter for hybrid search
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: u32,
+
+    /// Oversampling factor for hybrid search candidate retrieval
+    #[serde(default = "default_hybrid_oversampling")]
+    pub hybrid_oversampling: u32,
+
+    /// PostgreSQL text search language configuration
+    #[serde(default = "default_text_search_language")]
+    pub text_search_language: String,
 }
 
 fn default_table_name() -> String {
@@ -117,6 +149,34 @@ fn default_connect_timeout() -> u64 {
     30
 }
 
+fn default_index_type_str() -> String {
+    "hnsw".to_string()
+}
+
+fn default_hnsw_m() -> u16 {
+    16
+}
+
+fn default_hnsw_ef_construction() -> u16 {
+    64
+}
+
+fn default_ivfflat_lists() -> u16 {
+    100
+}
+
+fn default_rrf_k() -> u32 {
+    60
+}
+
+fn default_hybrid_oversampling() -> u32 {
+    2
+}
+
+fn default_text_search_language() -> String {
+    "english".to_string()
+}
+
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
@@ -132,6 +192,27 @@ impl Default for EmbeddingsConfig {
         Self {
             table_name: default_table_name(),
             dimension: default_embedding_dim(),
+            index_type: default_index_type_str(),
+            hnsw_m: default_hnsw_m(),
+            hnsw_ef_construction: default_hnsw_ef_construction(),
+            ivfflat_lists: default_ivfflat_lists(),
+        }
+    }
+}
+
+impl EmbeddingsConfig {
+    /// Construct an `IndexType` from the flat config fields.
+    pub fn index_type(&self) -> IndexType {
+        match self.index_type.to_lowercase().as_str() {
+            "hnsw" => IndexType::Hnsw {
+                m: self.hnsw_m,
+                ef_construction: self.hnsw_ef_construction,
+            },
+            "ivfflat" => IndexType::IvfFlat {
+                lists: self.ivfflat_lists,
+            },
+            "none" => IndexType::None,
+            _ => IndexType::default(),
         }
     }
 }
@@ -142,6 +223,10 @@ impl Default for SearchConfig {
             max_results: default_max_results(),
             min_similarity: default_min_similarity(),
             distance_metric: DistanceMetric::default(),
+            search_type: SearchType::default(),
+            rrf_k: default_rrf_k(),
+            hybrid_oversampling: default_hybrid_oversampling(),
+            text_search_language: default_text_search_language(),
         }
     }
 }
@@ -178,6 +263,72 @@ impl DistanceMetric {
             DistanceMetric::InnerProduct => "vector_ip_ops",
         }
     }
+}
+
+/// Type of vector index to create on the embeddings table
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IndexType {
+    /// HNSW index (recommended for most workloads)
+    Hnsw {
+        /// Maximum number of connections per layer (default: 16)
+        m: u16,
+        /// Size of the dynamic candidate list for construction (default: 64)
+        ef_construction: u16,
+    },
+    /// IVF-Flat index (faster build, good for large datasets)
+    IvfFlat {
+        /// Number of inverted lists (default: 100)
+        lists: u16,
+    },
+    /// No index (brute-force scan)
+    None,
+}
+
+impl Default for IndexType {
+    fn default() -> Self {
+        Self::Hnsw {
+            m: 16,
+            ef_construction: 64,
+        }
+    }
+}
+
+impl IndexType {
+    /// Generate the SQL components needed to create this index.
+    ///
+    /// Returns `(index_method, ops_class, with_clause)` where:
+    /// - `index_method` is the PostgreSQL index method (e.g. `"hnsw"`)
+    /// - `ops_class` is the operator class passed in via `ops`
+    /// - `with_clause` is the `WITH (...)` parameters string
+    ///
+    /// For `IndexType::None`, all components are empty strings.
+    pub fn index_sql<'a>(&self, ops: &'a str) -> (&'static str, &'a str, String) {
+        match self {
+            IndexType::Hnsw { m, ef_construction } => (
+                "hnsw",
+                ops,
+                format!("WITH (m = {}, ef_construction = {})", m, ef_construction),
+            ),
+            IndexType::IvfFlat { lists } => (
+                "ivfflat",
+                ops,
+                format!("WITH (lists = {})", lists),
+            ),
+            IndexType::None => ("", "", String::new()),
+        }
+    }
+}
+
+/// Type of search to perform
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchType {
+    /// Pure semantic/vector search
+    #[default]
+    Semantic,
+    /// Hybrid: combine semantic and keyword search
+    Hybrid,
 }
 
 impl RagConfig {
@@ -439,6 +590,31 @@ impl RagConfig {
     pub fn pool_size(&self) -> usize {
         self.database.pool_size
     }
+
+    /// Get the configured index type
+    pub fn index_type(&self) -> IndexType {
+        self.embeddings.index_type()
+    }
+
+    /// Get the configured search type
+    pub fn search_type(&self) -> SearchType {
+        self.search.search_type
+    }
+
+    /// Get the RRF k parameter for hybrid search
+    pub fn rrf_k(&self) -> u32 {
+        self.search.rrf_k
+    }
+
+    /// Get the hybrid search oversampling factor
+    pub fn hybrid_oversampling(&self) -> u32 {
+        self.search.hybrid_oversampling
+    }
+
+    /// Get the text search language configuration
+    pub fn text_search_language(&self) -> &str {
+        &self.search.text_search_language
+    }
 }
 
 /// Generate an example configuration file
@@ -481,4 +657,115 @@ min_similarity = 0.5
 # Options: "cosine" (default), "l2", "inner_product"
 distance_metric = "cosine"
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_type_default_is_hnsw() {
+        let idx = IndexType::default();
+        assert_eq!(
+            idx,
+            IndexType::Hnsw {
+                m: 16,
+                ef_construction: 64
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_type_hnsw_sql() {
+        let idx = IndexType::Hnsw {
+            m: 32,
+            ef_construction: 128,
+        };
+        let (method, ops, with_clause) = idx.index_sql("vector_cosine_ops");
+        assert_eq!(method, "hnsw");
+        assert_eq!(ops, "vector_cosine_ops");
+        assert_eq!(with_clause, "WITH (m = 32, ef_construction = 128)");
+    }
+
+    #[test]
+    fn test_index_type_ivfflat_sql() {
+        let idx = IndexType::IvfFlat { lists: 200 };
+        let (method, ops, with_clause) = idx.index_sql("vector_l2_ops");
+        assert_eq!(method, "ivfflat");
+        assert_eq!(ops, "vector_l2_ops");
+        assert_eq!(with_clause, "WITH (lists = 200)");
+    }
+
+    #[test]
+    fn test_search_config_defaults() {
+        let sc = SearchConfig::default();
+        assert_eq!(sc.search_type, SearchType::Semantic);
+        assert_eq!(sc.rrf_k, 60);
+        assert_eq!(sc.hybrid_oversampling, 2);
+        assert_eq!(sc.text_search_language, "english");
+        assert_eq!(sc.max_results, 5);
+        assert!((sc.min_similarity - 0.5).abs() < f32::EPSILON);
+        assert_eq!(sc.distance_metric, DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn test_config_toml_roundtrip() {
+        let config = RagConfig::new("postgres://localhost/test")
+            .with_table("docs")
+            .with_dim(768)
+            .with_max_results(10)
+            .with_min_similarity(0.7)
+            .with_distance_metric(DistanceMetric::L2);
+
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: RagConfig = toml::from_str(&toml_str).expect("deserialize");
+
+        assert_eq!(parsed.connection_string(), "postgres://localhost/test");
+        assert_eq!(parsed.table_name(), "docs");
+        assert_eq!(parsed.embedding_dim(), 768);
+        assert_eq!(parsed.max_results(), 10);
+        assert!((parsed.min_similarity() - 0.7).abs() < f32::EPSILON);
+        assert_eq!(parsed.distance_metric(), DistanceMetric::L2);
+        assert_eq!(parsed.search_type(), SearchType::Semantic);
+        assert_eq!(parsed.rrf_k(), 60);
+        assert_eq!(parsed.hybrid_oversampling(), 2);
+        assert_eq!(parsed.text_search_language(), "english");
+        assert_eq!(
+            parsed.index_type(),
+            IndexType::Hnsw {
+                m: 16,
+                ef_construction: 64
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_type_serde() {
+        let toml_str = r#"
+[database]
+connection_string = "postgres://localhost/test"
+
+[embeddings]
+table_name = "embeddings"
+dimension = 384
+index_type = "ivfflat"
+ivfflat_lists = 200
+
+[search]
+search_type = "hybrid"
+rrf_k = 30
+hybrid_oversampling = 4
+text_search_language = "spanish"
+"#;
+
+        let config: RagConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(
+            config.index_type(),
+            IndexType::IvfFlat { lists: 200 }
+        );
+        assert_eq!(config.search_type(), SearchType::Hybrid);
+        assert_eq!(config.rrf_k(), 30);
+        assert_eq!(config.hybrid_oversampling(), 4);
+        assert_eq!(config.text_search_language(), "spanish");
+    }
 }
