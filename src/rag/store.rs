@@ -533,10 +533,25 @@ impl RagStore {
     }
     
     /// Create the embeddings table if it doesn't exist
+    ///
+    /// The table schema and indexes are driven by the [`RagConfig`]:
+    /// - When `search_type == Hybrid`, a generated `content_tsv` tsvector
+    ///   column and a GIN index on it are added for full-text keyword search.
+    /// - The vector index type (HNSW or IVFFlat) is determined by
+    ///   [`IndexType`](super::IndexType) from the config.
     pub async fn create_table(&self) -> RagResult<()> {
         let client = self.pool.get().await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
+        let tsv_column = if self.config.search_type() == super::SearchType::Hybrid {
+            format!(
+                ", content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('{}', content)) STORED",
+                self.config.text_search_language()
+            )
+        } else {
+            String::new()
+        };
+
         let create_table = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -544,30 +559,79 @@ impl RagStore {
                 content TEXT NOT NULL,
                 embedding vector({}) NOT NULL,
                 metadata JSONB,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(){}
             )
             "#,
             self.config.table_name(),
-            self.config.embedding_dim()
+            self.config.embedding_dim(),
+            tsv_column,
         );
-        
+
         client.execute(&create_table, &[]).await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
-        // Create index for fast similarity search
-        let create_index = format!(
-            r#"
-            CREATE INDEX IF NOT EXISTS {}_embedding_idx 
-            ON {} USING ivfflat (embedding {})
-            "#,
-            self.config.table_name(),
-            self.config.table_name(),
-            self.config.distance_metric().index_ops()
-        );
-        
-        // Index creation may fail if table is empty, that's okay
-        let _ = client.execute(&create_index, &[]).await;
-        
+
+        // Create vector and (optionally) GIN indexes
+        self.create_index_inner(&client).await?;
+
+        Ok(())
+    }
+
+    /// Recreate the vector (and optional GIN) indexes.
+    ///
+    /// This is useful after a large bulk insert where you want to drop
+    /// and rebuild the index for optimal search performance.
+    pub async fn create_index(&self) -> RagResult<()> {
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+        self.create_index_inner(&client).await
+    }
+
+    /// Shared helper that creates vector and GIN indexes using an
+    /// already-acquired pool client.
+    async fn create_index_inner(&self, client: &deadpool_postgres::Object) -> RagResult<()> {
+        let index_type = self.config.index_type();
+        let ops = self.config.distance_metric().index_ops();
+        let (method, ops_class, with_clause) = index_type.index_sql(ops);
+
+        if !method.is_empty() {
+            let create_vec_idx = format!(
+                "CREATE INDEX IF NOT EXISTS {table}_embedding_idx ON {table} USING {method} (embedding {ops_class}) {with_clause}",
+                table = self.config.table_name(),
+                method = method,
+                ops_class = ops_class,
+                with_clause = with_clause,
+            );
+
+            // Index creation may fail if table is empty (IVFFlat); that's okay
+            let _ = client.execute(&create_vec_idx, &[]).await;
+        }
+
+        // GIN index for hybrid text search
+        if self.config.search_type() == super::SearchType::Hybrid {
+            let create_gin_idx = format!(
+                "CREATE INDEX IF NOT EXISTS {}_content_tsv_idx ON {} USING gin (content_tsv)",
+                self.config.table_name(),
+                self.config.table_name(),
+            );
+            let _ = client.execute(&create_gin_idx, &[]).await;
+        }
+
+        Ok(())
+    }
+
+    /// Set the HNSW `ef_search` parameter for the current connection,
+    /// controlling the trade-off between search quality and speed.
+    ///
+    /// Higher values yield more accurate results at the cost of latency.
+    /// This is a session-level setting and does not persist across connections.
+    pub async fn set_hnsw_ef_search(&self, ef_search: u16) -> RagResult<()> {
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+
+        let query = format!("SET hnsw.ef_search = {}", ef_search);
+        client.execute(&query, &[]).await
+            .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+
         Ok(())
     }
     
