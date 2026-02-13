@@ -637,14 +637,23 @@ connect_timeout_secs = 30
 # Name of the table storing embeddings
 table_name = "embeddings"
 
-# Dimension of embedding vectors (must match your embedding model)
+# Dimension of embedding vectors (auto-detected from model if not set)
 # Common values:
 #   - 384: all-MiniLM-L6-v2, all-MiniLM-L12-v2
 #   - 768: all-mpnet-base-v2, BERT-base
-#   - 1024: BERT-large
-#   - 1536: OpenAI text-embedding-ada-002
-#   - 3072: OpenAI text-embedding-3-large
+#   - 2048: LLaMA-7B (hidden_size)
+#   - 4096: LLaMA-13B/70B (hidden_size)
 dimension = 384
+
+# Index type: "hnsw" (default, recommended), "ivfflat", or "none"
+index_type = "hnsw"
+
+# HNSW parameters (only used when index_type = "hnsw")
+hnsw_m = 16                  # Max connections per node (higher = better recall, more memory)
+hnsw_ef_construction = 64    # Construction search depth (higher = better index, slower build)
+
+# IVFFlat parameters (only used when index_type = "ivfflat")
+# ivfflat_lists = 100        # Number of inverted lists
 
 [search]
 # Maximum number of results to return from similarity search
@@ -656,6 +665,18 @@ min_similarity = 0.5
 # Distance metric for similarity search
 # Options: "cosine" (default), "l2", "inner_product"
 distance_metric = "cosine"
+
+# Search type: "semantic" (vector only) or "hybrid" (vector + keyword with RRF)
+search_type = "semantic"
+
+# RRF constant for hybrid search (higher = more weight to lower-ranked results)
+rrf_k = 60
+
+# Oversampling factor for hybrid search (fetch N * this many candidates before fusion)
+hybrid_oversampling = 2
+
+# PostgreSQL text search configuration language
+text_search_language = "english"
 "#
 }
 

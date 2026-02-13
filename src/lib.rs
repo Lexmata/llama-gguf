@@ -69,7 +69,19 @@ pub use tokenizer::{Tokenizer, TokenizerError};
 #[cfg(feature = "huggingface")]
 pub use huggingface::{HfClient, HfError, HfFileInfo, format_bytes};
 #[cfg(feature = "rag")]
-pub use rag::{RagConfig, RagStore, RagError, RagResult, Document, NewDocument, RagContextBuilder, TextChunker};
+pub use rag::{
+    RagConfig, RagStore, RagError, RagResult, Document, NewDocument, RagContextBuilder, TextChunker,
+    // Config types
+    IndexType, SearchType, DistanceMetric, DatabaseConfig, EmbeddingsConfig, SearchConfig,
+    // Knowledge base
+    KnowledgeBase, KnowledgeBaseBuilder, KnowledgeBaseConfig, DataSource, ChunkingStrategy,
+    RetrievalConfig, RetrievalResponse, RetrieveAndGenerateResponse, RetrievedChunk,
+    Citation, SourceLocation, IngestionResult,
+    // Embeddings
+    EmbeddingGenerator,
+    // Metadata filtering
+    MetadataFilter,
+};
 
 /// Library-wide error type
 #[derive(thiserror::Error, Debug)]
