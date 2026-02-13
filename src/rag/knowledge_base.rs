@@ -690,7 +690,7 @@ impl KnowledgeBase {
     fn walk_directory_recursive(
         &self,
         path: &std::path::Path,
-        _pattern: Option<&str>,
+        pattern: Option<&str>,
     ) -> RagResult<Vec<PathBuf>> {
         let mut files = Vec::new();
 
@@ -710,13 +710,20 @@ impl KnowledgeBase {
         visit_dir(path, &mut files)
             .map_err(|e| RagError::ConfigError(format!("Failed to read directory: {}", e)))?;
 
+        if let Some(pattern) = pattern {
+            files.retain(|f| {
+                let path_str = f.to_string_lossy();
+                matches_glob_pattern(&path_str, pattern)
+            });
+        }
+
         Ok(files)
     }
 
     fn walk_directory_flat(
         &self,
         path: &std::path::Path,
-        _pattern: Option<&str>,
+        pattern: Option<&str>,
     ) -> RagResult<Vec<PathBuf>> {
         let mut files = Vec::new();
 
@@ -728,6 +735,13 @@ impl KnowledgeBase {
             if path.is_file() {
                 files.push(path);
             }
+        }
+
+        if let Some(pattern) = pattern {
+            files.retain(|f| {
+                let path_str = f.to_string_lossy();
+                matches_glob_pattern(&path_str, pattern)
+            });
         }
 
         Ok(files)
@@ -930,6 +944,16 @@ fn chrono_now() -> String {
     format!("{}s", duration.as_secs())
 }
 
+/// Check whether a path string matches a glob pattern.
+///
+/// Uses the `glob` crate's `Pattern` for matching. Returns `false` if the
+/// pattern is invalid.
+fn matches_glob_pattern(path: &str, pattern: &str) -> bool {
+    glob::Pattern::new(pattern)
+        .map(|p| p.matches(path))
+        .unwrap_or(false)
+}
+
 // =============================================================================
 // Builder Pattern
 // =============================================================================
@@ -1100,5 +1124,21 @@ mod tests {
         assert_eq!(result[0].content, "high score chunk");
         assert_eq!(result[1].content, "low score chunk");
         assert!(result[0].score > result[1].score);
+    }
+
+    #[test]
+    fn test_glob_pattern_matching() {
+        // Markdown files match **/*.md
+        assert!(matches_glob_pattern("docs/readme.md", "**/*.md"));
+
+        // Rust source files match **/*.rs
+        assert!(matches_glob_pattern("src/lib.rs", "**/*.rs"));
+
+        // PNG file does NOT match **/*.md
+        assert!(!matches_glob_pattern("image.png", "**/*.md"));
+
+        // Edge cases
+        assert!(matches_glob_pattern("a.md", "**/*.md"));
+        assert!(!matches_glob_pattern("docs/readme.txt", "**/*.md"));
     }
 }
