@@ -47,10 +47,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::backend::Backend;
+use crate::model::LlamaModel;
+use crate::tokenizer::Tokenizer;
 
 use super::{
-    Document, MetadataFilter, NewDocument, RagConfig, RagError, RagResult, RagStore, SearchType,
-    TextChunker,
+    Document, EmbeddingGenerator, MetadataFilter, NewDocument, RagConfig, RagError, RagResult,
+    RagStore, SearchType, TextChunker,
 };
 
 // =============================================================================
@@ -372,6 +377,7 @@ pub struct RetrieveAndGenerateResponse {
 pub struct KnowledgeBase {
     config: KnowledgeBaseConfig,
     store: RagStore,
+    embedding_gen: Option<EmbeddingGenerator>,
 }
 
 impl KnowledgeBase {
@@ -380,13 +386,27 @@ impl KnowledgeBase {
         let store = RagStore::connect(config.storage.clone()).await?;
         store.create_table().await?;
 
-        Ok(Self { config, store })
+        Ok(Self {
+            config,
+            store,
+            embedding_gen: None,
+        })
     }
 
     /// Connect to an existing knowledge base
     pub async fn connect(config: KnowledgeBaseConfig) -> RagResult<Self> {
         let store = RagStore::connect(config.storage.clone()).await?;
-        Ok(Self { config, store })
+        Ok(Self {
+            config,
+            store,
+            embedding_gen: None,
+        })
+    }
+
+    /// Attach an embedding generator to this knowledge base
+    pub fn with_embedding_generator(mut self, emb_gen: EmbeddingGenerator) -> Self {
+        self.embedding_gen = Some(emb_gen);
+        self
     }
 
     /// Get the knowledge base name
@@ -462,14 +482,24 @@ impl KnowledgeBase {
     ) -> RagResult<RetrievalResponse> {
         let config = config.unwrap_or_else(|| self.config.retrieval.clone());
 
-        // Generate query embedding (placeholder - returns zeros)
+        // Generate query embedding
         let query_embedding = self.embed_query(query)?;
 
-        // Perform search
-        let docs = self
-            .store
-            .search_with_filter(&query_embedding, Some(config.max_results), config.filter)
-            .await?;
+        // Dispatch to hybrid or semantic search based on configuration
+        let docs = if self.config.storage.search_type() == SearchType::Hybrid {
+            self.store
+                .search_hybrid(
+                    &query_embedding,
+                    query,
+                    Some(config.max_results),
+                    config.filter,
+                )
+                .await?
+        } else {
+            self.store
+                .search_with_filter(&query_embedding, Some(config.max_results), config.filter)
+                .await?
+        };
 
         // Convert to retrieved chunks
         let chunks = docs
@@ -784,15 +814,22 @@ impl KnowledgeBase {
         }
     }
 
-    fn embed_text(&self, _text: &str) -> RagResult<Vec<f32>> {
-        // Placeholder: return zero vector
-        // In practice, use EmbeddingGenerator or external API
-        Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+    fn embed_text(&self, text: &str) -> RagResult<Vec<f32>> {
+        if let Some(emb) = &self.embedding_gen {
+            emb.embed(text)
+        } else {
+            // Fallback: zero vector (for testing without a model)
+            Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+        }
     }
 
-    fn embed_query(&self, _query: &str) -> RagResult<Vec<f32>> {
-        // Placeholder: return zero vector
-        Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+    fn embed_query(&self, query: &str) -> RagResult<Vec<f32>> {
+        if let Some(emb) = &self.embedding_gen {
+            emb.embed(query)
+        } else {
+            // Fallback: zero vector (for testing without a model)
+            Ok(vec![0.0f32; self.config.storage.embedding_dim()])
+        }
     }
 
     fn doc_to_chunk(&self, doc: Document) -> RetrievedChunk {
@@ -866,6 +903,9 @@ fn chrono_now() -> String {
 /// Builder for KnowledgeBaseConfig
 pub struct KnowledgeBaseBuilder {
     config: KnowledgeBaseConfig,
+    model: Option<Arc<LlamaModel>>,
+    tokenizer: Option<Arc<Tokenizer>>,
+    backend: Option<Arc<dyn Backend>>,
 }
 
 impl KnowledgeBaseBuilder {
@@ -875,7 +915,23 @@ impl KnowledgeBaseBuilder {
                 name: name.into(),
                 ..Default::default()
             },
+            model: None,
+            tokenizer: None,
+            backend: None,
         }
+    }
+
+    /// Set the model, tokenizer, and backend for real embedding generation
+    pub fn with_model(
+        mut self,
+        model: Arc<LlamaModel>,
+        tokenizer: Arc<Tokenizer>,
+        backend: Arc<dyn Backend>,
+    ) -> Self {
+        self.model = Some(model);
+        self.tokenizer = Some(tokenizer);
+        self.backend = Some(backend);
+        self
     }
 
     pub fn description(mut self, desc: impl Into<String>) -> Self {
@@ -953,6 +1009,15 @@ impl KnowledgeBaseBuilder {
     }
 
     pub async fn create(self) -> RagResult<KnowledgeBase> {
-        KnowledgeBase::create(self.config).await
+        let mut kb = KnowledgeBase::create(self.config).await?;
+
+        // Construct EmbeddingGenerator when model, tokenizer, and backend are all provided
+        if let (Some(model), Some(tokenizer), Some(backend)) =
+            (self.model, self.tokenizer, self.backend)
+        {
+            kb.embedding_gen = Some(EmbeddingGenerator::new(model, tokenizer, backend));
+        }
+
+        Ok(kb)
     }
 }
