@@ -677,18 +677,18 @@ impl RagStore {
     pub async fn search(&self, query_embedding: &[f32], limit: Option<usize>) -> RagResult<Vec<Document>> {
         self.search_with_filter(query_embedding, limit, None).await
     }
-    
+
     /// Search for similar documents with metadata filtering
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust,ignore
     /// use llama_gguf::rag::{RagStore, MetadataFilter};
-    /// 
+    ///
     /// // Search with a simple filter
     /// let filter = MetadataFilter::eq("type", "documentation");
     /// let results = store.search_with_filter(&embedding, Some(10), Some(filter)).await?;
-    /// 
+    ///
     /// // Search with multiple filters
     /// let filter = MetadataFilter::and(vec![
     ///     MetadataFilter::eq("source", "docs"),
@@ -702,29 +702,39 @@ impl RagStore {
         limit: Option<usize>,
         filter: Option<MetadataFilter>,
     ) -> RagResult<Vec<Document>> {
+        self.search_vector_inner(query_embedding, limit, filter).await
+    }
+
+    /// Core vector-similarity search implementation.
+    async fn search_vector_inner(
+        &self,
+        query_embedding: &[f32],
+        limit: Option<usize>,
+        filter: Option<MetadataFilter>,
+    ) -> RagResult<Vec<Document>> {
         if query_embedding.len() != self.config.embedding_dim() {
             return Err(RagError::DimensionMismatch {
                 expected: self.config.embedding_dim(),
                 actual: query_embedding.len(),
             });
         }
-        
+
         let client = self.pool.get().await
             .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
-        
+
         let embedding = Vector::from(query_embedding.to_vec());
         let limit = limit.unwrap_or(self.config.max_results()) as i64;
         let operator = self.config.distance_metric().operator();
-        
+
         // For cosine distance, convert to similarity (1 - distance)
         let score_expr = match self.config.distance_metric() {
             super::DistanceMetric::Cosine => format!("1 - (embedding {} $1)", operator),
             super::DistanceMetric::L2 => format!("1 / (1 + (embedding {} $1))", operator),
             super::DistanceMetric::InnerProduct => format!("-(embedding {} $1)", operator),
         };
-        
+
         let min_sim = self.config.min_similarity();
-        
+
         // Build the WHERE clause
         let (filter_clause, filter_params) = if let Some(f) = filter {
             let (sql, params) = f.to_sql(3)?; // Start after $1 (embedding), $2 (min_sim), $3 (limit)
@@ -732,7 +742,7 @@ impl RagStore {
         } else {
             (String::new(), Vec::new())
         };
-        
+
         let query = format!(
             r#"
             SELECT id, content, metadata, {} as score
@@ -747,7 +757,7 @@ impl RagStore {
             filter_clause,
             operator
         );
-        
+
         // Build params dynamically
         use tokio_postgres::types::ToSql;
         let mut params: Vec<&(dyn ToSql + Sync)> = vec![&embedding, &min_sim, &limit];
@@ -755,10 +765,10 @@ impl RagStore {
         for p in &filter_param_refs {
             params.push(p);
         }
-        
+
         let rows = client.query(&query, &params).await
             .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
-        
+
         let docs = rows.iter().map(|row| {
             Document {
                 id: row.get(0),
@@ -767,10 +777,142 @@ impl RagStore {
                 score: Some(row.get(3)),
             }
         }).collect();
-        
+
         Ok(docs)
     }
-    
+
+    /// Perform a keyword-only search using PostgreSQL full-text search.
+    ///
+    /// Returns `(id, ts_rank_score)` pairs ordered by relevance.
+    /// Requires `search_type = "hybrid"` in the config so that the
+    /// `content_tsv` generated column exists.
+    pub async fn search_keyword(
+        &self,
+        query_text: &str,
+        limit: usize,
+        filter: Option<MetadataFilter>,
+    ) -> RagResult<Vec<(i64, f32)>> {
+        let client = self.pool.get().await
+            .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+
+        let lang = self.config.text_search_language();
+
+        let (filter_clause, filter_params) = if let Some(f) = filter {
+            let (sql, params) = f.to_sql(2)?; // $1 = query_text, $2 = limit
+            (format!(" AND {}", sql), params)
+        } else {
+            (String::new(), Vec::new())
+        };
+
+        let limit_i64 = limit as i64;
+
+        let query = format!(
+            r#"
+            SELECT id, ts_rank(content_tsv, plainto_tsquery('{lang}', $1)) as rank
+            FROM {table}
+            WHERE content_tsv @@ plainto_tsquery('{lang}', $1){filter}
+            ORDER BY rank DESC
+            LIMIT $2
+            "#,
+            lang = lang,
+            table = self.config.table_name(),
+            filter = filter_clause,
+        );
+
+        use tokio_postgres::types::ToSql;
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&query_text, &limit_i64];
+        let filter_param_refs: Vec<&str> = filter_params.iter().map(|s| s.as_str()).collect();
+        for p in &filter_param_refs {
+            params.push(p);
+        }
+
+        let rows = client.query(&query, &params).await
+            .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+
+        let results = rows.iter().map(|row| {
+            let id: i64 = row.get(0);
+            let score: f32 = row.get(1);
+            (id, score)
+        }).collect();
+
+        Ok(results)
+    }
+
+    /// Perform a hybrid search combining vector similarity and keyword
+    /// relevance via Reciprocal Rank Fusion (RRF).
+    ///
+    /// Both the vector and keyword searches are run, then their results
+    /// are merged using [`rrf_fuse`] and the final documents are returned
+    /// sorted by the fused score.
+    pub async fn search_hybrid(
+        &self,
+        query_embedding: &[f32],
+        query_text: &str,
+        limit: Option<usize>,
+        filter: Option<MetadataFilter>,
+    ) -> RagResult<Vec<Document>> {
+        let limit = limit.unwrap_or(self.config.max_results());
+        let oversampled = limit * self.config.hybrid_oversampling() as usize;
+
+        // Run vector search (oversampled)
+        let vec_docs = self.search_vector_inner(query_embedding, Some(oversampled), filter.clone()).await?;
+        let vector_results: Vec<(i64, f32)> = vec_docs.iter().map(|d| (d.id, d.score.unwrap_or(0.0))).collect();
+
+        // Run keyword search (oversampled)
+        let keyword_results = self.search_keyword(query_text, oversampled, filter).await?;
+
+        // Fuse with RRF
+        let fused = rrf_fuse(&vector_results, &keyword_results, self.config.rrf_k(), limit);
+
+        // Build a map of id -> Document from vector results
+        let mut doc_map: std::collections::HashMap<i64, Document> = vec_docs.into_iter().map(|d| (d.id, d)).collect();
+
+        // Identify keyword-only IDs that we need to fetch
+        let missing_ids: Vec<i64> = fused.iter()
+            .filter(|(id, _)| !doc_map.contains_key(id))
+            .map(|(id, _)| *id)
+            .collect();
+
+        if !missing_ids.is_empty() {
+            let client = self.pool.get().await
+                .map_err(|e| RagError::ConnectionFailed(format!("{}", e)))?;
+
+            // Fetch missing docs by ID
+            let placeholders: Vec<String> = (1..=missing_ids.len()).map(|i| format!("${}", i)).collect();
+            let query = format!(
+                "SELECT id, content, metadata FROM {} WHERE id IN ({})",
+                self.config.table_name(),
+                placeholders.join(", ")
+            );
+
+            use tokio_postgres::types::ToSql;
+            let params: Vec<&(dyn ToSql + Sync)> = missing_ids.iter().map(|id| id as &(dyn ToSql + Sync)).collect();
+
+            let rows = client.query(&query, &params).await
+                .map_err(|e| RagError::QueryFailed(format!("{}", e)))?;
+
+            for row in &rows {
+                let doc = Document {
+                    id: row.get(0),
+                    content: row.get(1),
+                    metadata: row.get(2),
+                    score: None,
+                };
+                doc_map.insert(doc.id, doc);
+            }
+        }
+
+        // Assemble final results in fused order
+        let results = fused.into_iter().filter_map(|(id, score)| {
+            doc_map.remove(&id).map(|mut doc| {
+                doc.score = Some(score);
+                doc
+            })
+        }).collect();
+
+        Ok(results)
+    }
+
     /// Count documents matching a filter
     pub async fn count_with_filter(&self, filter: Option<MetadataFilter>) -> RagResult<i64> {
         let client = self.pool.get().await
