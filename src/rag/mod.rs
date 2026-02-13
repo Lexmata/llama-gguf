@@ -104,6 +104,9 @@ pub enum RagError {
     
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("Embedding error: {0}")]
+    EmbeddingError(String),
 }
 
 pub type RagResult<T> = Result<T, RagError>;
