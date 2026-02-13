@@ -315,7 +315,9 @@ impl MetadataFilter {
                 }
                 let mut parts = Vec::new();
                 for f in filters {
-                    parts.push(f.to_sql_inner(param_offset + params.len(), params)?);
+                    // Pass param_offset unchanged — each child reads params.len()
+                    // internally to determine its own parameter index.
+                    parts.push(f.to_sql_inner(param_offset, params)?);
                 }
                 Ok(format!("({})", parts.join(" AND ")))
             }
@@ -326,13 +328,13 @@ impl MetadataFilter {
                 }
                 let mut parts = Vec::new();
                 for f in filters {
-                    parts.push(f.to_sql_inner(param_offset + params.len(), params)?);
+                    parts.push(f.to_sql_inner(param_offset, params)?);
                 }
                 Ok(format!("({})", parts.join(" OR ")))
             }
 
             Self::Not { filter } => {
-                let inner = filter.to_sql_inner(param_offset + params.len(), params)?;
+                let inner = filter.to_sql_inner(param_offset, params)?;
                 Ok(format!("NOT ({})", inner))
             }
         }
@@ -814,7 +816,9 @@ impl RagStore {
             super::DistanceMetric::InnerProduct => format!("-(embedding {} $1)", operator),
         };
 
-        let min_sim = self.config.min_similarity();
+        // Cast to f64 so tokio-postgres sends float8 (double precision),
+        // matching the return type of pgvector distance operators.
+        let min_sim = self.config.min_similarity() as f64;
 
         // Build the WHERE clause
         let (filter_clause, filter_params) = if let Some(f) = filter {
@@ -826,7 +830,7 @@ impl RagStore {
 
         let query = format!(
             r#"
-            SELECT id, content, metadata, {} as score
+            SELECT id, content, metadata, ({})::float4 as score
             FROM {}
             WHERE {} >= $2{}
             ORDER BY embedding {} $1

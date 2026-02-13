@@ -503,9 +503,9 @@ impl RagConfig {
             ));
         }
         
-        if self.search.min_similarity < 0.0 || self.search.min_similarity > 1.0 {
+        if self.search.min_similarity < -1.0 || self.search.min_similarity > 1.0 {
             return Err(super::RagError::ConfigError(
-                "min_similarity must be between 0.0 and 1.0".into()
+                "min_similarity must be between -1.0 and 1.0".into()
             ));
         }
         
@@ -545,7 +545,7 @@ impl RagConfig {
     
     /// Set the minimum similarity threshold
     pub fn with_min_similarity(mut self, min: f32) -> Self {
-        self.search.min_similarity = min.clamp(0.0, 1.0);
+        self.search.min_similarity = min.clamp(-1.0, 1.0);
         self
     }
     
