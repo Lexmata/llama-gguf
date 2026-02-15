@@ -84,22 +84,31 @@ impl LlamaModel {
         &self.token_embedding
     }
 
+    /// Dequantize the embedding table once and return it as a `Cow`.
+    ///
+    /// For F32 embeddings this borrows the existing data (zero-copy).
+    /// For quantized embeddings this dequantizes once into an owned `Vec`.
+    fn dequantize_embeddings<'a>(
+        &'a self,
+        backend: &dyn Backend,
+    ) -> ModelResult<std::borrow::Cow<'a, [f32]>> {
+        if self.token_embedding.dtype() == DType::F32 {
+            Ok(std::borrow::Cow::Borrowed(self.token_embedding.as_f32()?))
+        } else {
+            let numel = self.token_embedding.numel();
+            let mut dequant = Tensor::zeros(vec![numel], DType::F32);
+            backend.dequantize(&self.token_embedding, &mut dequant)?;
+            Ok(std::borrow::Cow::Owned(dequant.as_f32()?.to_vec()))
+        }
+    }
+
     /// Get token embedding for given token IDs (public for testing)
     pub fn embed_tokens(&self, tokens: &[u32], backend: &dyn Backend) -> ModelResult<Tensor> {
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let seq_len = tokens.len();
 
-        // Handle both quantized and non-quantized embeddings
-        let embedding_data: Vec<f32> = if self.token_embedding.dtype() == DType::F32 {
-            self.token_embedding.as_f32()?.to_vec()
-        } else {
-            // Dequantize the embedding tensor
-            let numel = self.token_embedding.numel();
-            let mut dequant = Tensor::zeros(vec![numel], DType::F32);
-            backend.dequantize(&self.token_embedding, &mut dequant)?;
-            dequant.as_f32()?.to_vec()
-        };
+        let embedding_data = self.dequantize_embeddings(backend)?;
 
         let mut output = vec![0.0f32; seq_len * hidden_size];
 
@@ -171,14 +180,37 @@ impl Model for LlamaModel {
             });
         }
 
-        // Process each token sequentially to properly build KV cache
-        let mut final_hidden = None;
+        // Dequantize the embedding table ONCE for all tokens in this forward
+        // pass.  Previously, embed_tokens() dequantized the entire table for
+        // every single token, making prefill cost O(n × vocab × hidden) instead
+        // of O(vocab × hidden).
+        let embedding_data = self.dequantize_embeddings(backend)?;
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
 
+        // Pre-allocate a reusable hidden-state buffer.
+        let mut hidden_buf = vec![0.0f32; hidden_size];
+
+        // Process each token sequentially through all layers.
+        // Tokens must be processed one at a time because each token's KV cache
+        // entry at position `p` must be populated before the next token at
+        // position `p+1` can attend to it.
         for (token_offset, &token) in tokens.iter().enumerate() {
             let current_pos = ctx.position + token_offset;
+            let token_idx = token as usize;
 
-            // Get embedding for single token
-            let mut hidden = self.embed_tokens(&[token], backend)?;
+            if token_idx >= vocab_size {
+                return Err(ModelError::InvalidMetadata {
+                    key: "token".into(),
+                    message: format!("Token ID {} exceeds vocab size {}", token, vocab_size),
+                });
+            }
+
+            // Look up embedding from cached (dequantized) table — O(hidden_size) copy.
+            let src = token_idx * hidden_size;
+            hidden_buf.copy_from_slice(&embedding_data[src..src + hidden_size]);
+
+            let mut hidden = Tensor::from_f32(&hidden_buf, vec![hidden_size])?;
 
             // Run through transformer layers
             for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -193,17 +225,16 @@ impl Model for LlamaModel {
                 )?;
             }
 
-            final_hidden = Some(hidden);
+            // Keep the last hidden state for logits (reuse buffer on next iter).
+            if token_offset + 1 == tokens.len() {
+                // Last token — compute logits from this hidden state.
+                ctx.position = new_pos;
+                ctx.kv_cache.seq_len = new_pos;
+                return self.compute_logits(&hidden, backend);
+            }
         }
 
-        // Update position
-        ctx.position = new_pos;
-        ctx.kv_cache.seq_len = new_pos;
-
-        // Compute logits from final hidden state
-        let hidden =
-            final_hidden.ok_or_else(|| ModelError::ConfigError("No tokens to process".into()))?;
-        self.compute_logits(&hidden, backend)
+        Err(ModelError::ConfigError("No tokens to process".into()))
     }
 
     fn config(&self) -> &ModelConfig {

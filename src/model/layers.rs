@@ -306,50 +306,18 @@ impl Attention {
             }
         }
 
-        // Build K and V tensors from cache for attention
-        // We need [num_kv_heads, kv_len, head_dim] where kv_len = pos + 1
+        // Compute attention reading K/V directly from the cache (strided).
+        // This avoids allocating + copying a contiguous [num_kv_heads, kv_len, head_dim]
+        // tensor on every token, which was previously O(n²) total during prefill.
         let kv_len = pos + 1;
-        let mut k_for_attn = Tensor::zeros(vec![num_kv_heads, kv_len, head_dim], DType::F32);
-        let mut v_for_attn = Tensor::zeros(vec![num_kv_heads, kv_len, head_dim], DType::F32);
-
-        {
-            let k_cache_data = k_cache.as_f32()?;
-            let k_attn_data = k_for_attn.as_f32_mut()?;
-
-            for h in 0..num_kv_heads {
-                for p in 0..kv_len {
-                    let cache_offset = h * max_seq_len * head_dim + p * head_dim;
-                    let attn_offset = h * kv_len * head_dim + p * head_dim;
-
-                    k_attn_data[attn_offset..attn_offset + head_dim]
-                        .copy_from_slice(&k_cache_data[cache_offset..cache_offset + head_dim]);
-                }
-            }
-        }
-
-        {
-            let v_cache_data = v_cache.as_f32()?;
-            let v_attn_data = v_for_attn.as_f32_mut()?;
-
-            for h in 0..num_kv_heads {
-                for p in 0..kv_len {
-                    let cache_offset = h * max_seq_len * head_dim + p * head_dim;
-                    let attn_offset = h * kv_len * head_dim + p * head_dim;
-
-                    v_attn_data[attn_offset..attn_offset + head_dim]
-                        .copy_from_slice(&v_cache_data[cache_offset..cache_offset + head_dim]);
-                }
-            }
-        }
-
-        // Compute attention using full cached K, V
         let mut attn_out = Tensor::zeros(vec![self.num_heads, 1, self.head_dim], DType::F32);
-        backend.attention(
+        backend.attention_cached(
             &q_reshaped,
-            &k_for_attn,
-            &v_for_attn,
+            k_cache,
+            v_cache,
             &mut attn_out,
             self.scale,
+            kv_len,
         )?;
 
         // Reshape back to [hidden_size]

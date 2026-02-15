@@ -175,6 +175,65 @@ pub trait Backend: Send + Sync {
         // Backends can override this with optimized implementations
         self.attention(q, k, v, out, scale)
     }
+
+    /// Compute causal self-attention directly from KV cache tensors.
+    ///
+    /// This avoids copying the KV cache into contiguous tensors for each
+    /// token, which is a major performance win during autoregressive
+    /// generation and prefill.
+    ///
+    /// # Arguments
+    /// * `q` - Query tensor [num_heads, 1, head_dim] (single query position)
+    /// * `k_cache` - Key cache tensor [num_kv_heads, max_seq_len, head_dim]
+    /// * `v_cache` - Value cache tensor [num_kv_heads, max_seq_len, head_dim]
+    /// * `out` - Output tensor [num_heads, 1, head_dim]
+    /// * `scale` - Attention scale factor (typically 1/sqrt(head_dim))
+    /// * `kv_len` - Number of valid positions in the cache (positions 0..kv_len)
+    fn attention_cached(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        scale: f32,
+        kv_len: usize,
+    ) -> BackendResult<()> {
+        // Default: extract contiguous k/v from cache and call standard attention.
+        // Backends should override with strided implementations for better performance.
+        let num_kv_heads = k_cache.shape()[0];
+        let max_seq_len = k_cache.shape()[1];
+        let head_dim = k_cache.shape()[2];
+
+        let mut k_contig = Tensor::zeros(vec![num_kv_heads, kv_len, head_dim], DType::F32);
+        let mut v_contig = Tensor::zeros(vec![num_kv_heads, kv_len, head_dim], DType::F32);
+
+        {
+            let k_src = k_cache.as_f32()?;
+            let k_dst = k_contig.as_f32_mut()?;
+            for h in 0..num_kv_heads {
+                for p in 0..kv_len {
+                    let src_off = h * max_seq_len * head_dim + p * head_dim;
+                    let dst_off = h * kv_len * head_dim + p * head_dim;
+                    k_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&k_src[src_off..src_off + head_dim]);
+                }
+            }
+        }
+        {
+            let v_src = v_cache.as_f32()?;
+            let v_dst = v_contig.as_f32_mut()?;
+            for h in 0..num_kv_heads {
+                for p in 0..kv_len {
+                    let src_off = h * max_seq_len * head_dim + p * head_dim;
+                    let dst_off = h * kv_len * head_dim + p * head_dim;
+                    v_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&v_src[src_off..src_off + head_dim]);
+                }
+            }
+        }
+
+        self.attention(q, &k_contig, &v_contig, out, scale)
+    }
 }
 
 /// Get the default backend (CPU)

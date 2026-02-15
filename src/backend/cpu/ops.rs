@@ -1239,6 +1239,97 @@ pub fn attention(
 }
 
 // =============================================================================
+// Cached KV Attention (zero-copy from KV cache)
+// =============================================================================
+
+/// Compute causal self-attention reading K/V directly from cache tensors.
+///
+/// K/V cache layout: `[num_kv_heads, max_seq_len, head_dim]`.
+/// Only the first `kv_len` positions are valid.  This avoids allocating +
+/// copying a contiguous `[num_kv_heads, kv_len, head_dim]` tensor on every
+/// token, which previously caused O(n²) total memory traffic during prefill.
+pub fn attention_cached(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    out: &mut Tensor,
+    scale: f32,
+    kv_len: usize,
+) -> BackendResult<()> {
+    check_dtype(q, DType::F32)?;
+    check_dtype(k_cache, DType::F32)?;
+    check_dtype(v_cache, DType::F32)?;
+    check_dtype(out, DType::F32)?;
+
+    let q_shape = q.shape();
+    let k_shape = k_cache.shape();
+
+    let num_heads = q_shape[0];
+    let head_dim = q_shape[2];
+    let num_kv_heads = k_shape[0];
+    let max_seq_len = k_shape[1]; // stride between heads
+
+    let num_queries_per_kv = num_heads / num_kv_heads;
+
+    let q_data = q.as_f32()?;
+    let k_data = k_cache.as_f32()?;
+    let v_data = v_cache.as_f32()?;
+    let out_data = out.as_f32_mut()?;
+
+    for head in 0..num_heads {
+        let kv_head = head / num_queries_per_kv;
+
+        // q offset: [head, 0, 0] — single query position
+        let q_offset = head * head_dim; // shape is [num_heads, 1, head_dim]
+        let q_vec = &q_data[q_offset..q_offset + head_dim];
+
+        // --- Q · K^T (strided read from cache) ---
+        let mut scores = vec![0.0f32; kv_len];
+        for (kv_pos, score) in scores.iter_mut().enumerate() {
+            // k_cache stride: head * max_seq_len * head_dim + pos * head_dim
+            let k_offset = kv_head * max_seq_len * head_dim + kv_pos * head_dim;
+            let k_vec = &k_data[k_offset..k_offset + head_dim];
+
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q_vec[d] * k_vec[d];
+            }
+            *score = dot * scale;
+        }
+
+        // --- Softmax ---
+        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for s in &mut scores {
+            *s = (*s - max_score).exp();
+            sum += *s;
+        }
+        let inv_sum = 1.0 / sum;
+        for s in &mut scores {
+            *s *= inv_sum;
+        }
+
+        // --- Weighted sum of V (strided read from cache) ---
+        let out_offset = head * head_dim; // [num_heads, 1, head_dim]
+        let out_vec = &mut out_data[out_offset..out_offset + head_dim];
+        out_vec.fill(0.0);
+
+        for (kv_pos, &score_val) in scores.iter().enumerate() {
+            if score_val > 0.0 {
+                let v_offset = kv_head * max_seq_len * head_dim + kv_pos * head_dim;
+                let v_vec = &v_data[v_offset..v_offset + head_dim];
+
+                for d in 0..head_dim {
+                    out_vec[d] += score_val * v_vec[d];
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 

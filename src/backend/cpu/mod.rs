@@ -199,6 +199,18 @@ impl Backend for CpuBackend {
     ) -> BackendResult<()> {
         flash_attn::flash_attention(q, k, v, out, scale, causal)
     }
+
+    fn attention_cached(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        scale: f32,
+        kv_len: usize,
+    ) -> BackendResult<()> {
+        ops::attention_cached(q, k_cache, v_cache, out, scale, kv_len)
+    }
 }
 
 #[cfg(test)]

@@ -711,8 +711,75 @@ impl Backend for CudaBackend {
         out: &mut Tensor,
         scale: f32,
     ) -> BackendResult<()> {
-        // Use CPU for attention - GPU attention has complex implementation
+        // Use CPU for generic attention shapes
         self.cpu_backend.attention(q, k, v, out, scale)
+    }
+
+    fn attention_cached(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        scale: f32,
+        kv_len: usize,
+    ) -> BackendResult<()> {
+        // GPU-accelerated attention reading directly from KV cache.
+        // Uses the attention_multihead kernel which handles strided cache access.
+        let q_shape = q.shape();
+        let k_shape = k_cache.shape();
+
+        let num_heads = q_shape[0];
+        let head_dim = q_shape[2];
+        let num_kv_heads = k_shape[0];
+        let max_seq_len = k_shape[1];
+
+        let q_data = q.as_f32()?;
+        let k_data = k_cache.as_f32()?;
+        let v_data = v_cache.as_f32()?;
+        let out_data = out.as_f32_mut()?;
+
+        // Upload all data to GPU
+        let q_gpu = self.to_device(q_data)?;
+        let k_gpu = self.to_device(k_data)?;
+        let v_gpu = self.to_device(v_data)?;
+        let mut out_gpu = self.alloc_gpu(num_heads * head_dim)?;
+
+        // One block per query head, threads work on kv_len and head_dim.
+        // Shared memory for attention scores.
+        let block_size = 256.min(kv_len.max(1));
+        let config = LaunchConfig {
+            grid_dim: (num_heads as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: (kv_len * 4) as u32,
+        };
+
+        unsafe {
+            self.kernels.attention_multihead.clone().launch(
+                config,
+                (
+                    &q_gpu,
+                    &k_gpu,
+                    &v_gpu,
+                    &mut out_gpu,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    max_seq_len as i32,
+                    kv_len as i32,
+                    scale,
+                ),
+            )
+        }
+        .map_err(|e| {
+            BackendError::OperationFailed(format!("attention_multihead kernel failed: {}", e))
+        })?;
+
+        // Download result
+        let result = self.from_device(&out_gpu)?;
+        out_data.copy_from_slice(&result);
+
+        Ok(())
     }
 }
 
