@@ -66,7 +66,7 @@ struct InferenceConfig {
 fn rms_norm_gpu(
     kernels: &CudaKernels,
     weights: &GpuWeightStore,
-    device: &Arc<CudaDevice>,
+    _device: &Arc<CudaDevice>,
     hidden_size: usize,
     norm_eps: f32,
     weight_name: &str,
@@ -77,14 +77,13 @@ fn rms_norm_gpu(
         .get(weight_name)
         .ok_or_else(|| BackendError::OperationFailed(format!("Missing {}", weight_name)))?;
 
-    let n = hidden_size;
-    let eps = norm_eps;
-
-    // Sum of squares reduction
-    let mut sum_sq = device
-        .alloc_zeros::<f32>(1)
-        .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
-
+    // Use the fused RMS norm kernel which correctly handles arbitrary hidden
+    // sizes via stride-based loops within a single block.  The old two-pass
+    // kernel (rms_norm_sum_sq + rms_norm_scale) only launched 256 threads
+    // with grid_dim=(1,1,1), silently ignoring elements beyond index 255.
+    // For hidden_size=896 (Qwen 0.5B) this meant 71% of the vector was
+    // excluded from the sum-of-squares, producing wildly incorrect norms
+    // that compounded across layers into garbled output.
     let config = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (256, 1, 1),
@@ -93,29 +92,12 @@ fn rms_norm_gpu(
 
     unsafe {
         kernels
-            .rms_norm_sum_sq
+            .rms_norm_fused
             .clone()
-            .launch(config, (x, &mut sum_sq, n as i32))
-    }
-    .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
-
-    let sum_sq_val: Vec<f32> = device
-        .dtoh_sync_copy(&sum_sq)
-        .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
-    let rms = (sum_sq_val[0] / n as f32 + eps).sqrt();
-    let rms_inv = 1.0 / rms;
-
-    let config = LaunchConfig {
-        grid_dim: (((n + 255) / 256) as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    unsafe {
-        kernels
-            .rms_norm_scale
-            .clone()
-            .launch(config, (x, &weight.data, out, rms_inv, n as i32))
+            .launch(
+                config,
+                (x, &weight.data, out, norm_eps, hidden_size as i32),
+            )
     }
     .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
 }
