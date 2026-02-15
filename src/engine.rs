@@ -874,19 +874,32 @@ impl ChatEngine {
         // Add new tokens to conversation
         self.conversation_tokens.extend(&new_tokens);
 
-        // Process the new prompt tokens through the model
-        let start_pos = self.ctx.position;
-        for (i, &token) in new_tokens.iter().enumerate() {
-            let pos = start_pos + i;
-            if pos < self.engine.config.max_seq_len {
-                let _ = self.engine.model.forward(&[token], &mut self.ctx);
-            }
-        }
-
-        // Generate response
+        // Batch-prefill: process ALL prompt tokens in a single forward pass.
+        // This is dramatically faster than one-at-a-time, especially on GPU
+        // backends where kernel launch overhead dominates for tiny batches.
+        let eos_id = self.engine.tokenizer.special_tokens.eos_token_id;
         let mut response_text = String::new();
 
-        for _ in 0..max_tokens {
+        if new_tokens.is_empty() {
+            self.is_first_turn = false;
+            return Ok(response_text);
+        }
+
+        let prefill_logits = self.engine.model.forward(&new_tokens, &mut self.ctx)?;
+        let first_token = self.sampler.sample(&prefill_logits, &self.conversation_tokens);
+
+        if first_token == eos_id {
+            self.is_first_turn = false;
+            return Ok(response_text);
+        }
+
+        if let Ok(text) = self.engine.tokenizer.decode(&[first_token]) {
+            response_text.push_str(&text);
+        }
+        self.conversation_tokens.push(first_token);
+
+        // Autoregressive decode for the remaining tokens
+        for _ in 1..max_tokens {
             // Check stop patterns
             let should_stop = self
                 .engine
@@ -895,7 +908,6 @@ impl ChatEngine {
                 .iter()
                 .any(|p| response_text.contains(p));
             if should_stop {
-                // Trim the stop pattern from the end
                 for pattern in self.engine.chat_template.stop_patterns() {
                     if let Some(idx) = response_text.find(pattern) {
                         response_text.truncate(idx);
@@ -913,8 +925,7 @@ impl ChatEngine {
             let logits = self.engine.model.forward(&[last_token], &mut self.ctx)?;
             let next_token = self.sampler.sample(&logits, &self.conversation_tokens);
 
-            // Check for EOS
-            if next_token == self.engine.tokenizer.special_tokens.eos_token_id {
+            if next_token == eos_id {
                 break;
             }
 
@@ -954,15 +965,15 @@ impl ChatEngine {
         // Ensure context space
         self.ensure_context_space(new_tokens.len(), max_tokens);
 
-        // Add and process new tokens
+        // Add new tokens to conversation
         self.conversation_tokens.extend(&new_tokens);
-        let start_pos = self.ctx.position;
-        for (i, &token) in new_tokens.iter().enumerate() {
-            let pos = start_pos + i;
-            if pos < self.engine.config.max_seq_len {
-                let _ = self.engine.model.forward(&[token], &mut self.ctx);
-            }
-        }
+
+        // Batch-prefill all prompt tokens in a single forward pass.
+        let prefill_logits = if !new_tokens.is_empty() {
+            Some(self.engine.model.forward(&new_tokens, &mut self.ctx)?)
+        } else {
+            None
+        };
 
         self.is_first_turn = false;
 
@@ -971,6 +982,7 @@ impl ChatEngine {
             remaining: max_tokens,
             done: false,
             accumulated: String::new(),
+            prefill_logits,
         })
     }
 
@@ -1015,6 +1027,8 @@ pub struct ChatStream<'a> {
     remaining: usize,
     done: bool,
     accumulated: String,
+    /// Logits from the batched prefill pass; consumed on the first `next()` call.
+    prefill_logits: Option<crate::tensor::Tensor>,
 }
 
 impl<'a> Iterator for ChatStream<'a> {
@@ -1033,25 +1047,31 @@ impl<'a> Iterator for ChatStream<'a> {
             }
         }
 
-        let last_token = *self.chat_engine.conversation_tokens.last().unwrap_or(
-            &self
+        // On the first call, use the prefill logits (no extra forward pass).
+        // On subsequent calls, run the standard single-token decode.
+        let logits = if let Some(prefill) = self.prefill_logits.take() {
+            prefill
+        } else {
+            let last_token = *self.chat_engine.conversation_tokens.last().unwrap_or(
+                &self
+                    .chat_engine
+                    .engine
+                    .tokenizer
+                    .special_tokens
+                    .bos_token_id,
+            );
+
+            match self
                 .chat_engine
                 .engine
-                .tokenizer
-                .special_tokens
-                .bos_token_id,
-        );
-
-        let logits = match self
-            .chat_engine
-            .engine
-            .model
-            .forward(&[last_token], &mut self.chat_engine.ctx)
-        {
-            Ok(l) => l,
-            Err(e) => {
-                self.done = true;
-                return Some(Err(EngineError::Model(e)));
+                .model
+                .forward(&[last_token], &mut self.chat_engine.ctx)
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(EngineError::Model(e)));
+                }
             }
         };
 
