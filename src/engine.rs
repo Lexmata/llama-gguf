@@ -994,6 +994,100 @@ impl ChatEngine {
         Ok(response_text.trim().to_string())
     }
 
+    /// Send a message and get the full response, with a prefix injected as the
+    /// start of the assistant's reply. The prefix tokens are prefilled alongside
+    /// the prompt tokens so the model continues from the prefix text. The prefix
+    /// is prepended to the returned string.
+    ///
+    /// This is useful for forcing the model to start with a particular token
+    /// sequence (e.g. `{` for JSON output).
+    pub fn chat_with_prefix(
+        &mut self,
+        message: &str,
+        prefix: &str,
+    ) -> Result<String, EngineError> {
+        let max_tokens = self.engine.engine_config.max_tokens;
+
+        let formatted = if self.is_first_turn {
+            self.engine
+                .chat_template
+                .format_first_turn(&self.system_prompt, message)
+        } else {
+            self.engine.chat_template.format_continuation(message)
+        };
+
+        // Append prefix to the formatted prompt so it becomes part of the prefill
+        let formatted_with_prefix = format!("{}{}", formatted, prefix);
+
+        let new_tokens = self
+            .engine
+            .tokenizer
+            .encode(&formatted_with_prefix, self.is_first_turn && self.engine.add_bos)?;
+
+        self.ensure_context_space(new_tokens.len(), max_tokens);
+        self.conversation_tokens.extend(&new_tokens);
+
+        let eos_id = self.engine.tokenizer.special_tokens.eos_token_id;
+        let mut response_text = prefix.to_string();
+
+        if new_tokens.is_empty() {
+            self.is_first_turn = false;
+            return Ok(response_text);
+        }
+
+        let prefill_logits = self.engine.model.forward(&new_tokens, &mut self.ctx)?;
+        let first_token = self.sampler.sample(&prefill_logits, &self.conversation_tokens);
+
+        if first_token == eos_id {
+            self.is_first_turn = false;
+            return Ok(response_text);
+        }
+
+        if let Ok(text) = self.engine.tokenizer.decode(&[first_token]) {
+            response_text.push_str(&text);
+        }
+        self.conversation_tokens.push(first_token);
+
+        for _ in 1..max_tokens {
+            let should_stop = self
+                .engine
+                .chat_template
+                .stop_patterns()
+                .iter()
+                .any(|p| response_text.contains(p));
+            if should_stop {
+                for pattern in self.engine.chat_template.stop_patterns() {
+                    if let Some(idx) = response_text.find(pattern) {
+                        response_text.truncate(idx);
+                        break;
+                    }
+                }
+                break;
+            }
+
+            let last_token = *self
+                .conversation_tokens
+                .last()
+                .unwrap_or(&self.engine.tokenizer.special_tokens.bos_token_id);
+
+            let logits = self.engine.model.forward(&[last_token], &mut self.ctx)?;
+            let next_token = self.sampler.sample(&logits, &self.conversation_tokens);
+
+            if next_token == eos_id {
+                break;
+            }
+
+            if let Ok(text) = self.engine.tokenizer.decode(&[next_token]) {
+                response_text.push_str(&text);
+            }
+
+            self.conversation_tokens.push(next_token);
+        }
+
+        self.is_first_turn = false;
+        Ok(response_text.trim().to_string())
+    }
+
     /// Send a message and stream the response token by token.
     ///
     /// Returns an iterator of `Result<String, EngineError>` where each item is
