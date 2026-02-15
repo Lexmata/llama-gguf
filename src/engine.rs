@@ -355,16 +355,21 @@ impl Engine {
 
         let concrete_model = loader.build_model()?;
 
-        // Select backend -- must happen before boxing the model so CUDA can
-        // access the concrete LlamaModel type for weight upload.
-        let backend: Arc<dyn Backend> = if config.use_gpu {
-            Self::select_gpu_backend(&concrete_model)
+        // Select backend and model implementation.
+        //
+        // When CUDA is available we try to create a GpuModelWrapper first.
+        // This runs the entire forward pass on GPU with pre-allocated scratch
+        // buffers, eliminating ~770 host↔device transfers per token that the
+        // standard Backend-trait path incurs.  If GPU-only init fails we
+        // fall back to the regular CudaBackend (per-op transfers) or CPU.
+        let (backend, model): (Arc<dyn Backend>, Box<dyn Model>) = if config.use_gpu {
+            Self::select_gpu_model(concrete_model, &model_config)
         } else {
-            Arc::new(crate::backend::cpu::CpuBackend::new())
+            (
+                Arc::new(crate::backend::cpu::CpuBackend::new()),
+                Box::new(concrete_model),
+            )
         };
-
-        // Box the model as a trait object now that GPU weight upload is done
-        let model: Box<dyn Model> = Box::new(concrete_model);
 
         // Detect chat template
         let chat_template = ChatTemplate::detect(&gguf);
@@ -496,9 +501,58 @@ impl Engine {
         })
     }
 
+    /// Select the best GPU model + backend combination.
+    ///
+    /// Tries GPU-only inference first (all computation on GPU, ~386× fewer
+    /// host↔device transfers), then falls back to the per-op CudaBackend,
+    /// then to CPU.
+    #[allow(unused_variables)]
+    fn select_gpu_model(
+        model: crate::model::LlamaModel,
+        config: &ModelConfig,
+    ) -> (Arc<dyn Backend>, Box<dyn Model>) {
+        // Try full GPU-only inference first (CUDA only)
+        #[cfg(feature = "cuda")]
+        {
+            let architecture = model.architecture();
+            match crate::backend::cuda::gpu_only::GpuOnlyInference::from_model(
+                &model,
+                config.max_seq_len,
+            ) {
+                Ok(gpu) => {
+                    tracing::info!(
+                        "Using GPU-only inference (all computation on GPU, minimal transfers)"
+                    );
+                    let wrapper = crate::backend::cuda::gpu_only::GpuModelWrapper::new(
+                        gpu,
+                        config.clone(),
+                        architecture,
+                    );
+                    // The Backend is only needed for InferenceContext construction;
+                    // computation goes through GpuModelWrapper directly.
+                    return (
+                        Arc::new(crate::backend::cpu::CpuBackend::new()),
+                        Box::new(wrapper),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "GPU-only inference init failed ({}), trying per-op GPU backend",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Fall back to per-op GPU backend
+        let backend = Self::select_gpu_backend(&model);
+        (backend, Box::new(model))
+    }
+
     /// Select the best available GPU backend.
     ///
     /// Priority: CUDA > Metal > DX12 > Vulkan > CPU fallback.
+    #[allow(unused_variables)]
     pub fn select_gpu_backend(model: &crate::model::LlamaModel) -> Arc<dyn Backend> {
         // Try CUDA first (NVIDIA GPUs)
         #[cfg(feature = "cuda")]
