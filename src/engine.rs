@@ -499,7 +499,7 @@ impl Engine {
     /// Select the best available GPU backend.
     ///
     /// Priority: CUDA > Metal > DX12 > Vulkan > CPU fallback.
-    pub fn select_gpu_backend(_model: &crate::model::LlamaModel) -> Arc<dyn Backend> {
+    pub fn select_gpu_backend(model: &crate::model::LlamaModel) -> Arc<dyn Backend> {
         // Try CUDA first (NVIDIA GPUs)
         #[cfg(feature = "cuda")]
         {
