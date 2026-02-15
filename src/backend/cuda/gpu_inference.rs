@@ -166,6 +166,7 @@ impl GpuInference {
                 &mut self.model.scratch.q,
                 &mut self.model.scratch.k,
                 num_heads,
+                num_kv_heads,
                 head_dim,
                 self.pos,
                 freq_base,

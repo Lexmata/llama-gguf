@@ -314,7 +314,7 @@ __global__ void vec_mat_f32(const float* vec, const float* mat, float* out,
 // RoPE for LLaMA-style (consecutive pairs)
 // q, k: [num_heads * head_dim] for single position
 __global__ void rope_single_pos(float* q, float* k, 
-                                 int num_heads, int head_dim,
+                                 int num_heads, int num_kv_heads, int head_dim,
                                  int pos, float freq_base, float freq_scale,
                                  int use_neox) {
     int head = blockIdx.x;
@@ -330,30 +330,39 @@ __global__ void rope_single_pos(float* q, float* k,
     float cos_theta = cosf(theta);
     float sin_theta = sinf(theta);
     
-    int base = head * head_dim;
-    int idx0, idx1;
+    int q_base = head * head_dim;
+    int q_idx0, q_idx1;
     
     if (use_neox) {
-        // NeoX: (i, i + half_dim)
-        idx0 = base + i;
-        idx1 = base + i + half_dim;
+        q_idx0 = q_base + i;
+        q_idx1 = q_base + i + half_dim;
     } else {
-        // LLaMA: (2*i, 2*i+1)
-        idx0 = base + 2 * i;
-        idx1 = base + 2 * i + 1;
+        q_idx0 = q_base + 2 * i;
+        q_idx1 = q_base + 2 * i + 1;
     }
     
-    // Rotate Q
-    float q0 = q[idx0];
-    float q1 = q[idx1];
-    q[idx0] = q0 * cos_theta - q1 * sin_theta;
-    q[idx1] = q0 * sin_theta + q1 * cos_theta;
+    // Rotate Q (always — all heads)
+    float q0 = q[q_idx0];
+    float q1 = q[q_idx1];
+    q[q_idx0] = q0 * cos_theta - q1 * sin_theta;
+    q[q_idx1] = q0 * sin_theta + q1 * cos_theta;
     
-    // Rotate K
-    float k0 = k[idx0];
-    float k1 = k[idx1];
-    k[idx0] = k0 * cos_theta - k1 * sin_theta;
-    k[idx1] = k0 * sin_theta + k1 * cos_theta;
+    // Rotate K only for KV heads (skip for GQA heads beyond num_kv_heads)
+    if (head < num_kv_heads) {
+        int k_base = head * head_dim;
+        int k_idx0, k_idx1;
+        if (use_neox) {
+            k_idx0 = k_base + i;
+            k_idx1 = k_base + i + half_dim;
+        } else {
+            k_idx0 = k_base + 2 * i;
+            k_idx1 = k_base + 2 * i + 1;
+        }
+        float k0 = k[k_idx0];
+        float k1 = k[k_idx1];
+        k[k_idx0] = k0 * cos_theta - k1 * sin_theta;
+        k[k_idx1] = k0 * sin_theta + k1 * cos_theta;
+    }
 }
 
 // ============================================================================

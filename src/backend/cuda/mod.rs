@@ -600,6 +600,7 @@ impl Backend for CudaBackend {
         // Get dimensions - for single position inference, q/k are [num_heads, head_dim]
         // or [num_heads, 1, head_dim]
         let q_shape = q.shape();
+        let k_shape = k.shape();
 
         // Handle different tensor layouts
         let (num_heads, head_dim) = if q_shape.len() == 2 {
@@ -612,6 +613,15 @@ impl Backend for CudaBackend {
             return self
                 .cpu_backend
                 .rope(q, k, pos, freq_base, freq_scale, use_neox);
+        };
+
+        // Derive num_kv_heads from K shape (may differ from num_heads for GQA)
+        let num_kv_heads = if k_shape.len() == 2 {
+            k_shape[0]
+        } else if k_shape.len() == 3 && k_shape[1] == 1 {
+            k_shape[0]
+        } else {
+            num_heads // fallback
         };
 
         let q_data = q.as_f32_mut()?;
@@ -635,6 +645,7 @@ impl Backend for CudaBackend {
                     &mut q_gpu,
                     &mut k_gpu,
                     num_heads as i32,
+                    num_kv_heads as i32,
                     head_dim as i32,
                     pos as i32,
                     freq_base,

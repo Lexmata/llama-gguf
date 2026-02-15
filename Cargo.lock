@@ -1209,7 +1209,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llama-gguf"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ash",
  "axum",

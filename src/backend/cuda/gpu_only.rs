@@ -318,10 +318,7 @@ impl GpuOnlyInference {
         let hidden_norm = alloc(cfg.hidden_size)?;
         let residual = alloc(cfg.hidden_size)?;
         let q = alloc(cfg.num_heads * cfg.head_dim)?;
-        // Allocate K buffer to max(num_heads, num_kv_heads) * head_dim so the
-        // RoPE kernel can safely launch with num_heads grid blocks for GQA
-        // models without writing past the end of the buffer.
-        let k = alloc(cfg.num_heads.max(cfg.num_kv_heads) * cfg.head_dim)?;
+        let k = alloc(cfg.num_kv_heads * cfg.head_dim)?;
         let v = alloc(cfg.num_kv_heads * cfg.head_dim)?;
         let attn_out = alloc(cfg.hidden_size)?;
         let ffn_gate = alloc(cfg.intermediate_size)?;
@@ -626,12 +623,8 @@ impl GpuOnlyInference {
     fn apply_rope_gpu(&mut self) -> BackendResult<()> {
         let cfg = &self.config;
 
-        // The rope_single_pos kernel processes both Q and K simultaneously
-        // using the same grid dimensions.  For GQA models where num_heads >
-        // num_kv_heads, we launch with num_heads blocks.  The K scratch buffer
-        // is allocated to max(num_heads, num_kv_heads) * head_dim so the
-        // kernel can safely write to extra K heads (the data is ignored by
-        // the KV cache update which only reads num_kv_heads heads).
+        // The rope_single_pos kernel processes Q for all heads and K only
+        // for the first num_kv_heads heads (GQA-safe).
         let config = LaunchConfig {
             grid_dim: (cfg.num_heads as u32, 1, 1),
             block_dim: ((cfg.head_dim / 2) as u32, 1, 1),
@@ -645,6 +638,7 @@ impl GpuOnlyInference {
                     &mut self.q,
                     &mut self.k,
                     cfg.num_heads as i32,
+                    cfg.num_kv_heads as i32,
                     cfg.head_dim as i32,
                     self.pos as i32,
                     cfg.freq_base,
