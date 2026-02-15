@@ -91,7 +91,7 @@ __global__ void gelu_f32(const float* x, float* out, int n) {
 // Normalization
 // ============================================================================
 
-// RMS normalization - two-pass algorithm
+// RMS normalization - two-pass algorithm (legacy, kept for reference)
 __global__ void rms_norm_sum_sq(const float* x, float* sum_sq, int n) {
     extern __shared__ float sdata[];
     
@@ -118,6 +118,49 @@ __global__ void rms_norm_scale(const float* x, const float* weight, float* out,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         out[idx] = x[idx] * rms_inv * weight[idx];
+    }
+}
+
+// Fused RMS normalization — single kernel, no CPU round-trip.
+// One block processes the entire vector.  Shared memory holds partial
+// sums-of-squares; after reduction we broadcast rms_inv and each
+// thread writes its output element.
+__global__ void rms_norm_fused(const float* x, const float* weight,
+                                float* out, float eps, int n) {
+    extern __shared__ float sdata[];
+    
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Step 1: Each thread accumulates partial sum-of-squares.
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += stride) {
+        float v = x[i];
+        local_sum += v * v;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    
+    // Step 2: Parallel reduction over shared memory.
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    // Step 3: Compute rms_inv and broadcast via shared memory.
+    if (tid == 0) {
+        float rms = sqrtf(sdata[0] / (float)n + eps);
+        sdata[0] = 1.0f / rms;  // reuse sdata[0] for rms_inv
+    }
+    __syncthreads();
+    
+    float rms_inv = sdata[0];
+    
+    // Step 4: Scale output — each thread writes its elements.
+    for (int i = tid; i < n; i += stride) {
+        out[i] = x[i] * rms_inv * weight[i];
     }
 }
 
@@ -185,6 +228,59 @@ __global__ void softmax_div(float* out, float sum_inv, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         out[idx] *= sum_inv;
+    }
+}
+
+// Fused softmax — single kernel using online softmax algorithm.
+// One block processes the entire vector.  No CPU round-trips.
+__global__ void softmax_fused(const float* x, float* out, int n) {
+    extern __shared__ float sdata[];
+    // sdata layout: [blockDim.x] for max, then [blockDim.x] for sum
+    float* smax = sdata;
+    float* ssum = sdata + blockDim.x;
+    
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Step 1: Find maximum (parallel reduction).
+    float local_max = -MY_INFINITY;
+    for (int i = tid; i < n; i += stride) {
+        local_max = fmaxf(local_max, x[i]);
+    }
+    smax[tid] = local_max;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smax[tid] = fmaxf(smax[tid], smax[tid + s]);
+        }
+        __syncthreads();
+    }
+    float max_val = smax[0];
+    __syncthreads();
+    
+    // Step 2: Compute exp(x - max) and sum (parallel reduction).
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += stride) {
+        float e = expf(x[i] - max_val);
+        out[i] = e;
+        local_sum += e;
+    }
+    ssum[tid] = local_sum;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            ssum[tid] += ssum[tid + s];
+        }
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / ssum[0];
+    __syncthreads();
+    
+    // Step 3: Normalize.
+    for (int i = tid; i < n; i += stride) {
+        out[i] *= inv_sum;
     }
 }
 
@@ -512,6 +608,8 @@ __global__ void update_kv_cache(const float* k, const float* v,
 // k_cache, v_cache: [num_kv_heads * max_seq_len * head_dim]
 // out: [num_heads * head_dim]
 // One block per query head
+//
+// Shared memory layout: scores[kv_len] + reduce[blockDim.x]
 __global__ void attention_multihead(const float* q,
                                      const float* k_cache,
                                      const float* v_cache,
@@ -520,10 +618,12 @@ __global__ void attention_multihead(const float* q,
                                      int head_dim, int max_seq_len,
                                      int kv_len, float scale) {
     extern __shared__ float shared[];
-    float* scores = shared;  // [kv_len]
+    float* scores = shared;            // [kv_len]
+    float* reduce = shared + kv_len;   // [blockDim.x]
     
     int head = blockIdx.x;
     int tid = threadIdx.x;
+    int nthreads = blockDim.x;
     
     // GQA: map query head to KV head
     int heads_per_kv = num_heads / num_kv_heads;
@@ -536,7 +636,7 @@ __global__ void attention_multihead(const float* q,
     const float* v_head = v_cache + kv_head * max_seq_len * head_dim;
     
     // Step 1: Compute attention scores (parallel over kv_len)
-    for (int pos = tid; pos < kv_len; pos += blockDim.x) {
+    for (int pos = tid; pos < kv_len; pos += nthreads) {
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             score += q_head[d] * k_head[pos * head_dim + d];
@@ -545,29 +645,50 @@ __global__ void attention_multihead(const float* q,
     }
     __syncthreads();
     
-    // Step 2: Softmax (single thread)
-    if (tid == 0) {
-        float max_val = -MY_INFINITY;
-        for (int i = 0; i < kv_len; i++) {
-            max_val = fmaxf(max_val, scores[i]);
+    // Step 2: Parallel softmax over scores[0..kv_len]
+    // 2a: Find max via parallel reduction.
+    float local_max = -MY_INFINITY;
+    for (int i = tid; i < kv_len; i += nthreads) {
+        local_max = fmaxf(local_max, scores[i]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            reduce[tid] = fmaxf(reduce[tid], reduce[tid + s]);
         }
-        
-        float sum = 0.0f;
-        for (int i = 0; i < kv_len; i++) {
-            scores[i] = expf(scores[i] - max_val);
-            sum += scores[i];
+        __syncthreads();
+    }
+    float max_val = reduce[0];
+    __syncthreads();
+    
+    // 2b: Compute exp(score - max) and sum via parallel reduction.
+    float local_sum = 0.0f;
+    for (int i = tid; i < kv_len; i += nthreads) {
+        float e = expf(scores[i] - max_val);
+        scores[i] = e;
+        local_sum += e;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            reduce[tid] += reduce[tid + s];
         }
-        
-        float inv_sum = 1.0f / sum;
-        for (int i = 0; i < kv_len; i++) {
-            scores[i] *= inv_sum;
-        }
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / reduce[0];
+    __syncthreads();
+    
+    // 2c: Normalize.
+    for (int i = tid; i < kv_len; i += nthreads) {
+        scores[i] *= inv_sum;
     }
     __syncthreads();
     
     // Step 3: Weighted sum of values (parallel over head_dim)
     float* out_head = out + head * head_dim;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
+    for (int d = tid; d < head_dim; d += nthreads) {
         float sum = 0.0f;
         for (int pos = 0; pos < kv_len; pos++) {
             sum += scores[pos] * v_head[pos * head_dim + d];
@@ -590,14 +711,18 @@ pub struct CudaKernels {
     pub silu_f32: CudaFunction,
     pub gelu_f32: CudaFunction,
 
-    // Normalization
+    // Normalization (legacy two-pass)
     pub rms_norm_sum_sq: CudaFunction,
     pub rms_norm_scale: CudaFunction,
+    // Normalization (fused single-pass)
+    pub rms_norm_fused: CudaFunction,
 
-    // Softmax
+    // Softmax (legacy three-pass)
     pub softmax_max: CudaFunction,
     pub softmax_exp_sum: CudaFunction,
     pub softmax_div: CudaFunction,
+    // Softmax (fused single-pass)
+    pub softmax_fused: CudaFunction,
 
     // Matrix ops
     pub vec_mat_f32: CudaFunction,
@@ -639,9 +764,11 @@ impl CudaKernels {
                     "gelu_f32",
                     "rms_norm_sum_sq",
                     "rms_norm_scale",
+                    "rms_norm_fused",
                     "softmax_max",
                     "softmax_exp_sum",
                     "softmax_div",
+                    "softmax_fused",
                     "vec_mat_f32",
                     "rope_single_pos",
                     "vec_mat_q4k",
@@ -687,6 +814,11 @@ impl CudaKernels {
                 .ok_or_else(|| {
                     BackendError::InitializationFailed("Kernel 'rms_norm_scale' not found".into())
                 })?,
+            rms_norm_fused: device
+                .get_func("llama_kernels", "rms_norm_fused")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'rms_norm_fused' not found".into())
+                })?,
             softmax_max: device
                 .get_func("llama_kernels", "softmax_max")
                 .ok_or_else(|| {
@@ -701,6 +833,11 @@ impl CudaKernels {
                 .get_func("llama_kernels", "softmax_div")
                 .ok_or_else(|| {
                     BackendError::InitializationFailed("Kernel 'softmax_div' not found".into())
+                })?,
+            softmax_fused: device
+                .get_func("llama_kernels", "softmax_fused")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'softmax_fused' not found".into())
                 })?,
             vec_mat_f32: device
                 .get_func("llama_kernels", "vec_mat_f32")

@@ -373,59 +373,26 @@ impl Backend for CudaBackend {
 
         let x_gpu = self.to_device(x_data)?;
         let mut out_gpu = self.alloc_gpu(n)?;
-        let mut max_gpu = self
-            .device
-            .alloc_zeros::<f32>(1)
-            .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
-        let mut sum_gpu = self
-            .device
-            .alloc_zeros::<f32>(1)
-            .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
 
-        // Initialize max to negative infinity
-        self.device
-            .htod_sync_copy_into(&[f32::NEG_INFINITY], &mut max_gpu)
-            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+        // Fused single-kernel softmax — no CPU round-trips.
+        // One block with up to 1024 threads processes the full vector.
+        // Shared memory: block_size floats for max + block_size floats for sum.
+        let block_size = 1024.min(n.next_power_of_two());
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: (block_size * 4 * 2) as u32,
+        };
 
-        let block_size = 256;
-        let config = launch_config_1d_shared(n, block_size, block_size * 4);
-
-        // Pass 1: Find max
         unsafe {
             self.kernels
-                .softmax_max
+                .softmax_fused
                 .clone()
-                .launch(config.clone(), (&x_gpu, &mut max_gpu, n as i32))
-        }
-        .map_err(|e| BackendError::OperationFailed(format!("softmax_max kernel failed: {}", e)))?;
-
-        // Read max value
-        let max_val = self.from_device(&max_gpu)?[0];
-
-        // Pass 2: Compute exp and sum
-        unsafe {
-            self.kernels.softmax_exp_sum.clone().launch(
-                config.clone(),
-                (&x_gpu, &mut out_gpu, &mut sum_gpu, max_val, n as i32),
-            )
+                .launch(config, (&x_gpu, &mut out_gpu, n as i32))
         }
         .map_err(|e| {
-            BackendError::OperationFailed(format!("softmax_exp_sum kernel failed: {}", e))
+            BackendError::OperationFailed(format!("softmax_fused kernel failed: {}", e))
         })?;
-
-        // Read sum
-        let sum_val = self.from_device(&sum_gpu)?[0];
-        let sum_inv = 1.0 / sum_val;
-
-        // Pass 3: Normalize
-        let config = launch_config_1d(n, 256);
-        unsafe {
-            self.kernels
-                .softmax_div
-                .clone()
-                .launch(config, (&mut out_gpu, sum_inv, n as i32))
-        }
-        .map_err(|e| BackendError::OperationFailed(format!("softmax_div kernel failed: {}", e)))?;
 
         let result = self.from_device(&out_gpu)?;
         out_data.copy_from_slice(&result);
@@ -448,40 +415,24 @@ impl Backend for CudaBackend {
         let x_gpu = self.to_device(x_data)?;
         let w_gpu = self.to_device(w_data)?;
         let mut out_gpu = self.alloc_gpu(n)?;
-        let mut sum_sq_gpu = self
-            .device
-            .alloc_zeros::<f32>(1)
-            .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
 
-        let block_size = 256;
-        let config = launch_config_1d_shared(n, block_size, block_size * 4);
+        // Fused single-kernel RMS norm — no CPU round-trip.
+        // One block with up to 1024 threads processes the full vector.
+        let block_size = 1024.min(n.next_power_of_two());
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: (block_size * 4) as u32,
+        };
 
-        // Pass 1: Compute sum of squares
         unsafe {
-            self.kernels
-                .rms_norm_sum_sq
-                .clone()
-                .launch(config, (&x_gpu, &mut sum_sq_gpu, n as i32))
+            self.kernels.rms_norm_fused.clone().launch(
+                config,
+                (&x_gpu, &w_gpu, &mut out_gpu, eps, n as i32),
+            )
         }
         .map_err(|e| {
-            BackendError::OperationFailed(format!("rms_norm_sum_sq kernel failed: {}", e))
-        })?;
-
-        // Read sum and compute RMS inverse
-        let sum_sq = self.from_device(&sum_sq_gpu)?[0];
-        let rms = (sum_sq / n as f32 + eps).sqrt();
-        let rms_inv = 1.0 / rms;
-
-        // Pass 2: Normalize and scale
-        let config = launch_config_1d(n, 256);
-        unsafe {
-            self.kernels
-                .rms_norm_scale
-                .clone()
-                .launch(config, (&x_gpu, &w_gpu, &mut out_gpu, rms_inv, n as i32))
-        }
-        .map_err(|e| {
-            BackendError::OperationFailed(format!("rms_norm_scale kernel failed: {}", e))
+            BackendError::OperationFailed(format!("rms_norm_fused kernel failed: {}", e))
         })?;
 
         let result = self.from_device(&out_gpu)?;
@@ -746,12 +697,13 @@ impl Backend for CudaBackend {
         let mut out_gpu = self.alloc_gpu(num_heads * head_dim)?;
 
         // One block per query head, threads work on kv_len and head_dim.
-        // Shared memory for attention scores.
-        let block_size = 256.min(kv_len.max(1));
+        // Shared memory: scores[kv_len] + reduce[block_size] for parallel softmax.
+        let block_size = 256.min(kv_len.max(1).next_power_of_two());
+        let shared_bytes = (kv_len + block_size) * 4;
         let config = LaunchConfig {
             grid_dim: (num_heads as u32, 1, 1),
             block_dim: (block_size as u32, 1, 1),
-            shared_mem_bytes: (kv_len * 4) as u32,
+            shared_mem_bytes: shared_bytes as u32,
         };
 
         unsafe {

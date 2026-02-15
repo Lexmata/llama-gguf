@@ -249,6 +249,21 @@ impl Backend for MetalBackend {
         // Fall back to CPU for attention
         self.cpu_fallback.attention(q, k, v, out, scale)
     }
+
+    fn attention_cached(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        scale: f32,
+        kv_len: usize,
+    ) -> BackendResult<()> {
+        // Route directly to CPU strided attention — avoids the default trait
+        // impl that copies the cache into contiguous tensors first.
+        self.cpu_fallback
+            .attention_cached(q, k_cache, v_cache, out, scale, kv_len)
+    }
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
