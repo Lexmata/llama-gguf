@@ -8,6 +8,11 @@ fn main() {
         compile_onnx_proto();
     }
 
+    // Compile distributed gRPC proto when the distributed feature is enabled
+    if env::var("CARGO_FEATURE_DISTRIBUTED").is_ok() {
+        compile_distributed_proto();
+    }
+
     // Compile Metal shaders when the metal feature is enabled (macOS only)
     #[cfg(target_os = "macos")]
     if env::var("CARGO_FEATURE_METAL").is_ok() {
@@ -388,4 +393,24 @@ fn compile_onnx_proto() {
         .out_dir(PathBuf::from(env::var("OUT_DIR").unwrap()))
         .compile_protos(&[proto_path], &[Path::new("proto")])
         .expect("Failed to compile ONNX protobuf");
+}
+
+// =============================================================================
+// Distributed gRPC protobuf compilation
+// =============================================================================
+
+fn compile_distributed_proto() {
+    let proto_path = Path::new("proto/distributed.proto");
+    if !proto_path.exists() {
+        panic!("Distributed proto file not found at proto/distributed.proto");
+    }
+
+    println!("cargo:rerun-if-changed=proto/distributed.proto");
+
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .out_dir(PathBuf::from(env::var("OUT_DIR").unwrap()))
+        .compile_protos(&[proto_path], &[Path::new("proto")])
+        .expect("Failed to compile distributed protobuf");
 }

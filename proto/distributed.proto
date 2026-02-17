@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package distributed;
+
+// Shard service runs on each worker node in the cluster.
+// The coordinator connects to each shard to distribute model layers
+// and orchestrate pipeline-parallel inference.
+service ShardService {
+    // Stream model layer weights from coordinator to shard.
+    // The coordinator reads the GGUF file and sends each assigned layer's
+    // tensors as a stream of LayerData messages.
+    rpc LoadLayers(stream LayerData) returns (LoadResponse);
+
+    // Run a forward pass through this shard's assigned layers.
+    // Receives the hidden state from the previous pipeline stage,
+    // processes it through local transformer layers (updating KV cache),
+    // and returns the output hidden state for the next stage.
+    rpc Forward(ForwardRequest) returns (ForwardResponse);
+
+    // Reset the KV cache on this shard (new sequence).
+    rpc ResetKvCache(ResetRequest) returns (ResetResponse);
+
+    // Health check and capability reporting.
+    rpc Health(HealthRequest) returns (HealthResponse);
+
+    // Send model configuration so the shard can initialize its backend
+    // and KV cache before receiving layers.
+    rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Tensor serialization
+// ---------------------------------------------------------------------------
+
+// Raw tensor data for network transfer.
+// Shape + dtype + raw bytes allows reconstructing any Tensor on the receiver.
+message TensorData {
+    repeated uint64 shape = 1;
+    // DType encoded as uint32 (matches DType enum discriminant order)
+    uint32 dtype = 2;
+    // Raw tensor bytes in little-endian format
+    bytes data = 3;
+    // Optional tensor name (for weight lookup / debugging)
+    string name = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Layer loading
+// ---------------------------------------------------------------------------
+
+// A single named tensor within a layer (e.g. "attn_q.weight").
+message NamedTensor {
+    string name = 1;
+    TensorData tensor = 2;
+}
+
+// All tensors for a single transformer layer.
+message LayerData {
+    // Layer index in the full model (0-based)
+    uint32 layer_index = 1;
+    // All tensors belonging to this layer
+    repeated NamedTensor tensors = 2;
+}
+
+message LoadResponse {
+    bool success = 1;
+    string message = 2;
+    // Number of layers successfully loaded
+    uint32 layers_loaded = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Forward pass
+// ---------------------------------------------------------------------------
+
+message ForwardRequest {
+    // Hidden state tensor from previous pipeline stage
+    TensorData hidden_state = 1;
+    // Current position in the sequence (for KV cache and RoPE)
+    uint32 position = 2;
+    // Current sequence length (number of valid KV cache entries after this step)
+    uint32 seq_len = 3;
+}
+
+message ForwardResponse {
+    // Output hidden state after processing through this shard's layers
+    TensorData hidden_state = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+// ---------------------------------------------------------------------------
+// KV cache management
+// ---------------------------------------------------------------------------
+
+message ResetRequest {}
+
+message ResetResponse {
+    bool success = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Health and status
+// ---------------------------------------------------------------------------
+
+message HealthRequest {}
+
+message HealthResponse {
+    bool healthy = 1;
+    string shard_name = 2;
+    string backend_name = 3;
+    // Layer range this shard is responsible for
+    uint32 layer_start = 4;
+    uint32 layer_end = 5;
+    // Number of layers currently loaded
+    uint32 layers_loaded = 6;
+    // Memory usage in bytes
+    uint64 memory_used = 7;
+    // Whether GPU is available
+    bool gpu_available = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Model configuration sent to shard before layer loading.
+// Contains all parameters needed to initialize the backend and KV cache.
+message ConfigureRequest {
+    uint32 hidden_size = 1;
+    uint32 intermediate_size = 2;
+    uint32 num_layers = 3;
+    uint32 num_heads = 4;
+    uint32 num_kv_heads = 5;
+    uint32 head_dim = 6;
+    uint32 max_seq_len = 7;
+    float norm_eps = 8;
+    // RoPE configuration
+    float rope_freq_base = 9;
+    float rope_freq_scale = 10;
+    bool use_neox_rope = 11;
+    // Layer range assigned to this shard
+    uint32 layer_start = 12;
+    uint32 layer_end = 13;
+    // Whether to use GPU if available
+    bool use_gpu = 14;
+}
+
+message ConfigureResponse {
+    bool success = 1;
+    string message = 2;
+    string backend_name = 3;
+}
