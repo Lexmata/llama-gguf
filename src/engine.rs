@@ -93,6 +93,15 @@ pub struct EngineConfig {
 
     /// Use GPU acceleration (requires `cuda` feature).
     pub use_gpu: bool,
+
+    /// Maximum context length override.
+    ///
+    /// If set, caps the model's context length (and thus KV cache size).
+    /// The model's native `max_seq_len` from GGUF metadata can be very large
+    /// (e.g. 32768) which may exhaust GPU memory for the KV cache alone.
+    /// Set this to a smaller value (e.g. 2048) to reduce VRAM usage.
+    /// If `None` or `0`, uses the model's native `max_seq_len`.
+    pub max_context_len: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -107,6 +116,7 @@ impl Default for EngineConfig {
             max_tokens: 512,
             seed: None,
             use_gpu: false,
+            max_context_len: None,
         }
     }
 }
@@ -363,7 +373,7 @@ impl Engine {
         // standard Backend-trait path incurs.  If GPU-only init fails we
         // fall back to the regular CudaBackend (per-op transfers) or CPU.
         let (backend, model): (Arc<dyn Backend>, Box<dyn Model>) = if config.use_gpu {
-            Self::select_gpu_model(concrete_model, &model_config)
+            Self::select_gpu_model(concrete_model, &model_config, &config)
         } else {
             (
                 Arc::new(crate::backend::cpu::CpuBackend::new()),
@@ -510,14 +520,27 @@ impl Engine {
     fn select_gpu_model(
         model: crate::model::LlamaModel,
         config: &ModelConfig,
+        engine_config: &EngineConfig,
     ) -> (Arc<dyn Backend>, Box<dyn Model>) {
         // Try full GPU-only inference first (CUDA only)
         #[cfg(feature = "cuda")]
         {
             let architecture = model.architecture();
+            // Cap context length if max_context_len is configured
+            let gpu_seq_len = match engine_config.max_context_len {
+                Some(cap) if cap > 0 && cap < config.max_seq_len => {
+                    tracing::info!(
+                        "Capping GPU context length from {} to {} (max_context_len)",
+                        config.max_seq_len,
+                        cap
+                    );
+                    cap
+                }
+                _ => config.max_seq_len,
+            };
             match crate::backend::cuda::gpu_only::GpuOnlyInference::from_model(
                 &model,
-                config.max_seq_len,
+                gpu_seq_len,
             ) {
                 Ok(gpu) => {
                     tracing::info!(

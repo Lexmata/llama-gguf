@@ -525,6 +525,147 @@ __global__ void vec_mat_q4_0(const unsigned char* weight,  // [num_blocks, n, 18
 }
 
 // ============================================================================
+// Quantized Operations - Q6_K (high quality K-quant)
+// ============================================================================
+
+// Q6_K block layout (210 bytes for 256 values):
+// - ql: [128] u8 - low 4 bits
+// - qh: [64] u8 - high 2 bits
+// - scales: [16] i8 - signed per-group scales
+// - d: f16 (2 bytes) - super scale
+
+__global__ void vec_mat_q6k(const unsigned char* weight,
+                            const float* vec,
+                            float* out,
+                            int k, int n) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) return;
+
+    int num_blocks = k / 256;
+    float sum = 0.0f;
+
+    for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+        const unsigned char* block = weight + (block_idx * n + col) * 210;
+
+        // d is at offset 208 (after ql[128] + qh[64] + scales[16])
+        unsigned short d_bits = block[208] | (block[209] << 8);
+        float d = half_to_float(d_bits);
+
+        int vec_base = block_idx * 256;
+
+        // Process 256 elements in two groups of 128
+        for (int ng = 0; ng < 2; ng++) {
+            int ql_base = ng * 64;
+            int qh_base = 128 + ng * 32;
+            int sc_base = 192 + ng * 8;
+            int o_base = ng * 128;
+
+            for (int l = 0; l < 32; l++) {
+                int is_idx = l / 16;
+
+                int q1 = ((block[ql_base + l] & 0x0F) | ((block[qh_base + l] & 0x03) << 4)) - 32;
+                int q2 = ((block[ql_base + l + 32] & 0x0F) | (((block[qh_base + l] >> 2) & 0x03) << 4)) - 32;
+                int q3 = ((block[ql_base + l] >> 4) | (((block[qh_base + l] >> 4) & 0x03) << 4)) - 32;
+                int q4 = ((block[ql_base + l + 32] >> 4) | (((block[qh_base + l] >> 6) & 0x03) << 4)) - 32;
+
+                float sc1 = d * (float)((signed char)block[sc_base + is_idx]);
+                float sc2 = d * (float)((signed char)block[sc_base + is_idx + 2]);
+                float sc3 = d * (float)((signed char)block[sc_base + is_idx + 4]);
+                float sc4 = d * (float)((signed char)block[sc_base + is_idx + 6]);
+
+                sum += vec[vec_base + o_base + l]      * (sc1 * (float)q1);
+                sum += vec[vec_base + o_base + l + 32]  * (sc2 * (float)q2);
+                sum += vec[vec_base + o_base + l + 64]  * (sc3 * (float)q3);
+                sum += vec[vec_base + o_base + l + 96]  * (sc4 * (float)q4);
+            }
+        }
+    }
+
+    out[col] = sum;
+}
+
+// ============================================================================
+// Quantized Operations - Q5_K (5-bit K-quant)
+// ============================================================================
+
+// Q5_K block layout (176 bytes for 256 values):
+// - d: f16 (2 bytes) at offset 0
+// - dmin: f16 (2 bytes) at offset 2
+// - scales: [12] u8 at offset 4
+// - qh: [32] u8 at offset 16  (high bits)
+// - qs: [128] u8 at offset 48 (low 4 bits)
+
+__global__ void vec_mat_q5k(const unsigned char* weight,
+                            const float* vec,
+                            float* out,
+                            int k, int n) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) return;
+
+    int num_blocks = k / 256;
+    float sum = 0.0f;
+
+    for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+        const unsigned char* block = weight + (block_idx * n + col) * 176;
+
+        unsigned short d_bits = block[0] | (block[1] << 8);
+        unsigned short dmin_bits = block[2] | (block[3] << 8);
+        float d = half_to_float(d_bits);
+        float dmin = half_to_float(dmin_bits);
+
+        // Decode scales and mins from 12 bytes at offset 4
+        float scales[8], mins[8];
+        for (int j = 0; j < 4; j++) {
+            scales[j] = (float)(block[4 + j] & 0x3F);
+            mins[j] = (float)(block[4 + j + 4] & 0x3F);
+        }
+        for (int j = 4; j < 8; j++) {
+            scales[j] = (float)((block[4 + j + 4] & 0x0F) | ((block[4 + j - 4] >> 6) << 4));
+            mins[j] = (float)(((block[4 + j + 4] >> 4) & 0x0F) | ((block[4 + j] >> 6) << 4));
+        }
+
+        const unsigned char* qh = block + 16;   // [32] high bits
+        const unsigned char* qs = block + 48;    // [128] low nibbles
+
+        int vec_base = block_idx * 256;
+        int qs_idx = 0;
+        int is = 0;
+        unsigned char u1 = 1;
+        unsigned char u2 = 2;
+
+        for (int group = 0; group < 4; group++) {
+            float d1 = d * scales[is];
+            float m1 = dmin * mins[is];
+            float d2 = d * scales[is + 1];
+            float m2 = dmin * mins[is + 1];
+
+            // First 32: low nibbles + high bit u1
+            for (int l = 0; l < 32; l++) {
+                float lo4 = (float)(qs[qs_idx + l] & 0x0F);
+                float hi5 = (qh[l] & u1) ? 16.0f : 0.0f;
+                sum += vec[vec_base] * (d1 * (lo4 + hi5) - m1);
+                vec_base++;
+            }
+
+            // Next 32: high nibbles + high bit u2
+            for (int l = 0; l < 32; l++) {
+                float hi4 = (float)((qs[qs_idx + l] >> 4) & 0x0F);
+                float hi5 = (qh[l] & u2) ? 16.0f : 0.0f;
+                sum += vec[vec_base] * (d2 * (hi4 + hi5) - m2);
+                vec_base++;
+            }
+
+            qs_idx += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    out[col] = sum;
+}
+
+// ============================================================================
 // Attention
 // ============================================================================
 
@@ -742,6 +883,8 @@ pub struct CudaKernels {
     // Quantized ops
     pub vec_mat_q4k: CudaFunction,
     pub vec_mat_q8_0: CudaFunction,
+    pub vec_mat_q6k: CudaFunction,
+    pub vec_mat_q5k: CudaFunction,
 
     // KV cache
     pub update_kv_cache: CudaFunction,
@@ -783,6 +926,8 @@ impl CudaKernels {
                     "vec_mat_q4k",
                     "vec_mat_q8_0",
                     "vec_mat_q4_0",
+                    "vec_mat_q6k",
+                    "vec_mat_q5k",
                     "attention_single_head",
                     "update_kv_cache",
                     "attention_multihead",
@@ -872,6 +1017,16 @@ impl CudaKernels {
                 .get_func("llama_kernels", "vec_mat_q4_0")
                 .ok_or_else(|| {
                     BackendError::InitializationFailed("Kernel 'vec_mat_q4_0' not found".into())
+                })?,
+            vec_mat_q6k: device
+                .get_func("llama_kernels", "vec_mat_q6k")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'vec_mat_q6k' not found".into())
+                })?,
+            vec_mat_q5k: device
+                .get_func("llama_kernels", "vec_mat_q5k")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'vec_mat_q5k' not found".into())
                 })?,
             attention_single_head: device
                 .get_func("llama_kernels", "attention_single_head")

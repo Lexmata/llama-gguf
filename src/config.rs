@@ -492,6 +492,7 @@ impl Config {
             max_tokens: self.generation.max_tokens,
             seed: self.generation.seed,
             use_gpu: self.model.gpu,
+            max_context_len: None,
         }
     }
 

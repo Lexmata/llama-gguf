@@ -1032,6 +1032,7 @@ fn run_inference(
         max_tokens: n_predict,
         seed,
         use_gpu,
+        max_context_len: None,
     })?;
 
     let raw_prompt = prompt.unwrap_or("Hello");
@@ -1078,6 +1079,7 @@ fn run_chat(
         max_tokens: n_predict,
         seed,
         use_gpu: false,
+        max_context_len: None,
     })?;
 
     let system_text = system_prompt.unwrap_or("You are a helpful AI assistant.");

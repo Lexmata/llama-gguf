@@ -111,6 +111,80 @@ fn linear_gpu(
     x: &CudaSlice<f32>,
     out: &mut CudaSlice<f32>,
 ) -> BackendResult<()> {
+    // Try quantized weight first, then fall back to f32
+    if let Some(qw) = weights.get_quantized(weight_name) {
+        let k = qw.shape[0];
+        let n = if qw.shape.len() >= 2 { qw.shape[1] } else { 1 };
+
+        let config = LaunchConfig {
+            grid_dim: (((n + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        match qw.dtype {
+            DType::Q4K => unsafe {
+                kernels
+                    .vec_mat_q4k
+                    .clone()
+                    .launch(config, (&qw.data, x, &mut *out, k as i32, n as i32))
+            },
+            DType::Q6K => unsafe {
+                kernels
+                    .vec_mat_q6k
+                    .clone()
+                    .launch(config, (&qw.data, x, &mut *out, k as i32, n as i32))
+            },
+            DType::Q5K => unsafe {
+                kernels
+                    .vec_mat_q5k
+                    .clone()
+                    .launch(config, (&qw.data, x, &mut *out, k as i32, n as i32))
+            },
+            DType::Q4_0 => unsafe {
+                kernels
+                    .vec_mat_q4_0
+                    .clone()
+                    .launch(config, (&qw.data, x, &mut *out, k as i32, n as i32))
+            },
+            DType::Q8_0 => unsafe {
+                kernels
+                    .vec_mat_q8_0
+                    .clone()
+                    .launch(config, (&qw.data, x, &mut *out, k as i32, n as i32))
+            },
+            _ => {
+                return Err(BackendError::OperationFailed(format!(
+                    "No GPU kernel for quantized type {:?} (weight {})",
+                    qw.dtype, weight_name
+                )));
+            }
+        }
+        .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+
+        // Add bias if present
+        if let Some(bias_name) = bias_name {
+            if let Some(bias) = weights.get(bias_name) {
+                let mut temp = device
+                    .alloc_zeros::<f32>(n)
+                    .map_err(|e| BackendError::AllocationFailed(format!("{}", e)))?;
+                unsafe {
+                    kernels.add_f32.clone().launch(
+                        config,
+                        (&*out as &CudaSlice<f32>, &bias.data, &mut temp, n as i32),
+                    )
+                }
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+                device
+                    .dtod_copy(&temp, out)
+                    .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    // F32 path (dequantized weights)
     let weight = weights
         .get(weight_name)
         .ok_or_else(|| BackendError::OperationFailed(format!("Missing {}", weight_name)))?;
