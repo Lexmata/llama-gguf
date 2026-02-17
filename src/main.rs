@@ -251,6 +251,35 @@ enum Commands {
         #[arg(default_value = ".")]
         output_dir: String,
     },
+
+    /// Start a distributed inference shard server
+    #[cfg(feature = "distributed")]
+    Shard {
+        /// Port to listen on
+        #[arg(short, long, default_value = "50051")]
+        port: u16,
+
+        /// Host address to bind to
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Shard name (for identification in logs)
+        #[arg(long, default_value = "shard")]
+        name: String,
+
+        /// Use GPU acceleration if available
+        #[arg(long)]
+        gpu: bool,
+    },
+
+    /// Show status of a distributed inference cluster
+    #[cfg(feature = "distributed")]
+    #[command(name = "cluster")]
+    Cluster {
+        /// Path to cluster TOML configuration file
+        #[arg(short, long)]
+        config: String,
+    },
 }
 
 /// RAG subcommands
@@ -838,6 +867,19 @@ fn main() {
                 eprintln!("Error generating man pages: {}", e);
                 std::process::exit(1);
             }
+        }
+        #[cfg(feature = "distributed")]
+        Commands::Shard {
+            port,
+            host,
+            name,
+            gpu,
+        } => {
+            run_shard_server(&host, port, &name, gpu);
+        }
+        #[cfg(feature = "distributed")]
+        Commands::Cluster { config } => {
+            run_cluster_status(&config);
         }
     }
 }
@@ -2712,4 +2754,96 @@ fn run_rag_command(action: RagAction) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Distributed inference
+// =============================================================================
+
+#[cfg(feature = "distributed")]
+fn run_shard_server(host: &str, port: u16, name: &str, gpu: bool) {
+    use llama_gguf::distributed::ShardServer;
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    rt.block_on(async {
+        let addr: std::net::SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .expect("Invalid host:port");
+
+        let server = ShardServer::new(name, gpu);
+        eprintln!("Starting shard server '{}' on {}", name, addr);
+
+        if let Err(e) = server.serve(addr).await {
+            eprintln!("Shard server error: {}", e);
+            std::process::exit(1);
+        }
+    });
+}
+
+#[cfg(feature = "distributed")]
+fn run_cluster_status(config_path: &str) {
+    use llama_gguf::distributed::ClusterConfig;
+    use llama_gguf::distributed::proto::shard_service_client::ShardServiceClient;
+    use llama_gguf::distributed::proto::HealthRequest;
+
+    let config = match ClusterConfig::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error loading cluster config: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    rt.block_on(async {
+        eprintln!("Cluster status ({} shards):", config.shards.len());
+        eprintln!("Model: {}", config.model_path);
+        eprintln!();
+
+        for shard_spec in &config.shards {
+            eprint!("  {} ({}) ... ", shard_spec.name, shard_spec.address);
+
+            let endpoint = match tonic::transport::Channel::from_shared(format!(
+                "http://{}",
+                shard_spec.address
+            )) {
+                Ok(e) => e.connect_timeout(config.connect_timeout()),
+                Err(e) => {
+                    eprintln!("INVALID ADDRESS: {}", e);
+                    continue;
+                }
+            };
+
+            match endpoint.connect().await {
+                Ok(channel) => {
+                    let mut client = ShardServiceClient::new(channel);
+                    match client.health(HealthRequest {}).await {
+                        Ok(resp) => {
+                            let h = resp.into_inner();
+                            if h.healthy {
+                                eprintln!("HEALTHY");
+                                eprintln!(
+                                    "    Backend: {}, Layers: {}..{} ({} loaded), KV cache: {} bytes{}",
+                                    h.backend_name,
+                                    h.layer_start,
+                                    h.layer_end,
+                                    h.layers_loaded,
+                                    h.memory_used,
+                                    if h.gpu_available { ", GPU" } else { "" }
+                                );
+                            } else {
+                                eprintln!("UNHEALTHY");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("ERROR: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("UNREACHABLE: {}", e);
+                }
+            }
+        }
+    });
 }

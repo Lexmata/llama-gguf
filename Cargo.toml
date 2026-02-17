@@ -32,6 +32,7 @@ server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:futures"]
 rag = ["dep:tokio-postgres", "dep:pgvector", "dep:deadpool-postgres", "dep:tokio", "dep:url", "dep:glob"]
 huggingface = ["dep:reqwest", "dep:indicatif", "dep:directories"]
 onnx = ["dep:prost"]
+distributed = ["dep:tonic", "dep:tokio", "dep:prost", "dep:futures"]
 
 [dependencies]
 memmap2 = "0.9"
@@ -80,8 +81,12 @@ toml = "0.8"
 # ONNX protobuf support
 prost = { version = "0.13", optional = true }
 
+# Distributed inference (gRPC)
+tonic = { version = "0.12", optional = true }
+
 [build-dependencies]
 prost-build = "0.13"
+tonic-build = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

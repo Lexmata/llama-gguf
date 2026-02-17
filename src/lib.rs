@@ -35,6 +35,8 @@ pub mod huggingface;
 pub mod model;
 #[cfg(feature = "onnx")]
 pub mod onnx;
+#[cfg(feature = "distributed")]
+pub mod distributed;
 pub mod rag;
 pub mod sampling;
 #[cfg(feature = "server")]
@@ -85,6 +87,12 @@ pub use rag::{
     EmbeddingGenerator,
     // Metadata filtering
     MetadataFilter,
+};
+
+#[cfg(feature = "distributed")]
+pub use distributed::{
+    ClusterConfig, Coordinator, DistributedError, DistributedModel, DistributedResult,
+    PipelineExecutor, ShardServer, ShardSpec,
 };
 
 /// Library-wide error type
