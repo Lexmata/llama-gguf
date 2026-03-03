@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -9,6 +10,11 @@ use llama_gguf::gguf::{GgufFile, MetadataValue};
 #[cfg(feature = "huggingface")]
 use llama_gguf::huggingface::{HfClient, format_bytes};
 use llama_gguf::model::{InferenceContext, ModelLoader};
+use llama_gguf::tools::{
+    DeletePolicy, ToolRegistry,
+    executor::{ExecutorConfig, ToolExecutor},
+    filesystem::{FilesystemScope, FilesystemTools},
+};
 
 #[derive(Parser)]
 #[command(name = "llama-gguf")]
@@ -76,6 +82,14 @@ enum Commands {
         /// Path to external tokenizer (tokenizer.json or .gguf file)
         #[arg(long)]
         tokenizer: Option<String>,
+
+        /// Allow filesystem tool access scoped to these directories (repeatable)
+        #[arg(long = "fs-allow", value_name = "DIR")]
+        fs_allow: Vec<PathBuf>,
+
+        /// Allow the model to delete files without user confirmation
+        #[arg(long)]
+        force_delete: bool,
     },
 
     /// Interactive chat mode (local model or remote server)
@@ -119,6 +133,14 @@ enum Commands {
         /// Path to external tokenizer (tokenizer.json or .gguf file)
         #[arg(long)]
         tokenizer: Option<String>,
+
+        /// Allow filesystem tool access scoped to these directories (repeatable)
+        #[arg(long = "fs-allow", value_name = "DIR")]
+        fs_allow: Vec<PathBuf>,
+
+        /// Allow the model to delete files without user confirmation
+        #[arg(long)]
+        force_delete: bool,
     },
 
     /// Start HTTP server with OpenAI-compatible API
@@ -145,6 +167,14 @@ enum Commands {
         #[cfg(feature = "rag")]
         #[arg(long)]
         rag_config: Option<String>,
+
+        /// Allow filesystem tool access scoped to these directories (repeatable)
+        #[arg(long = "fs-allow", value_name = "DIR")]
+        fs_allow: Vec<PathBuf>,
+
+        /// Allow the model to delete files without user confirmation
+        #[arg(long)]
+        force_delete: bool,
     },
 
     /// Quantize a model to a different format
@@ -593,6 +623,49 @@ enum ModelAction {
     },
 }
 
+/// Build a tool executor from CLI flags. Returns `None` if no `--fs-allow` paths given.
+fn build_tool_executor(fs_allow: &[PathBuf], force_delete: bool) -> Option<ToolExecutor> {
+    if fs_allow.is_empty() {
+        return None;
+    }
+
+    let scope = match FilesystemScope::new(fs_allow.to_vec()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error setting up filesystem scope: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let delete_policy = if force_delete {
+        DeletePolicy::AlwaysAllow
+    } else {
+        DeletePolicy::Confirm(Arc::new(|path: &std::path::Path| {
+            eprint!(
+                "The model wants to delete '{}'. Allow? [y/N] ",
+                path.display()
+            );
+            let _ = io::stderr().flush();
+            let mut answer = String::new();
+            if io::stdin().read_line(&mut answer).is_ok() {
+                matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+            } else {
+                false
+            }
+        }))
+    };
+
+    let mut registry = ToolRegistry::new();
+    FilesystemTools::register_tools(&mut registry);
+
+    let fs_tools = FilesystemTools::new(scope, delete_policy);
+    Some(ToolExecutor::new(
+        registry,
+        Some(fs_tools),
+        ExecutorConfig::default(),
+    ))
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -628,11 +701,11 @@ fn main() {
             seed,
             gpu,
             tokenizer,
+            fs_allow,
+            force_delete,
         } => {
-            // CLI args override config file values; clap defaults are used when
-            // the user didn't explicitly pass an argument (we detect this by
-            // checking if the value matches clap's default and the config differs).
             let ec = cfg.to_engine_config(Some(&model));
+            let tool_executor = build_tool_executor(&fs_allow, force_delete);
             if let Err(e) = run_inference(
                 &resolve_model_path(&model, &cfg),
                 prompt.as_deref(),
@@ -644,6 +717,7 @@ fn main() {
                 seed.or(ec.seed),
                 gpu || ec.use_gpu,
                 tokenizer,
+                tool_executor.as_ref(),
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -660,6 +734,8 @@ fn main() {
             repeat_penalty,
             seed,
             tokenizer,
+            fs_allow,
+            force_delete,
         } => {
             // Determine server URL: --server flag > config file > none
             let server_url = server.or_else(|| cfg.server.host_url());
@@ -701,6 +777,7 @@ fn main() {
                 });
                 let ec = cfg.to_chat_engine_config(Some(&model));
                 let system_prompt = system.or(cfg.chat.system_prompt.clone());
+                let tool_executor = build_tool_executor(&fs_allow, force_delete);
                 if let Err(e) = run_chat(
                     &resolve_model_path(&model, &cfg),
                     system_prompt.as_deref(),
@@ -711,6 +788,7 @@ fn main() {
                     cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
                     seed.or(ec.seed),
                     tokenizer,
+                    tool_executor.as_ref(),
                 ) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
@@ -726,7 +804,10 @@ fn main() {
             rag_database_url,
             #[cfg(feature = "rag")]
             rag_config,
+            fs_allow,
+            force_delete,
         } => {
+            let _tool_executor = build_tool_executor(&fs_allow, force_delete);
             let model_path = resolve_model_path(&model, &cfg);
             let host = if host == "127.0.0.1" && cfg.server.host != "127.0.0.1" {
                 cfg.server.host.clone()
@@ -1021,6 +1102,7 @@ fn run_inference(
     seed: Option<u64>,
     use_gpu: bool,
     tokenizer_path: Option<String>,
+    tool_executor: Option<&ToolExecutor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::load(EngineConfig {
         model_path: model_path.to_string(),
@@ -1037,11 +1119,17 @@ fn run_inference(
 
     let raw_prompt = prompt.unwrap_or("Hello");
 
-    // Print the prompt before streaming the response
+    if let Some(executor) = tool_executor {
+        eprintln!("[tools enabled: {} tools available]", executor.registry.tools().len());
+        let result = engine.generate_with_tools(raw_prompt, n_predict, executor)?;
+        print!("{}", result);
+        println!();
+        return Ok(());
+    }
+
     print!("{}", raw_prompt);
     io::stdout().flush()?;
 
-    // Stream tokens as they are generated
     let mut count = 0;
     for token_result in engine.generate_streaming(raw_prompt, n_predict) {
         let text = token_result?;
@@ -1068,6 +1156,7 @@ fn run_chat(
     repeat_penalty: f32,
     seed: Option<u64>,
     tokenizer_path: Option<String>,
+    tool_executor: Option<&ToolExecutor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::load(EngineConfig {
         model_path: model_path.to_string(),
@@ -1098,13 +1187,15 @@ fn run_chat(
     eprintln!("╰─────────────────────────────────────────────────────────────────╯");
     eprintln!();
     eprintln!("System: {}", system_text);
+    if tool_executor.is_some() {
+        eprintln!("Tools: filesystem (read, write, delete, list, create_dir, move, info)");
+    }
     eprintln!();
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
 
     loop {
-        // Print prompt
         print!("You: ");
         io::stdout().flush()?;
 
@@ -1153,15 +1244,19 @@ fn run_chat(
             }
         }
 
-        // Generate and stream the response
         print!("\nAssistant: ");
         io::stdout().flush()?;
 
-        let stream = chat.chat_streaming(input)?;
-        for token_result in stream {
-            let text = token_result?;
-            print!("{}", text);
-            io::stdout().flush()?;
+        if let Some(executor) = tool_executor {
+            let response = chat.chat_with_tools(input, executor)?;
+            print!("{}", response);
+        } else {
+            let stream = chat.chat_streaming(input)?;
+            for token_result in stream {
+                let text = token_result?;
+                print!("{}", text);
+                io::stdout().flush()?;
+            }
         }
 
         println!();

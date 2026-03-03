@@ -43,6 +43,7 @@ pub mod sampling;
 pub mod server;
 pub mod tensor;
 pub mod tokenizer;
+pub mod tools;
 
 // Re-export main types
 pub use config::{Config, ConfigError};
@@ -70,6 +71,11 @@ pub use sampling::{
 };
 pub use tensor::{DType, Tensor, TensorError, TensorStorage};
 pub use tokenizer::{Tokenizer, TokenizerError};
+pub use tools::{
+    DeletePolicy, ToolCall, ToolDef, ToolError, ToolParam, ToolRegistry, ToolResult,
+    executor::{ExecutorConfig, ToolExecutor},
+    filesystem::{FilesystemScope, FilesystemTools},
+};
 #[cfg(feature = "huggingface")]
 pub use huggingface::{HfClient, HfError, HfFileInfo, format_bytes};
 #[cfg(feature = "onnx")]
