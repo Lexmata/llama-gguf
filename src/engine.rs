@@ -26,6 +26,7 @@ use crate::model::{
 };
 use crate::sampling::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
+use crate::tools::executor::ToolExecutor;
 
 // ============================================================================
 // Error type
@@ -754,6 +755,53 @@ impl Engine {
         GenerationStream::new(self, prompt, max_tokens)
     }
 
+    /// Generate text with tool-calling support.
+    ///
+    /// The system prompt is augmented with tool descriptions. When the model
+    /// emits a `tool_call` block, it is executed and the result is fed back
+    /// into the context. This loops until the model produces a final answer
+    /// or the iteration limit is reached.
+    pub fn generate_with_tools(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        executor: &ToolExecutor,
+    ) -> Result<String, EngineError> {
+        let tool_section = executor.registry.system_prompt_section();
+        let augmented_prompt = format!("{}{}", tool_section, prompt);
+
+        let mut full_output = String::new();
+        let mut current_prompt = augmented_prompt;
+
+        for _iteration in 0..executor.config.max_iterations {
+            let response = self.generate(&current_prompt, max_tokens)?;
+            if !ToolExecutor::has_tool_call(&response) {
+                full_output.push_str(&response);
+                return Ok(full_output);
+            }
+
+            if let Some((before, call, _after)) = ToolExecutor::parse_tool_call(&response) {
+                full_output.push_str(&before);
+                let tool_result = executor.execute_call(&call).map_err(|e| {
+                    EngineError::Other(format!("Tool execution error: {}", e))
+                })?;
+
+                // Build continuation prompt: original context + output so far + tool result
+                current_prompt = format!(
+                    "{}\n{}\n{}\nContinue based on the tool result above.",
+                    current_prompt, before, tool_result
+                );
+            } else {
+                full_output.push_str(&response);
+                return Ok(full_output);
+            }
+        }
+
+        Err(EngineError::Other(
+            "Max tool call iterations exceeded".into(),
+        ))
+    }
+
     /// Extract embeddings from text using the model.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
         let mut ctx = InferenceContext::new(&self.config, self.backend.clone());
@@ -1155,6 +1203,57 @@ impl ChatEngine {
             accumulated: String::new(),
             prefill_logits,
         })
+    }
+
+    /// Send a message with tool-calling support.
+    ///
+    /// When the model emits a tool call, it is executed and the result is
+    /// injected as a continuation. Loops until the model produces a final
+    /// answer or the iteration limit is reached.
+    pub fn chat_with_tools(
+        &mut self,
+        message: &str,
+        executor: &ToolExecutor,
+    ) -> Result<String, EngineError> {
+        let tool_section = executor.registry.system_prompt_section();
+        let augmented = format!("{}\n\n{}", message, tool_section);
+
+        let mut accumulated_response = String::new();
+
+        for _iteration in 0..executor.config.max_iterations {
+            let input = if accumulated_response.is_empty() {
+                augmented.clone()
+            } else {
+                accumulated_response.clone()
+            };
+
+            let response = if accumulated_response.is_empty() {
+                self.chat(&input)?
+            } else {
+                // Feed the tool result back as a continuation
+                self.chat(&format!("Tool result:\n{}", input))?
+            };
+
+            if !ToolExecutor::has_tool_call(&response) {
+                accumulated_response.push_str(&response);
+                return Ok(accumulated_response);
+            }
+
+            if let Some((before, call, _after)) = ToolExecutor::parse_tool_call(&response) {
+                accumulated_response.push_str(&before);
+                let tool_result = executor.execute_call(&call).map_err(|e| {
+                    EngineError::Other(format!("Tool execution error: {}", e))
+                })?;
+                accumulated_response.push_str(&tool_result);
+            } else {
+                accumulated_response.push_str(&response);
+                return Ok(accumulated_response);
+            }
+        }
+
+        Err(EngineError::Other(
+            "Max tool call iterations exceeded".into(),
+        ))
     }
 
     /// Clear conversation history and reset context.
