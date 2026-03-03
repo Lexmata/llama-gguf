@@ -17,6 +17,10 @@ pub enum Architecture {
     // Qwen family
     Qwen,
     Qwen2,
+    Qwen2Moe,
+    Qwen3,
+    Qwen3Moe,
+    Qwen3Next,
 
     // Phi family
     Phi,
@@ -66,6 +70,10 @@ impl Architecture {
             "mixtral" => Self::Mixtral,
             "qwen" => Self::Qwen,
             "qwen2" => Self::Qwen2,
+            "qwen2moe" => Self::Qwen2Moe,
+            "qwen3" => Self::Qwen3,
+            "qwen3moe" => Self::Qwen3Moe,
+            "qwen3next" => Self::Qwen3Next,
             "phi" => Self::Phi,
             "phi2" => Self::Phi2,
             "phi3" => Self::Phi3,
@@ -107,6 +115,10 @@ impl Architecture {
             Self::Mixtral => "mixtral",
             Self::Qwen => "qwen",
             Self::Qwen2 => "qwen2",
+            Self::Qwen2Moe => "qwen2moe",
+            Self::Qwen3 => "qwen3",
+            Self::Qwen3Moe => "qwen3moe",
+            Self::Qwen3Next => "qwen3next",
             Self::Phi => "phi",
             Self::Phi2 => "phi2",
             Self::Phi3 => "phi3",
@@ -153,6 +165,22 @@ impl Architecture {
                 | Self::Olmo
                 | Self::Qwen
                 | Self::Qwen2
+                | Self::Qwen3
+                | Self::Qwen3Moe
+                | Self::Qwen3Next
+        )
+    }
+
+    /// Check if this architecture uses Mixture of Experts
+    pub fn is_moe(&self) -> bool {
+        matches!(
+            self,
+            Self::Mixtral
+                | Self::Qwen2Moe
+                | Self::Qwen3Moe
+                | Self::Qwen3Next
+                | Self::DeepSeekV2
+                | Self::Dbrx
         )
     }
 
@@ -161,8 +189,21 @@ impl Architecture {
         self.is_llama_like()
             || matches!(
                 self,
-                Self::Qwen | Self::Qwen2 | Self::InternLM | Self::InternLM2 | Self::Baichuan
+                Self::Qwen
+                    | Self::Qwen2
+                    | Self::Qwen2Moe
+                    | Self::Qwen3
+                    | Self::Qwen3Moe
+                    | Self::Qwen3Next
+                    | Self::InternLM
+                    | Self::InternLM2
+                    | Self::Baichuan
             )
+    }
+
+    /// Check if this architecture uses QK normalization before RoPE
+    pub fn uses_qk_norm(&self) -> bool {
+        matches!(self, Self::Qwen3 | Self::Qwen3Moe | Self::Qwen3Next)
     }
 }
 

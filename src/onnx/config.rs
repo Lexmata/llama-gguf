@@ -176,6 +176,11 @@ impl HfConfig {
             attention_bias: self.attention_bias,
             mlp_bias: self.mlp_bias,
             tie_word_embeddings: self.tie_word_embeddings.unwrap_or(false),
+            num_experts: 0,
+            num_experts_per_token: 0,
+            expert_intermediate_size: 0,
+            key_length: head_dim,
+            value_length: head_dim,
         })
     }
 }

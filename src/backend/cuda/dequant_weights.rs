@@ -290,22 +290,24 @@ pub fn upload_model_weights(
             &layer.attn_norm.weight,
         )?;
 
-        // FFN weights — quantized path when possible
-        upload_weight(
-            &mut store,
-            &format!("blk.{}.ffn_gate.weight", i),
-            &layer.ffn.w_gate.weight,
-        )?;
-        upload_weight(
-            &mut store,
-            &format!("blk.{}.ffn_up.weight", i),
-            &layer.ffn.w_up.weight,
-        )?;
-        upload_weight(
-            &mut store,
-            &format!("blk.{}.ffn_down.weight", i),
-            &layer.ffn.w_down.weight,
-        )?;
+        // FFN weights — quantized path when possible (dense FFN only)
+        if let Some(ffn) = layer.ffn() {
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.ffn_gate.weight", i),
+                &ffn.w_gate.weight,
+            )?;
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.ffn_up.weight", i),
+                &ffn.w_up.weight,
+            )?;
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.ffn_down.weight", i),
+                &ffn.w_down.weight,
+            )?;
+        }
 
         // FFN norm
         store.upload(

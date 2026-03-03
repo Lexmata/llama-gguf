@@ -30,7 +30,7 @@ pub use embeddings::{
     cosine_similarity, dot_product, euclidean_distance, find_nearest,
 };
 pub use error::{ModelError, ModelResult};
-pub use layers::TransformerLayer;
+pub use layers::{FfnLayer, TransformerLayer};
 pub use llama::LlamaModel;
 pub use loader::{ModelLoader, load_llama_model};
 pub use lora::{LoraAdapter, LoraAdapters, LoraConfig};
@@ -196,7 +196,7 @@ impl InferenceContext {
                 config.num_layers,
                 config.num_kv_heads,
                 config.max_seq_len,
-                config.head_dim,
+                config.key_length,
             ),
             backend,
             position: 0,

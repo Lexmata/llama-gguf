@@ -1343,6 +1343,15 @@ fn show_info(path: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>
     if let Some(v) = data.get_f32(&format!("{}.rope.freq_base", arch)) {
         println!("│ RoPE freq base: {:<47} │", v);
     }
+    if let Some(v) = data.get_u32(&format!("{}.expert_count", arch)) {
+        println!("│ Expert count: {:<49} │", v);
+    }
+    if let Some(v) = data.get_u32(&format!("{}.expert_used_count", arch)) {
+        println!("│ Experts used per token: {:<39} │", v);
+    }
+    if let Some(v) = data.get_u32(&format!("{}.expert_feed_forward_length", arch)) {
+        println!("│ Expert FFN size: {:<46} │", v);
+    }
 
     println!("└───────────────────────────────────────────────────────────────┘");
     println!();

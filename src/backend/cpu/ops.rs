@@ -888,10 +888,27 @@ pub fn dequantize(src: &Tensor, out: &mut Tensor) -> BackendResult<()> {
             Ok(())
         }
         DType::F32 => {
-            // Just copy
             let src_data = src.as_f32()?;
             let out_data = out.as_f32_mut()?;
             out_data.copy_from_slice(src_data);
+            Ok(())
+        }
+        DType::F16 => {
+            let src_bytes = src.data();
+            let out_data = out.as_f32_mut()?;
+            let f16_slice: &[half::f16] = bytemuck::cast_slice(src_bytes);
+            for (o, &h) in out_data.iter_mut().zip(f16_slice.iter()) {
+                *o = h.to_f32();
+            }
+            Ok(())
+        }
+        DType::BF16 => {
+            let src_bytes = src.data();
+            let out_data = out.as_f32_mut()?;
+            let bf16_slice: &[half::bf16] = bytemuck::cast_slice(src_bytes);
+            for (o, &b) in out_data.iter_mut().zip(bf16_slice.iter()) {
+                *o = b.to_f32();
+            }
             Ok(())
         }
         dtype => Err(BackendError::UnsupportedDType(dtype)),

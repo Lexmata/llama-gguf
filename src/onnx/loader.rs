@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::model::layers::{Attention, FeedForward, Linear, RMSNorm, TransformerLayer};
+use crate::model::layers::{Attention, FeedForward, FfnLayer, Linear, RMSNorm, TransformerLayer};
 use crate::model::{Architecture, LlamaModel, ModelConfig, RopeType};
 use crate::tensor::{DType, Tensor};
 
@@ -242,7 +242,7 @@ impl OnnxModelLoader {
             attn_norm,
             attention,
             ffn_norm,
-            ffn,
+            ffn_layer: FfnLayer::Dense(ffn),
             layer_idx,
         })
     }

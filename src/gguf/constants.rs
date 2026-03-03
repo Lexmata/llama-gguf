@@ -83,7 +83,10 @@ pub enum GgmlType {
     I32 = 26,
     I64 = 27,
     F64 = 28,
-    BF16 = 29,
+    IQ1M = 29,
+    BF16 = 30,
+    TQ1_0 = 34,
+    TQ2_0 = 35,
 }
 
 impl TryFrom<u32> for GgmlType {
@@ -117,7 +120,10 @@ impl TryFrom<u32> for GgmlType {
             26 => Ok(Self::I32),
             27 => Ok(Self::I64),
             28 => Ok(Self::F64),
-            29 => Ok(Self::BF16),
+            29 => Ok(Self::IQ1M),
+            30 => Ok(Self::BF16),
+            34 => Ok(Self::TQ1_0),
+            35 => Ok(Self::TQ2_0),
             _ => Err(value),
         }
     }
@@ -138,7 +144,10 @@ impl GgmlType {
             | Self::IQ3S
             | Self::IQ4XS
             | Self::IQ4NL
-            | Self::IQ1S => 256,
+            | Self::IQ1S
+            | Self::IQ1M => 256,
+            Self::TQ1_0 => 256,
+            Self::TQ2_0 => 256,
         }
     }
 
@@ -172,6 +181,9 @@ impl GgmlType {
             Self::IQ4XS => 136,
             Self::IQ4NL => 132,
             Self::IQ1S => 50,
+            Self::IQ1M => 56,
+            Self::TQ1_0 => 54,
+            Self::TQ2_0 => 66,
         }
     }
 }

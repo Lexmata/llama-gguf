@@ -262,19 +262,21 @@ impl Coordinator {
                     tensor: Some(tensor_to_proto(&layer.ffn_norm.weight)),
                 });
 
-                // FFN gate/up/down
-                tensors.push(NamedTensor {
-                    name: "ffn_gate.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.ffn.w_gate.weight)),
-                });
-                tensors.push(NamedTensor {
-                    name: "ffn_up.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.ffn.w_up.weight)),
-                });
-                tensors.push(NamedTensor {
-                    name: "ffn_down.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.ffn.w_down.weight)),
-                });
+                // FFN gate/up/down (dense only)
+                if let Some(ffn) = layer.ffn() {
+                    tensors.push(NamedTensor {
+                        name: "ffn_gate.weight".into(),
+                        tensor: Some(tensor_to_proto(&ffn.w_gate.weight)),
+                    });
+                    tensors.push(NamedTensor {
+                        name: "ffn_up.weight".into(),
+                        tensor: Some(tensor_to_proto(&ffn.w_up.weight)),
+                    });
+                    tensors.push(NamedTensor {
+                        name: "ffn_down.weight".into(),
+                        tensor: Some(tensor_to_proto(&ffn.w_down.weight)),
+                    });
+                }
 
                 LayerData {
                     layer_index: layer.layer_idx as u32,

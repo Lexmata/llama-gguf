@@ -39,6 +39,10 @@ pub enum DType {
     IQ4XS,
     IQ4NL,
     IQ1S,
+    IQ1M,
+    // Ternary quant types
+    TQ1_0,
+    TQ2_0,
 }
 
 impl DType {
@@ -60,7 +64,10 @@ impl DType {
             | Self::IQ3S
             | Self::IQ4XS
             | Self::IQ4NL
-            | Self::IQ1S => 256,
+            | Self::IQ1S
+            | Self::IQ1M => 256,
+            // Ternary quants: 256 elements per block
+            Self::TQ1_0 | Self::TQ2_0 => 256,
         }
     }
 
@@ -94,6 +101,9 @@ impl DType {
             Self::IQ4XS => 136,
             Self::IQ4NL => 132,
             Self::IQ1S => 50,
+            Self::IQ1M => 56,
+            Self::TQ1_0 => 54,
+            Self::TQ2_0 => 66,
         }
     }
 
@@ -111,6 +121,44 @@ impl DType {
                 | Self::I64
                 | Self::U8
         )
+    }
+
+    /// Returns a human-readable name for the dtype
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::BF16 => "BF16",
+            Self::F64 => "F64",
+            Self::I8 => "I8",
+            Self::I16 => "I16",
+            Self::I32 => "I32",
+            Self::I64 => "I64",
+            Self::U8 => "U8",
+            Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
+            Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2K => "Q2_K",
+            Self::Q3K => "Q3_K",
+            Self::Q4K => "Q4_K",
+            Self::Q5K => "Q5_K",
+            Self::Q6K => "Q6_K",
+            Self::Q8K => "Q8_K",
+            Self::IQ2XXS => "IQ2_XXS",
+            Self::IQ2XS => "IQ2_XS",
+            Self::IQ2S => "IQ2_S",
+            Self::IQ3XXS => "IQ3_XXS",
+            Self::IQ3S => "IQ3_S",
+            Self::IQ4XS => "IQ4_XS",
+            Self::IQ4NL => "IQ4_NL",
+            Self::IQ1S => "IQ1_S",
+            Self::IQ1M => "IQ1_M",
+            Self::TQ1_0 => "TQ1_0",
+            Self::TQ2_0 => "TQ2_0",
+        }
     }
 
     /// Calculate the byte size needed for a given number of elements
@@ -155,6 +203,9 @@ impl From<GgmlType> for DType {
             GgmlType::IQ4XS => DType::IQ4XS,
             GgmlType::IQ4NL => DType::IQ4NL,
             GgmlType::IQ1S => DType::IQ1S,
+            GgmlType::IQ1M => DType::IQ1M,
+            GgmlType::TQ1_0 => DType::TQ1_0,
+            GgmlType::TQ2_0 => DType::TQ2_0,
         }
     }
 }

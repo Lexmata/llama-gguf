@@ -103,9 +103,11 @@ impl MoeRouter {
         }
     }
 
-    /// Create from existing weight tensor
+    /// Create from existing weight tensor.
+    /// GGML shape convention: `[hidden_dim, num_experts]` where dim 0 is fastest.
     pub fn from_weight(weight: Tensor, top_k: usize, normalize: bool) -> Self {
-        let num_experts = weight.shape()[0];
+        let shape = weight.shape();
+        let num_experts = if shape.len() >= 2 { shape[1] } else { shape[0] };
         Self {
             weight,
             num_experts,
@@ -128,7 +130,7 @@ impl MoeRouter {
         let h_data = hidden_states.as_f32()?;
         let w_data = self.weight.as_f32()?;
 
-        let hidden_dim = self.weight.shape()[1];
+        let hidden_dim = self.weight.shape()[0];
         let h_shape = hidden_states.shape();
 
         // Handle both batched and unbatched inputs
@@ -222,33 +224,47 @@ impl MoeExpert {
     /// Forward pass through expert (SwiGLU activation)
     ///
     /// output = down_proj(silu(gate_proj(x)) * up_proj(x))
+    ///
+    /// GGUF convention: weight shape is `[in_features, out_features]` (column-major).
     pub fn forward(
         &self,
         x: &Tensor,
         backend: &dyn Backend,
     ) -> Result<Tensor, crate::backend::BackendError> {
-        let hidden_dim = self.down_proj.shape()[0];
-        let intermediate_dim = self.gate_proj.shape()[0];
+        let intermediate_dim = self.gate_proj.shape()[1];
+        let hidden_dim = self.down_proj.shape()[1];
 
-        // Gate projection
+        // Gate projection: x @ gate_proj
         let mut gate_out = Tensor::zeros(vec![intermediate_dim], DType::F32);
-        backend.matvec(&self.gate_proj, x, &mut gate_out)?;
+        if self.gate_proj.dtype().is_quantized() {
+            backend.vec_mat_q(x, &self.gate_proj, &mut gate_out)?;
+        } else {
+            backend.vec_mat(x, &self.gate_proj, &mut gate_out)?;
+        }
 
         // Apply SiLU to gate
         let mut gate_silu = Tensor::zeros(vec![intermediate_dim], DType::F32);
         backend.silu(&gate_out, &mut gate_silu)?;
 
-        // Up projection
+        // Up projection: x @ up_proj
         let mut up_out = Tensor::zeros(vec![intermediate_dim], DType::F32);
-        backend.matvec(&self.up_proj, x, &mut up_out)?;
+        if self.up_proj.dtype().is_quantized() {
+            backend.vec_mat_q(x, &self.up_proj, &mut up_out)?;
+        } else {
+            backend.vec_mat(x, &self.up_proj, &mut up_out)?;
+        }
 
         // Element-wise multiply
         let mut intermediate = Tensor::zeros(vec![intermediate_dim], DType::F32);
         backend.mul(&gate_silu, &up_out, &mut intermediate)?;
 
-        // Down projection
+        // Down projection: intermediate @ down_proj
         let mut output = Tensor::zeros(vec![hidden_dim], DType::F32);
-        backend.matvec(&self.down_proj, &intermediate, &mut output)?;
+        if self.down_proj.dtype().is_quantized() {
+            backend.vec_mat_q(&intermediate, &self.down_proj, &mut output)?;
+        } else {
+            backend.vec_mat(&intermediate, &self.down_proj, &mut output)?;
+        }
 
         Ok(output)
     }

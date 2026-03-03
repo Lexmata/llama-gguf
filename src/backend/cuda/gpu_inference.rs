@@ -349,18 +349,19 @@ fn upload_transformer_layer(
 
     let ffn_norm = GpuRMSNorm::from_rms_norm(device, &layer.ffn_norm.weight, layer.ffn_norm.eps)?;
 
+    let dense_ffn = layer.ffn().expect("GPU inference requires dense FFN layers (MoE not yet supported on CUDA)");
     let ffn = GpuFFN {
         w1: GpuLinear::from_linear(
             device,
-            &layer.ffn.w_gate.weight,
-            layer.ffn.w_gate.bias.as_ref(),
+            &dense_ffn.w_gate.weight,
+            dense_ffn.w_gate.bias.as_ref(),
         )?,
         w2: GpuLinear::from_linear(
             device,
-            &layer.ffn.w_down.weight,
-            layer.ffn.w_down.bias.as_ref(),
+            &dense_ffn.w_down.weight,
+            dense_ffn.w_down.bias.as_ref(),
         )?,
-        w3: GpuLinear::from_linear(device, &layer.ffn.w_up.weight, layer.ffn.w_up.bias.as_ref())?,
+        w3: GpuLinear::from_linear(device, &dense_ffn.w_up.weight, dense_ffn.w_up.bias.as_ref())?,
     };
 
     Ok(GpuTransformerLayer {

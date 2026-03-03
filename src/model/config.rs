@@ -89,6 +89,16 @@ pub struct ModelConfig {
     pub mlp_bias: bool,
     /// Tie word embeddings with output projection
     pub tie_word_embeddings: bool,
+    /// Number of MoE experts (0 = dense model)
+    pub num_experts: usize,
+    /// Number of experts activated per token
+    pub num_experts_per_token: usize,
+    /// Expert FFN intermediate dimension (may differ from dense intermediate_size)
+    pub expert_intermediate_size: usize,
+    /// Per-head key dimension (defaults to head_dim if not specified)
+    pub key_length: usize,
+    /// Per-head value dimension (defaults to head_dim if not specified)
+    pub value_length: usize,
 }
 
 impl Default for ModelConfig {
@@ -109,11 +119,21 @@ impl Default for ModelConfig {
             attention_bias: false,
             mlp_bias: false,
             tie_word_embeddings: false,
+            num_experts: 0,
+            num_experts_per_token: 0,
+            expert_intermediate_size: 0,
+            key_length: 128,
+            value_length: 128,
         }
     }
 }
 
 impl ModelConfig {
+    /// Check if this is an MoE model
+    pub fn is_moe(&self) -> bool {
+        self.num_experts > 0
+    }
+
     /// Create config for LLaMA 7B
     pub fn llama_7b() -> Self {
         Self {
@@ -139,6 +159,11 @@ impl ModelConfig {
             attention_bias: false,
             mlp_bias: false,
             tie_word_embeddings: false,
+            num_experts: 0,
+            num_experts_per_token: 0,
+            expert_intermediate_size: 0,
+            key_length: 128,
+            value_length: 128,
         }
     }
 
@@ -175,6 +200,11 @@ impl ModelConfig {
             attention_bias: false,
             mlp_bias: false,
             tie_word_embeddings: false,
+            num_experts: 0,
+            num_experts_per_token: 0,
+            expert_intermediate_size: 0,
+            key_length: 128,
+            value_length: 128,
         }
     }
 
