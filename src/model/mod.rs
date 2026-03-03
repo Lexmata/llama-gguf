@@ -11,6 +11,7 @@
 mod architecture;
 pub mod cache;
 mod config;
+pub mod deltanet;
 pub mod embeddings;
 mod error;
 pub mod layers;
@@ -30,7 +31,8 @@ pub use embeddings::{
     cosine_similarity, dot_product, euclidean_distance, find_nearest,
 };
 pub use error::{ModelError, ModelResult};
-pub use layers::{FfnLayer, TransformerLayer};
+pub use deltanet::{DeltaNetConfig, DeltaNetLayer, DeltaNetState, RecurrentState};
+pub use layers::{AttentionLayer, FfnLayer, TransformerLayer};
 pub use llama::LlamaModel;
 pub use loader::{ModelLoader, load_llama_model};
 pub use lora::{LoraAdapter, LoraAdapters, LoraConfig};
@@ -186,6 +188,8 @@ pub struct InferenceContext {
     pub backend: Arc<dyn Backend>,
     /// Current position in sequence
     pub position: usize,
+    /// Recurrent state for delta-net layers (None if model has no SSM layers)
+    pub recurrent_state: Option<RecurrentState>,
 }
 
 impl InferenceContext {
@@ -200,6 +204,32 @@ impl InferenceContext {
             ),
             backend,
             position: 0,
+            recurrent_state: None,
+        }
+    }
+
+    /// Create inference context with recurrent state for SSM layers.
+    /// `is_recurrent[i]` marks which layers are delta-net layers.
+    pub fn new_with_recurrent(
+        config: &ModelConfig,
+        backend: Arc<dyn Backend>,
+        is_recurrent: &[bool],
+        dn_config: &DeltaNetConfig,
+    ) -> Self {
+        Self {
+            kv_cache: KVCache::new(
+                config.num_layers,
+                config.num_kv_heads,
+                config.max_seq_len,
+                config.key_length,
+            ),
+            backend,
+            position: 0,
+            recurrent_state: Some(RecurrentState::new(
+                config.num_layers,
+                is_recurrent,
+                dn_config,
+            )),
         }
     }
 
@@ -207,6 +237,9 @@ impl InferenceContext {
     pub fn reset(&mut self) {
         self.kv_cache.reset();
         self.position = 0;
+        if let Some(ref mut rs) = self.recurrent_state {
+            rs.reset();
+        }
     }
 }
 
@@ -227,6 +260,11 @@ pub trait Model: Send + Sync {
 
     /// Get model architecture
     fn architecture(&self) -> Architecture;
+
+    /// Create an InferenceContext with the right state for this model.
+    fn create_context(&self, backend: Arc<dyn Backend>) -> InferenceContext {
+        InferenceContext::new(self.config(), backend)
+    }
 
     /// Get vocabulary size
     fn vocab_size(&self) -> usize {

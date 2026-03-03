@@ -310,7 +310,7 @@ impl Attention {
         self.wv.forward(&x_vec, &mut v, backend)?;
 
         // Split Q into q_proper and gate if attention gating is active
-        // Per head layout: [nope_q | rope_q | gate_v]
+        // Per head in Q output: [q_proper(kl) | gate(vl)]
         let (q_proper_data, gate_data) = if self.has_attention_gate {
             let raw = q_raw.as_f32()?;
             let q_proper_len = self.num_heads * kl;
@@ -376,10 +376,11 @@ impl Attention {
             }
         }
 
-        // Apply RoPE - only to the last `rope_dims` dimensions per head
-        let nope_dims = kl - self.rope_dims;
-        if nope_dims > 0 && self.rope_dims < kl {
-            // Partial RoPE: extract rope portion, apply RoPE, write back
+        // Partial RoPE: rotate only the LAST `rope_dims` dimensions per head.
+        // Per-head layout: [nope(kl - rope_dims) | rope(rope_dims)]
+        // This matches llama.cpp's Qwen3Next: Qnope = first dims, Qrope = last dims.
+        if self.rope_dims > 0 && self.rope_dims < kl {
+            let nope_dims = kl - self.rope_dims;
             let q_data = q_reshaped.as_f32()?.to_vec();
             let k_data = k_reshaped.as_f32()?.to_vec();
 
@@ -413,7 +414,6 @@ impl Attention {
                 self.use_neox_rope,
             )?;
 
-            // Write rotated rope dims back
             let q_rope_out = q_rope_t.as_f32()?;
             let k_rope_out = k_rope_t.as_f32()?;
             let q_out = q_reshaped.as_f32_mut()?;
@@ -571,13 +571,25 @@ pub enum FfnLayer {
     Moe(super::moe::MoeLayer),
 }
 
+/// Attention variant: full softmax attention or delta-net recurrent.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum AttentionLayer {
+    /// Standard multi-head softmax attention (with optional gating, partial RoPE)
+    FullAttention(Attention),
+    /// Gated DeltaNet linear attention (SSM/recurrent)
+    DeltaNet(Box<super::deltanet::DeltaNetLayer>),
+}
+
 /// Single transformer layer (decoder block)
 #[derive(Debug)]
 pub struct TransformerLayer {
     /// Attention normalization
     pub attn_norm: RMSNorm,
-    /// Self-attention
-    pub attention: Attention,
+    /// Attention: either full softmax or delta-net recurrent
+    pub attn_layer: AttentionLayer,
+    /// Optional post-attention normalization (Qwen3Next)
+    pub post_attn_norm: Option<RMSNorm>,
     /// FFN normalization
     pub ffn_norm: RMSNorm,
     /// Feed-forward network (dense or MoE)
@@ -587,6 +599,14 @@ pub struct TransformerLayer {
 }
 
 impl TransformerLayer {
+    /// Get the full attention layer if this is not a delta-net layer
+    pub fn attention(&self) -> Option<&Attention> {
+        match &self.attn_layer {
+            AttentionLayer::FullAttention(attn) => Some(attn),
+            AttentionLayer::DeltaNet(_) => None,
+        }
+    }
+
     /// Get the dense FFN layer if this is not an MoE layer
     pub fn ffn(&self) -> Option<&FeedForward> {
         match &self.ffn_layer {
@@ -595,7 +615,13 @@ impl TransformerLayer {
         }
     }
 
-    /// Forward pass with residual connections
+    /// Whether this is a recurrent (delta-net) layer
+    pub fn is_recurrent(&self) -> bool {
+        matches!(&self.attn_layer, AttentionLayer::DeltaNet(_))
+    }
+
+    /// Forward pass with residual connections.
+    /// `recurrent_state` is used only for DeltaNet layers.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -606,16 +632,28 @@ impl TransformerLayer {
         freq_base: f32,
         freq_scale: f32,
         backend: &dyn Backend,
+        recurrent_state: Option<&mut super::deltanet::DeltaNetState>,
     ) -> ModelResult<Tensor> {
         let hidden_size = x.shape().last().copied().unwrap_or(0);
 
-        // Attention with residual
+        // Attention normalization
         let mut norm_out = Tensor::zeros(x.shape().to_vec(), DType::F32);
         self.attn_norm.forward(x, &mut norm_out, backend)?;
 
-        let attn_out = self.attention.forward(
-            &norm_out, k_cache, v_cache, pos, freq_base, freq_scale, backend,
-        )?;
+        // Run attention (full or delta-net)
+        let attn_out = match &self.attn_layer {
+            AttentionLayer::FullAttention(attn) => {
+                attn.forward(&norm_out, k_cache, v_cache, pos, freq_base, freq_scale, backend)?
+            }
+            AttentionLayer::DeltaNet(dn) => {
+                let state = recurrent_state.ok_or_else(|| {
+                    ModelError::ConfigError(
+                        "DeltaNet layer requires recurrent state".into(),
+                    )
+                })?;
+                dn.forward(&norm_out, state, backend)?
+            }
+        };
 
         // Residual connection for attention
         let mut h = Tensor::zeros(vec![hidden_size], DType::F32);
@@ -629,9 +667,14 @@ impl TransformerLayer {
         };
         backend.add(&x_flat, &attn_out, &mut h)?;
 
-        // FFN with residual
+        // FFN normalization: use post_attn_norm if present (Qwen3Next),
+        // otherwise use ffn_norm (standard models)
         let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
-        self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
+        if let Some(ref pan) = self.post_attn_norm {
+            pan.forward(&h, &mut ffn_norm_out, backend)?;
+        } else {
+            self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
+        }
 
         let ffn_out = match &self.ffn_layer {
             FfnLayer::Dense(ffn) => {

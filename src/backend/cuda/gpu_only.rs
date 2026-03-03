@@ -307,6 +307,15 @@ impl GpuOnlyInference {
     pub fn from_model(model: &LlamaModel, max_seq_len: usize) -> BackendResult<Self> {
         let cfg = model.config();
 
+        // GPU-only mode requires all layers to have standard attention.
+        // Hybrid models (with DeltaNet/recurrent layers) fall back to per-op CUDA.
+        let has_non_attention = model.layers().iter().any(|l| l.attention().is_none());
+        if has_non_attention {
+            return Err(BackendError::InitializationFailed(
+                "model has recurrent/DeltaNet layers not supported by GPU-only inference".into(),
+            ));
+        }
+
         let device = Arc::new(
             CudaDevice::new(0).map_err(|e| BackendError::InitializationFailed(format!("{}", e)))?,
         );
@@ -326,7 +335,8 @@ impl GpuOnlyInference {
         let use_neox = model
             .layers()
             .first()
-            .map(|l| l.attention.use_neox_rope)
+            .and_then(|l| l.attention())
+            .map(|a| a.use_neox_rope)
             .unwrap_or(false);
 
         let config = InferenceConfig {

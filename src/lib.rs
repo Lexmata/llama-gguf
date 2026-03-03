@@ -52,6 +52,8 @@ pub use gguf::{GgufBuilder, GgufData, GgufFile, GgufReader, GgufWriter, TensorTo
 pub use model::{
     Architecture, InferenceContext, KVCache, LlamaModel, Model, ModelConfig, ModelError,
     ModelLoader, load_llama_model,
+    // DeltaNet / SSM
+    AttentionLayer, DeltaNetConfig, DeltaNetLayer, DeltaNetState, RecurrentState,
     // LoRA
     LoraAdapter, LoraAdapters, LoraConfig,
     // MoE

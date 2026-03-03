@@ -320,31 +320,19 @@ fn upload_transformer_layer(
     let attention_norm =
         GpuRMSNorm::from_rms_norm(device, &layer.attn_norm.weight, layer.attn_norm.eps)?;
 
+    let attn = layer
+        .attention()
+        .expect("CUDA backend requires attention layers (recurrent/DeltaNet not supported)");
+
     let attention = GpuAttention {
-        wq: GpuLinear::from_linear(
-            device,
-            &layer.attention.wq.weight,
-            layer.attention.wq.bias.as_ref(),
-        )?,
-        wk: GpuLinear::from_linear(
-            device,
-            &layer.attention.wk.weight,
-            layer.attention.wk.bias.as_ref(),
-        )?,
-        wv: GpuLinear::from_linear(
-            device,
-            &layer.attention.wv.weight,
-            layer.attention.wv.bias.as_ref(),
-        )?,
-        wo: GpuLinear::from_linear(
-            device,
-            &layer.attention.wo.weight,
-            layer.attention.wo.bias.as_ref(),
-        )?,
+        wq: GpuLinear::from_linear(device, &attn.wq.weight, attn.wq.bias.as_ref())?,
+        wk: GpuLinear::from_linear(device, &attn.wk.weight, attn.wk.bias.as_ref())?,
+        wv: GpuLinear::from_linear(device, &attn.wv.weight, attn.wv.bias.as_ref())?,
+        wo: GpuLinear::from_linear(device, &attn.wo.weight, attn.wo.bias.as_ref())?,
         num_heads: config.num_heads,
         num_kv_heads: config.num_kv_heads,
         head_dim: config.head_dim,
-        use_neox_rope: layer.attention.use_neox_rope,
+        use_neox_rope: attn.use_neox_rope,
     };
 
     let ffn_norm = GpuRMSNorm::from_rms_norm(device, &layer.ffn_norm.weight, layer.ffn_norm.eps)?;

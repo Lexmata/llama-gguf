@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get layer 0's FFN down weight
     let layer = &model.layers()[0];
-    let w_down = &layer.ffn.w_down.weight;
+    let w_down = &layer.ffn().unwrap().w_down.weight;
 
     println!("FFN down weight:");
     println!("  Shape: {:?}", w_down.shape());
@@ -79,7 +79,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut test_output = Tensor::zeros(vec![hidden_size], DType::F32);
     layer
-        .ffn
+        .ffn()
+        .unwrap()
         .w_down
         .forward(&test_input, &mut test_output, &backend)?;
 

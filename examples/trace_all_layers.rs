@@ -89,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             freq_base,
             freq_scale,
             &backend,
+            None,
         )?;
 
         let (min, max, mean) = stats(hidden.as_f32()?);

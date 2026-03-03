@@ -251,37 +251,40 @@ pub fn upload_model_weights(
             eprintln!("  Layer {}/{}", i + 1, layers.len());
         }
 
-        // Attention weights — quantized path when possible
-        upload_weight(
-            &mut store,
-            &format!("blk.{}.attn_q.weight", i),
-            &layer.attention.wq.weight,
-        )?;
-        upload_weight(
-            &mut store,
-            &format!("blk.{}.attn_k.weight", i),
-            &layer.attention.wk.weight,
-        )?;
-        upload_weight(
-            &mut store,
-            &format!("blk.{}.attn_v.weight", i),
-            &layer.attention.wv.weight,
-        )?;
-        upload_weight(
-            &mut store,
-            &format!("blk.{}.attn_output.weight", i),
-            &layer.attention.wo.weight,
-        )?;
+        // Upload attention weights if this layer has them (DeltaNet/recurrent layers don't)
+        if let Some(attn) = layer.attention() {
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.attn_q.weight", i),
+                &attn.wq.weight,
+            )?;
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.attn_k.weight", i),
+                &attn.wk.weight,
+            )?;
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.attn_v.weight", i),
+                &attn.wv.weight,
+            )?;
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.attn_output.weight", i),
+                &attn.wo.weight,
+            )?;
 
-        // Biases are always f32
-        if let Some(ref bias) = layer.attention.wq.bias {
-            store.upload(&format!("blk.{}.attn_q.bias", i), bias)?;
-        }
-        if let Some(ref bias) = layer.attention.wk.bias {
-            store.upload(&format!("blk.{}.attn_k.bias", i), bias)?;
-        }
-        if let Some(ref bias) = layer.attention.wv.bias {
-            store.upload(&format!("blk.{}.attn_v.bias", i), bias)?;
+            if let Some(ref bias) = attn.wq.bias {
+                store.upload(&format!("blk.{}.attn_q.bias", i), bias)?;
+            }
+            if let Some(ref bias) = attn.wk.bias {
+                store.upload(&format!("blk.{}.attn_k.bias", i), bias)?;
+            }
+            if let Some(ref bias) = attn.wv.bias {
+                store.upload(&format!("blk.{}.attn_v.bias", i), bias)?;
+            }
+        } else {
+            tracing::debug!("Layer {}: skipping attention weight upload (recurrent layer)", i);
         }
 
         // Norms are always f32 (small 1D tensors)

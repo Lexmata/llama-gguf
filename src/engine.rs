@@ -684,7 +684,7 @@ impl Engine {
     ///
     /// Returns the generated text (not including the prompt).
     pub fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, EngineError> {
-        let mut ctx = InferenceContext::new(&self.config, self.backend.clone());
+        let mut ctx = self.model.create_context(self.backend.clone());
         let mut sampler = Sampler::new(self.sampler_config.clone(), self.config.vocab_size);
 
         // Wrap prompt with chat template
@@ -756,7 +756,7 @@ impl Engine {
 
     /// Extract embeddings from text using the model.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
-        let mut ctx = InferenceContext::new(&self.config, self.backend.clone());
+        let mut ctx = self.model.create_context(self.backend.clone());
         let embed_config = EmbeddingConfig::default();
         let extractor = EmbeddingExtractor::new(embed_config, &self.config);
         let embedding =
@@ -780,11 +780,13 @@ pub struct GenerationStream<'a> {
     remaining: usize,
     done: bool,
     accumulated: String,
+    /// Pending bytes for incomplete UTF-8 sequences across token boundaries
+    pending_bytes: Vec<u8>,
 }
 
 impl<'a> GenerationStream<'a> {
     fn new(engine: &'a Engine, prompt: &str, max_tokens: usize) -> Self {
-        let ctx = InferenceContext::new(&engine.config, engine.backend.clone());
+        let ctx = engine.model.create_context(engine.backend.clone());
         let sampler = Sampler::new(engine.sampler_config.clone(), engine.config.vocab_size);
 
         let formatted = engine.chat_template.wrap_prompt(prompt);
@@ -801,6 +803,7 @@ impl<'a> GenerationStream<'a> {
             remaining: max_tokens,
             done: false,
             accumulated: String::new(),
+            pending_bytes: Vec::new(),
         }
     }
 }
@@ -844,18 +847,29 @@ impl<'a> Iterator for GenerationStream<'a> {
             return None;
         }
 
-        // Decode
-        match self.engine.tokenizer.decode(&[next_token]) {
+        // Decode (streaming-aware: accumulates incomplete UTF-8 across tokens)
+        match self
+            .engine
+            .tokenizer
+            .decode_token_streaming(next_token, &mut self.pending_bytes)
+        {
             Ok(text) => {
+                self.tokens.push(next_token);
+                self.remaining -= 1;
+
+                if text.is_empty() {
+                    // Pending bytes not yet forming valid UTF-8; recurse to next token
+                    return self.next();
+                }
+
                 // Check stop patterns
                 let combined = format!("{}{}", self.accumulated, text);
                 for pattern in self.engine.chat_template.stop_patterns() {
                     if combined.contains(pattern) {
                         self.done = true;
-                        // Return text before the stop pattern if any
                         if let Some(idx) = combined.find(pattern) {
-                            let before = &combined[self.accumulated.len()..idx];
-                            if !before.is_empty() {
+                            if idx > self.accumulated.len() {
+                                let before = &combined[self.accumulated.len()..idx];
                                 return Some(Ok(before.to_string()));
                             }
                         }
@@ -864,8 +878,6 @@ impl<'a> Iterator for GenerationStream<'a> {
                 }
 
                 self.accumulated.push_str(&text);
-                self.tokens.push(next_token);
-                self.remaining -= 1;
                 Some(Ok(text))
             }
             Err(e) => {
@@ -897,7 +909,7 @@ pub struct ChatEngine {
 impl ChatEngine {
     /// Create a new chat engine from a loaded [`Engine`].
     pub fn new(engine: Engine, system_prompt: Option<String>) -> Self {
-        let ctx = InferenceContext::new(&engine.config, engine.backend.clone());
+        let ctx = engine.model.create_context(engine.backend.clone());
         let sampler = Sampler::new(engine.sampler_config.clone(), engine.config.vocab_size);
 
         Self {

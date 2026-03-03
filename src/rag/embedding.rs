@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::backend::Backend;
-use crate::model::{EmbeddingConfig, EmbeddingExtractor, InferenceContext, LlamaModel};
+use crate::model::{EmbeddingConfig, EmbeddingExtractor, LlamaModel};
 use crate::tokenizer::Tokenizer;
 
 use super::{RagError, RagResult};
@@ -56,7 +56,7 @@ impl EmbeddingGenerator {
 
     /// Generate embedding for a single text
     pub fn embed(&self, text: &str) -> RagResult<Vec<f32>> {
-        let mut ctx = InferenceContext::new(self.model.config(), Arc::clone(&self.backend));
+        let mut ctx = self.model.create_context(Arc::clone(&self.backend));
         self.extractor
             .embed_text(self.model.as_ref(), &self.tokenizer, &mut ctx, text)
             .map_err(|e| RagError::EmbeddingError(e.to_string()))
@@ -64,7 +64,7 @@ impl EmbeddingGenerator {
 
     /// Generate embeddings for multiple texts
     pub fn embed_batch(&self, texts: &[&str]) -> RagResult<Vec<Vec<f32>>> {
-        let mut ctx = InferenceContext::new(self.model.config(), Arc::clone(&self.backend));
+        let mut ctx = self.model.create_context(Arc::clone(&self.backend));
         self.extractor
             .embed_batch(self.model.as_ref(), &self.tokenizer, &mut ctx, texts)
             .map_err(|e| RagError::EmbeddingError(e.to_string()))

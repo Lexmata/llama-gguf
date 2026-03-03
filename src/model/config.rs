@@ -99,6 +99,16 @@ pub struct ModelConfig {
     pub key_length: usize,
     /// Per-head value dimension (defaults to head_dim if not specified)
     pub value_length: usize,
+    /// SSM/DeltaNet inner dimension (0 = no SSM layers)
+    pub ssm_d_inner: usize,
+    /// SSM state dimension (per-head key dim for delta-net)
+    pub ssm_d_state: usize,
+    /// SSM group count (number of key heads in delta-net)
+    pub ssm_n_group: usize,
+    /// SSM time step rank (number of value heads in delta-net)
+    pub ssm_dt_rank: usize,
+    /// SSM convolution kernel size
+    pub ssm_conv_kernel: usize,
 }
 
 impl Default for ModelConfig {
@@ -124,11 +134,21 @@ impl Default for ModelConfig {
             expert_intermediate_size: 0,
             key_length: 128,
             value_length: 128,
+            ssm_d_inner: 0,
+            ssm_d_state: 0,
+            ssm_n_group: 0,
+            ssm_dt_rank: 0,
+            ssm_conv_kernel: 0,
         }
     }
 }
 
 impl ModelConfig {
+    /// Whether this model has SSM/delta-net recurrent layers
+    pub fn has_ssm(&self) -> bool {
+        self.ssm_d_inner > 0
+    }
+
     /// Check if this is an MoE model
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0
@@ -164,6 +184,11 @@ impl ModelConfig {
             expert_intermediate_size: 0,
             key_length: 128,
             value_length: 128,
+            ssm_d_inner: 0,
+            ssm_d_state: 0,
+            ssm_n_group: 0,
+            ssm_dt_rank: 0,
+            ssm_conv_kernel: 0,
         }
     }
 
@@ -205,6 +230,11 @@ impl ModelConfig {
             expert_intermediate_size: 0,
             key_length: 128,
             value_length: 128,
+            ssm_d_inner: 0,
+            ssm_d_state: 0,
+            ssm_n_group: 0,
+            ssm_dt_rank: 0,
+            ssm_conv_kernel: 0,
         }
     }
 

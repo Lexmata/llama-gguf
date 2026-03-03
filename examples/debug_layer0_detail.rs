@@ -62,9 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut k = Tensor::zeros(vec![num_kv_heads * head_dim], DType::F32);
     let mut v = Tensor::zeros(vec![num_kv_heads * head_dim], DType::F32);
 
-    layer.attention.wq.forward(&x_vec, &mut q, &backend)?;
-    layer.attention.wk.forward(&x_vec, &mut k, &backend)?;
-    layer.attention.wv.forward(&x_vec, &mut v, &backend)?;
+    layer.attention().unwrap().wq.forward(&x_vec, &mut q, &backend)?;
+    layer.attention().unwrap().wk.forward(&x_vec, &mut k, &backend)?;
+    layer.attention().unwrap().wv.forward(&x_vec, &mut v, &backend)?;
 
     print_stats("Q (with bias)", q.as_f32()?);
     print_stats("K (with bias)", k.as_f32()?);
@@ -107,7 +107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attn_out_flat = attn_out.reshape(vec![num_heads * head_dim])?;
     let mut output = Tensor::zeros(vec![hidden_size], DType::F32);
     layer
-        .attention
+        .attention()
+        .unwrap()
         .wo
         .forward(&attn_out_flat, &mut output, &backend)?;
 
@@ -140,11 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 8: FFN (gate, up, down)
     println!("\n--- Step 8: FFN ---");
-    let intermediate_size = layer.ffn.intermediate_size;
+    let intermediate_size = layer.ffn().unwrap().intermediate_size;
     println!("  intermediate_size = {}", intermediate_size);
 
     let mut ffn_out = Tensor::zeros(vec![hidden_size], DType::F32);
-    layer.ffn.forward(&normed_ffn, &mut ffn_out, &backend)?;
+    layer.ffn().unwrap().forward(&normed_ffn, &mut ffn_out, &backend)?;
 
     let ffn_out_data = ffn_out.as_f32()?;
     print_stats("FFN output", ffn_out_data);

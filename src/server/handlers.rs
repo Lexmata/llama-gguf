@@ -13,7 +13,7 @@ use futures::stream::{self, Stream};
 use tokio::sync::Mutex;
 
 use crate::engine::ChatTemplate;
-use crate::model::{InferenceContext, ModelConfig};
+use crate::model::ModelConfig;
 use crate::sampling::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use crate::{Backend, Model};
@@ -246,7 +246,7 @@ async fn generate_response(
     _stop_sequences: Option<&[String]>,
 ) -> Result<(String, usize, usize), Box<dyn std::error::Error + Send + Sync>> {
     // Create a new context for this request using the shared backend
-    let mut ctx = InferenceContext::new(&state.config, state.backend.clone());
+    let mut ctx = state.model.create_context(state.backend.clone());
     let mut sampler = Sampler::new(sampler_config, state.config.vocab_size);
 
     // Encode prompt

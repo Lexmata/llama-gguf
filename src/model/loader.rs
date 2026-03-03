@@ -10,8 +10,11 @@ use crate::tensor::{DType, Tensor};
 
 use super::Architecture;
 use super::config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType, RopeType};
+use super::deltanet::{DeltaNetConfig, DeltaNetLayer};
 use super::error::{ModelError, ModelResult};
-use super::layers::{Attention, FeedForward, FfnLayer, Linear, RMSNorm, TransformerLayer};
+use super::layers::{
+    Attention, AttentionLayer, FeedForward, FfnLayer, Linear, RMSNorm, TransformerLayer,
+};
 use super::llama::LlamaModel;
 use super::moe::{MoeConfig, MoeExpert, MoeLayer, MoeRouter};
 
@@ -173,6 +176,11 @@ impl ModelLoader {
             expert_intermediate_size,
             key_length,
             value_length,
+            ssm_d_inner: get_u32(&format!("{}.ssm.inner_size", arch)).unwrap_or(0) as usize,
+            ssm_d_state: get_u32(&format!("{}.ssm.state_size", arch)).unwrap_or(0) as usize,
+            ssm_n_group: get_u32(&format!("{}.ssm.group_count", arch)).unwrap_or(0) as usize,
+            ssm_dt_rank: get_u32(&format!("{}.ssm.time_step_rank", arch)).unwrap_or(0) as usize,
+            ssm_conv_kernel: get_u32(&format!("{}.ssm.conv_kernel", arch)).unwrap_or(0) as usize,
         })
     }
 
@@ -198,15 +206,23 @@ impl ModelLoader {
             layers.push(layer);
         }
 
+        // Log recurrent layer summary
+        let recurrent_count = layers.iter().filter(|l| l.is_recurrent()).count();
+        if recurrent_count > 0 {
+            tracing::info!(
+                "Model has {}/{} DeltaNet recurrent layers",
+                recurrent_count,
+                layers.len()
+            );
+        }
+
         // Load final normalization
         let norm_weight = self.load_tensor("output_norm.weight")?;
         let norm = RMSNorm::new(norm_weight, self.config.norm_eps)?;
 
         // Load output projection (may be tied to embeddings)
-        // Check if output.weight exists - if not, use weight tying
         let output =
             if self.config.tie_word_embeddings || self.try_load_tensor("output.weight").is_none() {
-                // Use embedding weights as output (weight tying)
                 Linear::new(token_embedding.clone(), None)?
             } else {
                 let output_weight = self.load_tensor("output.weight")?;
@@ -223,6 +239,35 @@ impl ModelLoader {
         )
     }
 
+    /// Get the DeltaNet config for creating recurrent state.
+    /// Returns None if the model has no SSM layers.
+    pub fn deltanet_config(&self) -> Option<DeltaNetConfig> {
+        if !self.config.has_ssm() {
+            return None;
+        }
+        let d_inner = self.config.ssm_d_inner;
+        let d_state = self.config.ssm_d_state;
+        let num_v_heads = self.config.ssm_dt_rank;
+        let num_k_heads = self.config.ssm_n_group;
+        let head_v_dim = d_inner / num_v_heads;
+        let head_k_dim = d_state;
+        let conv_kernel = self.config.ssm_conv_kernel;
+        let q_dim = num_k_heads * head_k_dim;
+        let k_dim = num_k_heads * head_k_dim;
+        let qkv_dim = q_dim + k_dim + d_inner;
+
+        Some(DeltaNetConfig {
+            d_inner,
+            d_state,
+            num_v_heads,
+            num_k_heads,
+            head_v_dim,
+            head_k_dim,
+            conv_kernel,
+            qkv_dim,
+        })
+    }
+
     /// Load a single transformer layer
     fn load_transformer_layer(&self, layer_idx: usize) -> ModelResult<TransformerLayer> {
         let prefix = format!("blk.{}", layer_idx);
@@ -232,16 +277,48 @@ impl ModelLoader {
         let attn_norm = RMSNorm::new(attn_norm_weight, self.config.norm_eps)?;
 
         // Load attention based on available tensors
-        let attention = self.load_attention(layer_idx)?;
+        let attn_layer = self.load_attention_layer(layer_idx)?;
 
-        // FFN normalization - try both ffn_norm and post_attention_norm
+        // Post-attention normalization (Qwen3Next has this separate from ffn_norm)
+        let post_attn_norm =
+            if let Some(w) = self.try_load_tensor(&format!("{}.post_attention_norm.weight", prefix))
+            {
+                Some(RMSNorm::new(w, self.config.norm_eps)?)
+            } else {
+                None
+            };
+
+        // FFN normalization
         let ffn_norm_weight = self
             .try_load_tensor(&format!("{}.ffn_norm.weight", prefix))
-            .or_else(|| self.try_load_tensor(&format!("{}.post_attention_norm.weight", prefix)))
             .ok_or_else(|| {
+                // Qwen3Next uses post_attention_norm for FFN norm role
+                if post_attn_norm.is_some() {
+                    // Create a dummy norm — layer forward won't use it in practice
+                    // because post_attn_norm already handled normalization
+                }
                 ModelError::MissingTensor(format!("{}.ffn_norm.weight", prefix))
-            })?;
-        let ffn_norm = RMSNorm::new(ffn_norm_weight, self.config.norm_eps)?;
+            });
+
+        let ffn_norm = match ffn_norm_weight {
+            Ok(w) => RMSNorm::new(w, self.config.norm_eps)?,
+            Err(_) => {
+                if post_attn_norm.is_some() {
+                    // Models with post_attention_norm reuse it for FFN normalization
+                    // Create a unit-weight identity norm as placeholder
+                    let hidden = self.config.hidden_size;
+                    RMSNorm::new(
+                        Tensor::from_f32(&vec![1.0f32; hidden], vec![hidden])?,
+                        self.config.norm_eps,
+                    )?
+                } else {
+                    return Err(ModelError::MissingTensor(format!(
+                        "{}.ffn_norm.weight",
+                        prefix
+                    )));
+                }
+            }
+        };
 
         // Load FFN: MoE or dense
         let ffn_layer = if self.config.is_moe() {
@@ -264,121 +341,164 @@ impl ModelLoader {
 
         Ok(TransformerLayer {
             attn_norm,
-            attention,
+            attn_layer,
+            post_attn_norm,
             ffn_norm,
             ffn_layer,
             layer_idx,
         })
     }
 
-    /// Load attention projection tensors for a layer.
-    ///
-    /// Handles multiple tensor layouts:
-    /// - Standard: separate attn_q, attn_k, attn_v, attn_output
-    /// - Qwen3Next full attention: Q includes gate, key_length != head_dim, partial RoPE
-    /// - Qwen3Next recurrent: combined attn_qkv (identity passthrough for now)
-    fn load_attention(&self, layer_idx: usize) -> ModelResult<Attention> {
+    /// Load attention for a layer: either full softmax or delta-net recurrent.
+    fn load_attention_layer(&self, layer_idx: usize) -> ModelResult<AttentionLayer> {
+        let prefix = format!("blk.{}", layer_idx);
+
+        if let Some(wq_weight) = self.try_load_tensor(&format!("{}.attn_q.weight", prefix)) {
+            // Full softmax attention layer
+            let attn = self.load_full_attention(layer_idx, wq_weight)?;
+            Ok(AttentionLayer::FullAttention(attn))
+        } else if self.config.has_ssm()
+            && self
+                .try_load_tensor(&format!("{}.attn_qkv.weight", prefix))
+                .is_some()
+        {
+            // DeltaNet recurrent layer
+            let dn = self.load_deltanet_layer(layer_idx)?;
+            Ok(AttentionLayer::DeltaNet(Box::new(dn)))
+        } else {
+            Err(ModelError::MissingTensor(format!(
+                "{}.attn_q.weight or {}.attn_qkv.weight",
+                prefix, prefix
+            )))
+        }
+    }
+
+    /// Load a full softmax attention layer from separate Q/K/V/O tensors.
+    fn load_full_attention(
+        &self,
+        layer_idx: usize,
+        wq_weight: Tensor,
+    ) -> ModelResult<Attention> {
         let prefix = format!("blk.{}", layer_idx);
         let use_neox_rope = matches!(self.config.rope_config.rope_type, RopeType::NeoX);
         let kl = self.config.key_length;
         let vl = self.config.value_length;
         let rope_dims = self.config.rope_config.n_dims;
 
-        if let Some(wq_weight) = self.try_load_tensor(&format!("{}.attn_q.weight", prefix)) {
-            let wq_bias = self.try_load_tensor(&format!("{}.attn_q.bias", prefix));
+        let wq_bias = self.try_load_tensor(&format!("{}.attn_q.bias", prefix));
+        let actual_q_out = wq_weight.shape()[1];
+        let has_attention_gate = actual_q_out == self.config.num_heads * (kl + vl);
 
-            // Detect attention gate from Q output dimension
-            let actual_q_out = wq_weight.shape()[1];
-            let has_attention_gate = actual_q_out == self.config.num_heads * (kl + vl);
+        let wq = Linear::new(wq_weight, wq_bias)?;
 
-            let wq = Linear::new(wq_weight, wq_bias)?;
+        let wk_bias = self.try_load_tensor(&format!("{}.attn_k.bias", prefix));
+        let wk = Linear::new(
+            self.load_tensor(&format!("{}.attn_k.weight", prefix))?,
+            wk_bias,
+        )?;
+        let wv_bias = self.try_load_tensor(&format!("{}.attn_v.bias", prefix));
+        let wv = Linear::new(
+            self.load_tensor(&format!("{}.attn_v.weight", prefix))?,
+            wv_bias,
+        )?;
+        let wo_bias = self.try_load_tensor(&format!("{}.attn_output.bias", prefix));
+        let wo = Linear::new(
+            self.load_tensor(&format!("{}.attn_output.weight", prefix))?,
+            wo_bias,
+        )?;
 
-            let wk_bias = self.try_load_tensor(&format!("{}.attn_k.bias", prefix));
-            let wk = Linear::new(
-                self.load_tensor(&format!("{}.attn_k.weight", prefix))?,
-                wk_bias,
-            )?;
-            let wv_bias = self.try_load_tensor(&format!("{}.attn_v.bias", prefix));
-            let wv = Linear::new(
-                self.load_tensor(&format!("{}.attn_v.weight", prefix))?,
-                wv_bias,
-            )?;
-            let wo_bias = self.try_load_tensor(&format!("{}.attn_output.bias", prefix));
-            let wo = Linear::new(
-                self.load_tensor(&format!("{}.attn_output.weight", prefix))?,
-                wo_bias,
-            )?;
+        let mut attention = Attention::with_kv_dims(
+            wq, wk, wv, wo,
+            self.config.num_heads,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            kl, vl, rope_dims,
+            use_neox_rope,
+            has_attention_gate,
+        );
 
-            let mut attention = Attention::with_kv_dims(
-                wq,
-                wk,
-                wv,
-                wo,
-                self.config.num_heads,
-                self.config.num_kv_heads,
-                self.config.head_dim,
-                kl,
-                vl,
-                rope_dims,
-                use_neox_rope,
-                has_attention_gate,
-            );
-
-            if self.architecture.uses_qk_norm()
-                && let (Some(q_norm_w), Some(k_norm_w)) = (
-                    self.try_load_tensor(&format!("{}.attn_q_norm.weight", prefix)),
-                    self.try_load_tensor(&format!("{}.attn_k_norm.weight", prefix)),
-                )
-            {
-                let q_norm = RMSNorm::new(q_norm_w, self.config.norm_eps)?;
-                let k_norm = RMSNorm::new(k_norm_w, self.config.norm_eps)?;
-                attention.set_qk_norms(q_norm, k_norm);
-            }
-
-            Ok(attention)
-        } else {
-            // Recurrent / linear attention layer (qwen3next)
-            // For now, create zero-weight attention (passthrough via residual).
-            tracing::warn!(
-                "Layer {} uses recurrent attention (not yet fully supported), using identity passthrough",
-                layer_idx
-            );
-            let hidden = self.config.hidden_size;
-            let num_heads = self.config.num_heads;
-            let num_kv_heads = self.config.num_kv_heads;
-
-            let wq = Linear::new(
-                Tensor::zeros(vec![hidden, num_heads * kl], DType::F32),
-                None,
-            )?;
-            let wk = Linear::new(
-                Tensor::zeros(vec![hidden, num_kv_heads * kl], DType::F32),
-                None,
-            )?;
-            let wv = Linear::new(
-                Tensor::zeros(vec![hidden, num_kv_heads * vl], DType::F32),
-                None,
-            )?;
-            let wo = Linear::new(
-                Tensor::zeros(vec![num_heads * vl, hidden], DType::F32),
-                None,
-            )?;
-
-            Ok(Attention::with_kv_dims(
-                wq,
-                wk,
-                wv,
-                wo,
-                num_heads,
-                num_kv_heads,
-                self.config.head_dim,
-                kl,
-                vl,
-                rope_dims,
-                use_neox_rope,
-                false,
-            ))
+        if self.architecture.uses_qk_norm()
+            && let (Some(q_norm_w), Some(k_norm_w)) = (
+                self.try_load_tensor(&format!("{}.attn_q_norm.weight", prefix)),
+                self.try_load_tensor(&format!("{}.attn_k_norm.weight", prefix)),
+            )
+        {
+            let q_norm = RMSNorm::new(q_norm_w, self.config.norm_eps)?;
+            let k_norm = RMSNorm::new(k_norm_w, self.config.norm_eps)?;
+            attention.set_qk_norms(q_norm, k_norm);
         }
+
+        Ok(attention)
+    }
+
+    /// Load a DeltaNet (recurrent) layer from SSM tensors.
+    fn load_deltanet_layer(&self, layer_idx: usize) -> ModelResult<DeltaNetLayer> {
+        let prefix = format!("blk.{}", layer_idx);
+        let cfg = &self.config;
+
+        let d_inner = cfg.ssm_d_inner;
+        let d_state = cfg.ssm_d_state;
+        let num_v_heads = cfg.ssm_dt_rank;
+        let num_k_heads = cfg.ssm_n_group;
+        let head_v_dim = d_inner / num_v_heads;
+        let head_k_dim = d_state;
+        let conv_kernel = cfg.ssm_conv_kernel;
+        let q_dim = num_k_heads * head_k_dim;
+        let k_dim = num_k_heads * head_k_dim;
+        let qkv_dim = q_dim + k_dim + d_inner;
+
+        let dn_config = DeltaNetConfig {
+            d_inner,
+            d_state,
+            num_v_heads,
+            num_k_heads,
+            head_v_dim,
+            head_k_dim,
+            conv_kernel,
+            qkv_dim,
+        };
+
+        let attn_qkv = Linear::new(
+            self.load_tensor(&format!("{}.attn_qkv.weight", prefix))?,
+            None,
+        )?;
+
+        let attn_gate = Linear::new(
+            self.load_tensor(&format!("{}.attn_gate.weight", prefix))?,
+            None,
+        )?;
+
+        let ssm_ba = Linear::new(
+            self.load_tensor(&format!("{}.ssm_ba.weight", prefix))?,
+            None,
+        )?;
+
+        let ssm_conv1d_weight = self.load_tensor(&format!("{}.ssm_conv1d.weight", prefix))?;
+        let ssm_a = self.load_tensor(&format!("{}.ssm_a", prefix))?;
+        let ssm_dt_bias = self.load_tensor(&format!("{}.ssm_dt.bias", prefix))?;
+
+        let ssm_norm_weight = self.load_tensor(&format!("{}.ssm_norm.weight", prefix))?;
+        let ssm_norm = RMSNorm::new(ssm_norm_weight, cfg.norm_eps)?;
+
+        let ssm_out = Linear::new(
+            self.load_tensor(&format!("{}.ssm_out.weight", prefix))?,
+            None,
+        )?;
+
+        tracing::info!("Layer {}: loaded DeltaNet (d_inner={}, d_state={}, v_heads={}, k_heads={}, conv={})",
+            layer_idx, d_inner, d_state, num_v_heads, num_k_heads, conv_kernel);
+
+        Ok(DeltaNetLayer {
+            config: dn_config,
+            attn_qkv,
+            attn_gate,
+            ssm_ba,
+            ssm_conv1d_weight,
+            ssm_a,
+            ssm_dt_bias,
+            ssm_norm,
+            ssm_out,
+        })
     }
 
     /// Load MoE layer tensors for a given layer index
@@ -436,6 +556,37 @@ impl ModelLoader {
             });
         }
 
+        // Load shared expert gate weight if present (Qwen3Next).
+        // This tensor may be BF16 — convert to F32 for inference.
+        let shared_expert_gate =
+            self.try_load_tensor(&format!("{}.ffn_gate_inp_shexp.weight", prefix))
+                .map(|t| {
+                    if t.dtype() == DType::F32 {
+                        t
+                    } else {
+                        let raw = t.data();
+                        let f32_vals: Vec<f32> = match t.dtype() {
+                            DType::BF16 => {
+                                raw.chunks_exact(2)
+                                    .map(|c| {
+                                        let bits = u16::from_le_bytes([c[0], c[1]]);
+                                        f32::from_bits((bits as u32) << 16)
+                                    })
+                                    .collect()
+                            }
+                            _ => {
+                                tracing::warn!("Unsupported dtype for shared expert gate, zeroing");
+                                vec![0.0f32; t.numel()]
+                            }
+                        };
+                        let shape = t.shape().to_vec();
+                        Tensor::from_f32(&f32_vals, shape).unwrap()
+                    }
+                });
+        if shared_expert_gate.is_some() {
+            tracing::debug!("Layer {}: loaded shared expert gate", layer_idx);
+        }
+
         let num_shared = shared_experts.len();
         let moe_config = MoeConfig {
             num_experts,
@@ -450,6 +601,7 @@ impl ModelLoader {
         moe_layer.router = router;
         moe_layer.experts = experts;
         moe_layer.shared_experts = shared_experts;
+        moe_layer.shared_expert_gate = shared_expert_gate;
 
         Ok(FfnLayer::Moe(moe_layer))
     }

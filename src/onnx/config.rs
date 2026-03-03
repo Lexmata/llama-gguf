@@ -181,6 +181,11 @@ impl HfConfig {
             expert_intermediate_size: 0,
             key_length: head_dim,
             value_length: head_dim,
+            ssm_d_inner: 0,
+            ssm_d_state: 0,
+            ssm_n_group: 0,
+            ssm_dt_rank: 0,
+            ssm_conv_kernel: 0,
         })
     }
 }

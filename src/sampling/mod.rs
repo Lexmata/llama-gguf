@@ -243,7 +243,7 @@ impl Sampler {
 
         // Create sorted indices by probability
         let mut indices: Vec<usize> = (0..vocab_size).collect();
-        indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
 
         // Apply min-p filtering
         if self.config.min_p > 0.0 {

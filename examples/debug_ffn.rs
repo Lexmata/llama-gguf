@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let head_dim = model.config().head_dim;
 
     let mut v = Tensor::zeros(vec![num_kv_heads * head_dim], DType::F32);
-    layer.attention.wv.forward(&x_vec, &mut v, &backend)?;
+    layer.attention().unwrap().wv.forward(&x_vec, &mut v, &backend)?;
 
     // At pos=0, attention output = V replicated
     let v_data = v.as_f32()?;
@@ -71,7 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attn_out_tensor = Tensor::from_f32(&attn_out, vec![num_heads * head_dim])?;
     let mut output = Tensor::zeros(vec![hidden_size], DType::F32);
     layer
-        .attention
+        .attention()
+        .unwrap()
         .wo
         .forward(&attn_out_tensor, &mut output, &backend)?;
 
@@ -98,13 +99,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Now trace through FFN step by step
     println!("\n--- FFN Step-by-Step ---");
 
-    let intermediate_size = layer.ffn.intermediate_size;
+    let intermediate_size = layer.ffn().unwrap().intermediate_size;
     println!("intermediate_size = {}", intermediate_size);
 
     // Gate projection
     let mut gate_out = Tensor::zeros(vec![intermediate_size], DType::F32);
     layer
-        .ffn
+        .ffn()
+        .unwrap()
         .w_gate
         .forward(&normed_ffn, &mut gate_out, &backend)?;
 
@@ -113,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Up projection
     let mut up_out = Tensor::zeros(vec![intermediate_size], DType::F32);
-    layer.ffn.w_up.forward(&normed_ffn, &mut up_out, &backend)?;
+    layer.ffn().unwrap().w_up.forward(&normed_ffn, &mut up_out, &backend)?;
 
     let up_data = up_out.as_f32()?;
     print_stats("Up projection", up_data);
@@ -134,7 +136,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let swiglu_tensor = Tensor::from_f32(&swiglu, vec![intermediate_size])?;
     let mut down_out = Tensor::zeros(vec![hidden_size], DType::F32);
     layer
-        .ffn
+        .ffn()
+        .unwrap()
         .w_down
         .forward(&swiglu_tensor, &mut down_out, &backend)?;
 
@@ -145,7 +148,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Full FFN.forward result ---");
     let mut ffn_full_out = Tensor::zeros(vec![hidden_size], DType::F32);
     layer
-        .ffn
+        .ffn()
+        .unwrap()
         .forward(&normed_ffn, &mut ffn_full_out, &backend)?;
 
     let ffn_full_data = ffn_full_out.as_f32()?;

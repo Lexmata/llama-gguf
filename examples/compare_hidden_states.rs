@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             freq_base,
             freq_scale,
             &backend,
+            None,
         )?;
 
         let h_data = hidden.as_f32()?.to_vec();

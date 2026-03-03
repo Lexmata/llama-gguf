@@ -240,7 +240,8 @@ impl OnnxModelLoader {
 
         Ok(TransformerLayer {
             attn_norm,
-            attention,
+            attn_layer: crate::model::AttentionLayer::FullAttention(attention),
+            post_attn_norm: None,
             ffn_norm,
             ffn_layer: FfnLayer::Dense(ffn),
             layer_idx,

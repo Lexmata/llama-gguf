@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Q projection
     let mut q = Tensor::zeros(vec![num_heads * head_dim], DType::F32);
-    layer.attention.wq.forward(&x_vec, &mut q, &backend)?;
+    layer.attention().unwrap().wq.forward(&x_vec, &mut q, &backend)?;
     let q_data = q.as_f32()?;
 
     let q_min = q_data.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // K projection
     let mut k = Tensor::zeros(vec![num_kv_heads * head_dim], DType::F32);
-    layer.attention.wk.forward(&x_vec, &mut k, &backend)?;
+    layer.attention().unwrap().wk.forward(&x_vec, &mut k, &backend)?;
     let k_data = k.as_f32()?;
 
     let k_min = k_data.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // V projection
     let mut v = Tensor::zeros(vec![num_kv_heads * head_dim], DType::F32);
-    layer.attention.wv.forward(&x_vec, &mut v, &backend)?;
+    layer.attention().unwrap().wv.forward(&x_vec, &mut v, &backend)?;
     let v_data = v.as_f32()?;
 
     let v_min = v_data.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -221,7 +221,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attn_out_flat = attn_out.reshape(vec![num_heads * head_dim])?;
     let mut output = Tensor::zeros(vec![hidden_size], DType::F32);
     layer
-        .attention
+        .attention()
+        .unwrap()
         .wo
         .forward(&attn_out_flat, &mut output, &backend)?;
 

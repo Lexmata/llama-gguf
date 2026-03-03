@@ -167,7 +167,7 @@ impl MoeRouter {
             // Find top-k experts
             let mut indexed_logits: Vec<(usize, f32)> =
                 logits.iter().cloned().enumerate().collect();
-            indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let top_k_indices: Vec<usize> = indexed_logits[..self.top_k]
                 .iter()
@@ -281,6 +281,8 @@ pub struct MoeLayer {
     pub experts: Vec<MoeExpert>,
     /// Shared experts (if any)
     pub shared_experts: Vec<MoeExpert>,
+    /// Optional shared expert gate weight [hidden_dim] for sigmoid gating
+    pub shared_expert_gate: Option<Tensor>,
 }
 
 impl MoeLayer {
@@ -306,6 +308,7 @@ impl MoeLayer {
             router,
             experts,
             shared_experts,
+            shared_expert_gate: None,
         }
     }
 
@@ -359,14 +362,29 @@ impl MoeLayer {
             }
 
             // Add shared expert contributions (if any)
-            for shared_expert in &self.shared_experts {
-                let shared_output = shared_expert.forward(&token_input, backend)?;
-                let shared_data = shared_output.as_f32()?;
+            if !self.shared_experts.is_empty() {
+                let gate_scale = if let Some(ref gate_w) = self.shared_expert_gate {
+                    let gw = gate_w.as_f32()?;
+                    let mut dot = 0.0f32;
+                    let h_slice = if h_shape.len() == 1 {
+                        h_data
+                    } else {
+                        &h_data[h_offset..h_offset + hidden_dim]
+                    };
+                    for d in 0..hidden_dim.min(gw.len()) {
+                        dot += h_slice[d] * gw[d];
+                    }
+                    1.0 / (1.0 + (-dot).exp())
+                } else {
+                    1.0
+                };
 
-                // Shared experts contribute equally
-                let shared_weight = 1.0 / (self.shared_experts.len() as f32 + 1.0);
-                for d in 0..hidden_dim {
-                    output_data[b * hidden_dim + d] += shared_weight * shared_data[d];
+                for shared_expert in &self.shared_experts {
+                    let shared_output = shared_expert.forward(&token_input, backend)?;
+                    let shared_data = shared_output.as_f32()?;
+                    for d in 0..hidden_dim {
+                        output_data[b * hidden_dim + d] += gate_scale * shared_data[d];
+                    }
                 }
             }
         }

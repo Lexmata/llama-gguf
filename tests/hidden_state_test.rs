@@ -101,6 +101,7 @@ fn test_layer0_forward() {
             freq_base,
             freq_scale,
             &backend,
+            None,
         )
         .expect("Failed to forward through layer 0");
 
@@ -162,6 +163,7 @@ fn test_full_forward_produces_valid_logits() {
                 freq_base,
                 freq_scale,
                 &backend,
+                None,
             )
             .expect(&format!("Failed to forward through layer {}", layer_idx));
     }

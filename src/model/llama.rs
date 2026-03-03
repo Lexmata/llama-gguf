@@ -6,10 +6,13 @@
 //! - RoPE position embeddings
 //! - Quantized weights
 
+use std::sync::Arc;
+
 use crate::backend::Backend;
 use crate::tensor::{DType, Tensor};
 
 use super::config::ModelConfig;
+use super::deltanet::DeltaNetConfig;
 use super::error::{ModelError, ModelResult};
 use super::layers::{Linear, RMSNorm, TransformerLayer};
 use super::{Architecture, InferenceContext, Model};
@@ -28,6 +31,10 @@ pub struct LlamaModel {
     output: Linear,
     /// Model architecture variant
     architecture: Architecture,
+    /// Per-layer recurrent flag (true = delta-net, false = full attention)
+    recurrent_mask: Vec<bool>,
+    /// DeltaNet config (None if no recurrent layers)
+    deltanet_config: Option<DeltaNetConfig>,
 }
 
 impl LlamaModel {
@@ -40,7 +47,6 @@ impl LlamaModel {
         output: Linear,
         architecture: Architecture,
     ) -> ModelResult<Self> {
-        // Validate configuration
         if layers.len() != config.num_layers {
             return Err(ModelError::ConfigError(format!(
                 "Expected {} layers, got {}",
@@ -49,6 +55,34 @@ impl LlamaModel {
             )));
         }
 
+        let recurrent_mask: Vec<bool> = layers.iter().map(|l| l.is_recurrent()).collect();
+        let has_recurrent = recurrent_mask.iter().any(|&r| r);
+
+        let deltanet_config = if has_recurrent && config.has_ssm() {
+            let d_inner = config.ssm_d_inner;
+            let d_state = config.ssm_d_state;
+            let num_v_heads = config.ssm_dt_rank;
+            let num_k_heads = config.ssm_n_group;
+            let head_v_dim = d_inner / num_v_heads;
+            let head_k_dim = d_state;
+            let conv_kernel = config.ssm_conv_kernel;
+            let q_dim = num_k_heads * head_k_dim;
+            let k_dim = num_k_heads * head_k_dim;
+            let qkv_dim = q_dim + k_dim + d_inner;
+            Some(DeltaNetConfig {
+                d_inner,
+                d_state,
+                num_v_heads,
+                num_k_heads,
+                head_v_dim,
+                head_k_dim,
+                conv_kernel,
+                qkv_dim,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             token_embedding,
@@ -56,7 +90,23 @@ impl LlamaModel {
             norm,
             output,
             architecture,
+            recurrent_mask,
+            deltanet_config,
         })
+    }
+
+    /// Create an InferenceContext appropriate for this model (with recurrent state if needed).
+    pub fn create_context(&self, backend: Arc<dyn Backend>) -> InferenceContext {
+        if let Some(ref dn_cfg) = self.deltanet_config {
+            InferenceContext::new_with_recurrent(
+                &self.config,
+                backend,
+                &self.recurrent_mask,
+                dn_cfg,
+            )
+        } else {
+            InferenceContext::new(&self.config, backend)
+        }
     }
 
     /// Get model configuration
@@ -168,6 +218,10 @@ impl LlamaModel {
 }
 
 impl Model for LlamaModel {
+    fn create_context(&self, backend: Arc<dyn Backend>) -> InferenceContext {
+        self.create_context(backend)
+    }
+
     fn forward(&self, tokens: &[u32], ctx: &mut InferenceContext) -> ModelResult<Tensor> {
         let backend = ctx.backend.as_ref();
 
@@ -214,6 +268,11 @@ impl Model for LlamaModel {
 
             // Run through transformer layers
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let recurrent_state = ctx
+                    .recurrent_state
+                    .as_mut()
+                    .and_then(|rs| rs.states[layer_idx].as_mut());
+
                 hidden = layer.forward(
                     &hidden,
                     &mut ctx.kv_cache.k_cache[layer_idx],
@@ -222,6 +281,7 @@ impl Model for LlamaModel {
                     self.config.rope_config.freq_base,
                     self.config.rope_config.freq_scale,
                     backend,
+                    recurrent_state,
                 )?;
             }
 

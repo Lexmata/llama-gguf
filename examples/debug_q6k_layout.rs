@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = load_llama_model(model_path)?;
 
     let layer = &model.layers()[0];
-    let w_down = &layer.ffn.w_down.weight;
+    let w_down = &layer.ffn().unwrap().w_down.weight;
 
     println!("FFN down weight:");
     println!("  Shape: {:?}", w_down.shape());

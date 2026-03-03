@@ -86,6 +86,75 @@ pub enum TokenizerError {
 
 pub type TokenizerResult<T> = Result<T, TokenizerError>;
 
+/// Extract the longest valid UTF-8 prefix from `buf`, draining those bytes.
+/// Bytes that form incomplete trailing sequences are left in `buf` for the
+/// next call. At most 3 trailing bytes can remain (start of a 2–4 byte seq).
+fn flush_valid_utf8(buf: &mut Vec<u8>) -> String {
+    if buf.is_empty() {
+        return String::new();
+    }
+
+    // Find the longest prefix that is valid UTF-8.
+    // An incomplete trailing multi-byte sequence has at most 3 leading bytes.
+    let valid_up_to = match std::str::from_utf8(buf) {
+        Ok(_) => {
+            let s = String::from_utf8(std::mem::take(buf)).unwrap();
+            return s;
+        }
+        Err(e) => e.valid_up_to(),
+    };
+
+    if valid_up_to == 0 {
+        // Check if the entire buffer is a partial multi-byte start (≤3 bytes)
+        // that could become valid with more bytes
+        if buf.len() <= 3 && buf[0] >= 0x80 {
+            return String::new();
+        }
+        // Otherwise, the first byte is truly invalid — emit replacement and skip it
+        buf.remove(0);
+        return String::from("\u{FFFD}");
+    }
+
+    let text = String::from_utf8(buf[..valid_up_to].to_vec()).unwrap();
+    *buf = buf[valid_up_to..].to_vec();
+    text
+}
+
+/// GPT-2 byte-to-unicode mapping table.
+///
+/// GPT-2 BPE maps every byte (0-255) to a printable Unicode character so that
+/// token strings are always valid Unicode. Printable ASCII and certain Latin-1
+/// bytes map to themselves; the remaining 68 bytes map to U+0100..U+0143.
+/// Decoding requires the inverse: Unicode char → original byte.
+fn build_gpt2_unicode_to_byte() -> HashMap<char, u8> {
+    let mut byte_to_unicode: Vec<(u8, char)> = Vec::with_capacity(256);
+
+    // Bytes that map to their own Unicode code point:
+    //   ! (33) through ~ (126), ¡ (161) through ¬ (172), ® (174) through ÿ (255)
+    let mut direct: Vec<u8> = Vec::new();
+    direct.extend(33u8..=126);
+    direct.extend(161u8..=172);
+    direct.extend(174u8..=255);
+
+    for &b in &direct {
+        byte_to_unicode.push((b, char::from(b)));
+    }
+
+    // Remaining bytes map to U+0100 and up
+    let mut n: u32 = 0;
+    for b in 0u16..=255 {
+        if !direct.contains(&(b as u8)) {
+            byte_to_unicode.push((b as u8, char::from_u32(256 + n).unwrap()));
+            n += 1;
+        }
+    }
+
+    byte_to_unicode
+        .into_iter()
+        .map(|(b, c)| (c, b))
+        .collect()
+}
+
 /// Tokenizer loaded from GGUF metadata
 #[derive(Debug)]
 pub struct Tokenizer {
@@ -106,17 +175,31 @@ pub struct Tokenizer {
     pub vocab_size: usize,
     /// Token types (for distinguishing normal, control, byte tokens)
     token_types: Vec<TokenType>,
+    /// GPT-2 unicode-to-byte reverse mapping (only for GPT-2 tokenizers)
+    gpt2_unicode_to_byte: Option<HashMap<char, u8>>,
 }
 
 impl Tokenizer {
     /// Load tokenizer from GGUF file
     pub fn from_gguf(gguf: &GgufFile) -> TokenizerResult<Self> {
         // Get tokenizer type
-        let tokenizer_type = gguf
+        let model_str = gguf
             .data
             .get_string("tokenizer.ggml.model")
-            .map(TokenizerType::from_gguf_str)
-            .unwrap_or(TokenizerType::BPE);
+            .unwrap_or("bpe");
+        let tokenizer_type = TokenizerType::from_gguf_str(model_str);
+
+        // GPT-2 style tokenizers use byte-level BPE with a unicode mapping
+        let uses_gpt2_bytes = model_str == "gpt2"
+            || gguf
+                .data
+                .get_string("tokenizer.ggml.pre")
+                .is_some_and(|p| {
+                    matches!(
+                        p,
+                        "qwen2" | "gpt-2" | "gpt2" | "starcoder" | "deepseek-llm" | "deepseek-coder"
+                    )
+                });
 
         // Load vocabulary
         let tokens = Self::load_tokens(gguf)?;
@@ -143,6 +226,12 @@ impl Tokenizer {
         // Load special tokens
         let special_tokens = Self::load_special_tokens(gguf);
 
+        let gpt2_unicode_to_byte = if uses_gpt2_bytes {
+            Some(build_gpt2_unicode_to_byte())
+        } else {
+            None
+        };
+
         Ok(Self {
             token_to_id,
             id_to_token,
@@ -152,6 +241,7 @@ impl Tokenizer {
             tokenizer_type,
             vocab_size,
             token_types,
+            gpt2_unicode_to_byte,
         })
     }
 
@@ -516,20 +606,26 @@ impl Tokenizer {
 
     /// Decode token IDs to text
     pub fn decode(&self, tokens: &[u32]) -> TokenizerResult<String> {
-        let mut text = String::new();
-        let mut byte_buffer: Vec<u8> = Vec::new();
+        if let Some(ref u2b) = self.gpt2_unicode_to_byte {
+            return self.decode_gpt2(tokens, u2b);
+        }
+        self.decode_sentencepiece(tokens)
+    }
+
+    /// Decode for GPT-2 byte-level BPE tokenizers (Qwen, StarCoder, DeepSeek, etc.)
+    ///
+    /// Each character in a GPT-2 token string represents one byte via the byte_to_unicode
+    /// mapping. Decoding reverses the mapping to recover the raw byte sequence, then
+    /// interprets those bytes as UTF-8.
+    fn decode_gpt2(
+        &self,
+        tokens: &[u32],
+        unicode_to_byte: &HashMap<char, u8>,
+    ) -> TokenizerResult<String> {
+        let mut raw_bytes: Vec<u8> = Vec::new();
 
         for &token_id in tokens {
-            // Skip special tokens in output
-            if token_id == self.special_tokens.bos_token_id
-                || token_id == self.special_tokens.eos_token_id
-            {
-                continue;
-            }
-
-            if let Some(pad_id) = self.special_tokens.pad_token_id
-                && token_id == pad_id
-            {
+            if self.is_special_token(token_id) {
                 continue;
             }
 
@@ -537,7 +633,56 @@ impl Tokenizer {
                 TokenizerError::InvalidToken(format!("Unknown token ID: {}", token_id))
             })?;
 
-            // Handle byte tokens - collect into buffer for proper UTF-8 decoding
+            // Skip control tokens that render as literal text (e.g. <|im_end|>)
+            if self.get_token_type(token_id) == TokenType::Control {
+                continue;
+            }
+
+            // Handle <0x??> byte fallback tokens
+            if token_str.starts_with("<0x")
+                && token_str.ends_with('>')
+                && token_str.len() == 6
+                && let Ok(byte) = u8::from_str_radix(&token_str[3..5], 16)
+            {
+                raw_bytes.push(byte);
+                continue;
+            }
+
+            // Map each character through the GPT-2 unicode→byte table
+            for ch in token_str.chars() {
+                if let Some(&b) = unicode_to_byte.get(&ch) {
+                    raw_bytes.push(b);
+                } else {
+                    // Character not in the GPT-2 table — encode its UTF-8 bytes directly
+                    let mut buf = [0u8; 4];
+                    let encoded = ch.encode_utf8(&mut buf);
+                    raw_bytes.extend_from_slice(encoded.as_bytes());
+                }
+            }
+        }
+
+        Ok(String::from_utf8_lossy(&raw_bytes).into_owned())
+    }
+
+    /// Decode for SentencePiece-style tokenizers (LLaMA, etc.)
+    fn decode_sentencepiece(&self, tokens: &[u32]) -> TokenizerResult<String> {
+        let mut text = String::new();
+        let mut byte_buffer: Vec<u8> = Vec::new();
+
+        for &token_id in tokens {
+            if self.is_special_token(token_id) {
+                continue;
+            }
+
+            if self.get_token_type(token_id) == TokenType::Control {
+                continue;
+            }
+
+            let token_str = self.id_to_token.get(token_id as usize).ok_or_else(|| {
+                TokenizerError::InvalidToken(format!("Unknown token ID: {}", token_id))
+            })?;
+
+            // Handle byte tokens — collect into buffer for proper UTF-8 decoding
             if token_str.starts_with("<0x")
                 && token_str.ends_with('>')
                 && token_str.len() == 6
@@ -549,35 +694,17 @@ impl Tokenizer {
 
             // Flush byte buffer before adding text
             if !byte_buffer.is_empty() {
-                if let Ok(s) = String::from_utf8(byte_buffer.clone()) {
-                    text.push_str(&s);
-                } else {
-                    // Invalid UTF-8, decode as lossy
-                    text.push_str(&String::from_utf8_lossy(&byte_buffer));
-                }
+                text.push_str(&String::from_utf8_lossy(&byte_buffer));
                 byte_buffer.clear();
             }
 
-            // Handle BPE special characters
-            let decoded = token_str
-                .replace("▁", " ") // SentencePiece space
-                .replace("Ġ", " ") // GPT-2 style space
-                .replace("Ċ", "\n") // GPT-2 style newline
-                .replace("ĉ", "\t"); // GPT-2 style tab
-
-            // Debug: uncomment to see token decoding
-            // eprintln!("Token {}: '{}' -> '{}' bytes:{:?}", token_id, token_str, decoded, token_str.as_bytes());
-
-            text.push_str(&decoded);
+            // SentencePiece uses ▁ for leading spaces
+            text.push_str(&token_str.replace('▁', " "));
         }
 
         // Flush remaining bytes
         if !byte_buffer.is_empty() {
-            if let Ok(s) = String::from_utf8(byte_buffer.clone()) {
-                text.push_str(&s);
-            } else {
-                text.push_str(&String::from_utf8_lossy(&byte_buffer));
-            }
+            text.push_str(&String::from_utf8_lossy(&byte_buffer));
         }
 
         Ok(text)
@@ -586,6 +713,56 @@ impl Tokenizer {
     /// Decode a single token to string
     pub fn decode_token(&self, token_id: u32) -> TokenizerResult<String> {
         self.decode(&[token_id])
+    }
+
+    /// Decode a single token in streaming mode, handling incomplete UTF-8 sequences.
+    ///
+    /// For GPT-2 byte-level tokenizers, multi-byte UTF-8 characters (like emoji)
+    /// may be split across multiple tokens. This method accumulates raw bytes in
+    /// `pending` and only returns text once complete UTF-8 code points are formed.
+    pub fn decode_token_streaming(
+        &self,
+        token_id: u32,
+        pending: &mut Vec<u8>,
+    ) -> TokenizerResult<String> {
+        if self.is_special_token(token_id) || self.get_token_type(token_id) == TokenType::Control {
+            // Flush any pending bytes before emitting nothing
+            let flushed = flush_valid_utf8(pending);
+            return Ok(flushed);
+        }
+
+        let token_str = self.id_to_token.get(token_id as usize).ok_or_else(|| {
+            TokenizerError::InvalidToken(format!("Unknown token ID: {}", token_id))
+        })?;
+
+        // Handle <0x??> byte fallback tokens
+        if token_str.starts_with("<0x")
+            && token_str.ends_with('>')
+            && token_str.len() == 6
+            && let Ok(byte) = u8::from_str_radix(&token_str[3..5], 16)
+        {
+            pending.push(byte);
+            return Ok(flush_valid_utf8(pending));
+        }
+
+        if let Some(ref u2b) = self.gpt2_unicode_to_byte {
+            // GPT-2: each char maps to a byte
+            for ch in token_str.chars() {
+                if let Some(&b) = u2b.get(&ch) {
+                    pending.push(b);
+                } else {
+                    let mut buf = [0u8; 4];
+                    let encoded = ch.encode_utf8(&mut buf);
+                    pending.extend_from_slice(encoded.as_bytes());
+                }
+            }
+            Ok(flush_valid_utf8(pending))
+        } else {
+            // SentencePiece: flush pending, then return token text
+            let mut result = flush_valid_utf8(pending);
+            result.push_str(&token_str.replace('▁', " "));
+            Ok(result)
+        }
     }
 
     /// Get token string by ID
@@ -804,6 +981,13 @@ impl Tokenizer {
 
         let scores = vec![0.0; vocab_size];
 
+        // HF BPE tokenizers are GPT-2 byte-level
+        let gpt2_unicode_to_byte = if tokenizer_type == TokenizerType::BPE {
+            Some(build_gpt2_unicode_to_byte())
+        } else {
+            None
+        };
+
         Ok(Self {
             token_to_id,
             id_to_token,
@@ -813,6 +997,7 @@ impl Tokenizer {
             tokenizer_type,
             vocab_size,
             token_types,
+            gpt2_unicode_to_byte,
         })
     }
 }
@@ -836,5 +1021,40 @@ mod tests {
         let special = SpecialTokens::default();
         assert_eq!(special.bos_token_id, 1);
         assert_eq!(special.eos_token_id, 2);
+    }
+
+    #[test]
+    fn test_gpt2_unicode_to_byte_table() {
+        let table = build_gpt2_unicode_to_byte();
+        assert_eq!(table.len(), 256);
+
+        // Printable ASCII maps to itself
+        assert_eq!(table[&'!'], b'!');
+        assert_eq!(table[&'A'], b'A');
+        assert_eq!(table[&'~'], b'~');
+
+        // GPT-2 special chars map to their byte values
+        assert_eq!(table[&'Ġ'], b' '); // U+0120 → 0x20 (space)
+        assert_eq!(table[&'Ċ'], b'\n'); // U+010A → 0x0A (newline)
+        assert_eq!(table[&'ĉ'], b'\t'); // U+0109 → 0x09 (tab)
+
+        // Latin-1 supplement bytes map to themselves
+        assert_eq!(table[&'¡'], 0xA1);
+        assert_eq!(table[&'®'], 0xAE);
+        assert_eq!(table[&'ÿ'], 0xFF);
+    }
+
+    #[test]
+    fn test_gpt2_decode_space_and_emoji() {
+        let table = build_gpt2_unicode_to_byte();
+
+        // "ĠHello" should decode to " Hello"
+        let bytes: Vec<u8> = "ĠHello".chars().map(|c| table[&c]).collect();
+        assert_eq!(String::from_utf8(bytes).unwrap(), " Hello");
+
+        // "ðŁĺĬ" is the GPT-2 encoding of 😊 (U+1F60A, UTF-8: F0 9F 98 8A)
+        let bytes: Vec<u8> = "ðŁĺĬ".chars().map(|c| table[&c]).collect();
+        let decoded = String::from_utf8(bytes).unwrap();
+        assert_eq!(decoded, "😊");
     }
 }

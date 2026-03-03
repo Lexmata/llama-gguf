@@ -8,7 +8,7 @@ use llama_gguf::engine::{ChatEngine, Engine, EngineConfig};
 use llama_gguf::gguf::{GgufFile, MetadataValue};
 #[cfg(feature = "huggingface")]
 use llama_gguf::huggingface::{HfClient, format_bytes};
-use llama_gguf::model::{InferenceContext, ModelLoader};
+use llama_gguf::model::ModelLoader;
 
 #[derive(Parser)]
 #[command(name = "llama-gguf")]
@@ -1769,7 +1769,6 @@ fn run_benchmark(
     eprintln!("Loading model: {}", model_path);
     let start = Instant::now();
     let loader = ModelLoader::load(model_path)?;
-    let config = loader.config().clone();
     let model = loader.build_model()?;
     let load_time = start.elapsed();
     eprintln!("Model loaded in {:.2}s", load_time.as_secs_f64());
@@ -1778,7 +1777,7 @@ fn run_benchmark(
     // Create inference context
     let backend: Arc<dyn llama_gguf::Backend> =
         Arc::new(llama_gguf::backend::cpu::CpuBackend::new());
-    let mut ctx = InferenceContext::new(&config, backend.clone());
+    let mut ctx = model.create_context(backend.clone());
 
     // Generate dummy prompt tokens
     let prompt_tokens: Vec<u32> = (0..n_prompt as u32).map(|i| i % 32000).collect();
