@@ -10,6 +10,9 @@ use crate::backend::{BackendError, BackendResult};
 
 /// CUDA kernel source code
 pub const KERNEL_SOURCE: &str = r#"
+// FP16 support
+#include <cuda_fp16.h>
+
 // Define infinity for CUDA
 #define CUDART_INF_F __int_as_float(0x7f800000)
 #define MY_INFINITY CUDART_INF_F

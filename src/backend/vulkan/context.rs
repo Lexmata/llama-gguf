@@ -297,6 +297,48 @@ impl VulkanContext {
                 2,
                 28,
             ),
+            (
+                "matmul",
+                include_bytes!(concat!(env!("OUT_DIR"), "/matmul.spv")),
+                3,
+                12,
+            ),
+            (
+                "matvec",
+                include_bytes!(concat!(env!("OUT_DIR"), "/matvec.spv")),
+                3,
+                8,
+            ),
+            (
+                "dequant_q8_0",
+                include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q8_0.spv")),
+                2,
+                4,
+            ),
+            (
+                "dequant_q4_k",
+                include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q4_k.spv")),
+                2,
+                4,
+            ),
+            (
+                "dequant_q6_k",
+                include_bytes!(concat!(env!("OUT_DIR"), "/dequant_q6_k.spv")),
+                2,
+                4,
+            ),
+            (
+                "attention",
+                include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")),
+                4,
+                24,
+            ),
+            (
+                "attention_cached",
+                include_bytes!(concat!(env!("OUT_DIR"), "/attention_cached.spv")),
+                4,
+                24,
+            ),
         ];
 
         for (name, spirv_bytes, num_bindings, push_constant_size) in shader_defs {
@@ -715,6 +757,172 @@ impl VulkanContext {
     pub fn workgroup_count_1d(n: usize, local_size: u32) -> (u32, u32, u32) {
         let count = ((n as u32) + local_size - 1) / local_size;
         (count, 1, 1)
+    }
+
+    // =========================================================================
+    // Persistent buffer management (for gpu_only inference)
+    // =========================================================================
+
+    /// Create a persistent GPU buffer initialized to zeros.
+    /// Uses CpuToGpu memory for CPU-writable, GPU-readable/writable access.
+    pub fn create_persistent_buffer(&self, num_floats: usize) -> Result<GpuBuffer, BackendError> {
+        let data = vec![0.0f32; num_floats];
+        self.create_buffer_with_data(&data)
+    }
+
+    /// Write f32 data into an existing mapped GPU buffer.
+    pub fn write_to_buffer(&self, buf: &GpuBuffer, data: &[f32]) -> Result<(), BackendError> {
+        if let Some(mapped) = buf.allocation.mapped_ptr() {
+            let byte_len = data.len() * std::mem::size_of::<f32>();
+            if byte_len as u64 > buf.size {
+                return Err(BackendError::OperationFailed(format!(
+                    "Data too large for buffer: {} bytes > {} bytes",
+                    byte_len, buf.size
+                )));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    mapped.as_ptr() as *mut u8,
+                    byte_len,
+                );
+            }
+            Ok(())
+        } else {
+            Err(BackendError::OperationFailed(
+                "Buffer not mapped for writing".to_string(),
+            ))
+        }
+    }
+
+    /// Write f32 data at a byte offset into an existing mapped GPU buffer.
+    pub fn write_to_buffer_offset(
+        &self,
+        buf: &GpuBuffer,
+        data: &[f32],
+        byte_offset: usize,
+    ) -> Result<(), BackendError> {
+        if let Some(mapped) = buf.allocation.mapped_ptr() {
+            let byte_len = data.len() * std::mem::size_of::<f32>();
+            if (byte_offset + byte_len) as u64 > buf.size {
+                return Err(BackendError::OperationFailed(
+                    "Write exceeds buffer size".to_string(),
+                ));
+            }
+            unsafe {
+                let dst = (mapped.as_ptr() as *mut u8).add(byte_offset);
+                std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, dst, byte_len);
+            }
+            Ok(())
+        } else {
+            Err(BackendError::OperationFailed(
+                "Buffer not mapped for writing".to_string(),
+            ))
+        }
+    }
+
+    /// GPU-to-GPU buffer copy using vkCmdCopyBuffer.
+    pub fn copy_buffer(
+        &self,
+        src: &GpuBuffer,
+        dst: &GpuBuffer,
+        size_bytes: u64,
+    ) -> Result<(), BackendError> {
+        unsafe {
+            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let cmd_buf = self
+                .device
+                .allocate_command_buffers(&cmd_alloc_info)
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("Command buffer alloc failed: {}", e))
+                })?[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+            self.device
+                .begin_command_buffer(cmd_buf, &begin_info)
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("Begin command buffer failed: {}", e))
+                })?;
+
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: size_bytes,
+            };
+            self.device
+                .cmd_copy_buffer(cmd_buf, src.buffer, dst.buffer, &[region]);
+
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ);
+
+            self.device.cmd_pipeline_barrier(
+                cmd_buf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+
+            self.device.end_command_buffer(cmd_buf).map_err(|e| {
+                BackendError::OperationFailed(format!("End command buffer failed: {}", e))
+            })?;
+
+            let cmd_bufs = [cmd_buf];
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
+
+            let fence_info = vk::FenceCreateInfo::default();
+            let fence = self.device.create_fence(&fence_info, None).map_err(|e| {
+                BackendError::OperationFailed(format!("Fence creation failed: {}", e))
+            })?;
+
+            self.device
+                .queue_submit(self.compute_queue, &[submit_info], fence)
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("Queue submit failed: {}", e))
+                })?;
+
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| BackendError::OperationFailed(format!("Fence wait failed: {}", e)))?;
+
+            self.device.destroy_fence(fence, None);
+            self.device
+                .free_command_buffers(self.command_pool, &cmd_bufs);
+        }
+
+        Ok(())
+    }
+
+    /// Read specific number of floats from a GPU buffer (for partial reads).
+    pub fn read_buffer_floats(
+        &self,
+        buf: &GpuBuffer,
+        num_floats: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        if let Some(mapped) = buf.allocation.mapped_ptr() {
+            let mut result = vec![0.0f32; num_floats];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    mapped.as_ptr() as *const f32,
+                    result.as_mut_ptr(),
+                    num_floats,
+                );
+            }
+            Ok(result)
+        } else {
+            Err(BackendError::OperationFailed(
+                "Buffer not mapped for reading".to_string(),
+            ))
+        }
     }
 }
 

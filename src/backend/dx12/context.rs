@@ -819,6 +819,386 @@ impl Dx12Context {
         let count = ((n as u32) + local_size - 1) / local_size;
         (count, 1, 1)
     }
+
+    // =========================================================================
+    // Persistent buffer management (for gpu_only inference)
+    // =========================================================================
+
+    /// Create a persistent GPU buffer (default UAV + upload + readback).
+    /// The upload heap is used for CPU writes; readback for CPU reads.
+    pub fn create_persistent_buffer(&self, num_floats: usize) -> Result<GpuBuffer, BackendError> {
+        let data = vec![0.0f32; num_floats];
+        self.create_readwrite_buffer(&data)
+    }
+
+    /// Write f32 data into a persistent buffer's upload resource, then copy to default.
+    pub fn write_to_persistent_buffer(
+        &self,
+        buf: &GpuBuffer,
+        data: &[f32],
+    ) -> Result<(), BackendError> {
+        let upload = buf.upload_resource.as_ref().ok_or_else(|| {
+            BackendError::OperationFailed("Buffer has no upload resource".to_string())
+        })?;
+
+        let byte_len = data.len() * std::mem::size_of::<f32>();
+        if byte_len as u64 > buf.size {
+            return Err(BackendError::OperationFailed(format!(
+                "Data too large for buffer: {} bytes > {} bytes",
+                byte_len, buf.size
+            )));
+        }
+
+        unsafe {
+            let mut mapped_ptr = std::ptr::null_mut();
+            upload
+                .Map(0, None, Some(&mut mapped_ptr))
+                .map_err(|e| BackendError::OperationFailed(format!("Map upload failed: {}", e)))?;
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                mapped_ptr as *mut u8,
+                byte_len,
+            );
+            upload.Unmap(0, None);
+        }
+
+        self.copy_upload_to_default(buf)
+    }
+
+    /// Write f32 data at a byte offset into a persistent buffer.
+    pub fn write_to_persistent_buffer_offset(
+        &self,
+        buf: &GpuBuffer,
+        data: &[f32],
+        byte_offset: usize,
+    ) -> Result<(), BackendError> {
+        let upload = buf.upload_resource.as_ref().ok_or_else(|| {
+            BackendError::OperationFailed("Buffer has no upload resource".to_string())
+        })?;
+
+        let byte_len = data.len() * std::mem::size_of::<f32>();
+        if (byte_offset + byte_len) as u64 > buf.size {
+            return Err(BackendError::OperationFailed(
+                "Write exceeds buffer size".to_string(),
+            ));
+        }
+
+        unsafe {
+            let mut mapped_ptr = std::ptr::null_mut();
+            upload
+                .Map(0, None, Some(&mut mapped_ptr))
+                .map_err(|e| BackendError::OperationFailed(format!("Map upload failed: {}", e)))?;
+            let dst = (mapped_ptr as *mut u8).add(byte_offset);
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, dst, byte_len);
+            upload.Unmap(0, None);
+        }
+
+        self.copy_upload_to_default(buf)
+    }
+
+    /// Copy a buffer's upload resource to its default resource.
+    fn copy_upload_to_default(&self, buf: &GpuBuffer) -> Result<(), BackendError> {
+        let upload = buf.upload_resource.as_ref().ok_or_else(|| {
+            BackendError::OperationFailed("Buffer has no upload resource".to_string())
+        })?;
+
+        unsafe {
+            let mut fence_val = self.fence_value.lock().unwrap();
+            self.command_allocator.Reset().map_err(|e| {
+                BackendError::OperationFailed(format!("Reset allocator failed: {}", e))
+            })?;
+
+            let command_list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &self.command_allocator, None)
+                .map_err(|e| BackendError::OperationFailed(format!("CreateCommandList failed: {}", e)))?;
+
+            let barrier = Self::transition_barrier(
+                &buf.default_resource,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            command_list.ResourceBarrier(&[barrier]);
+
+            command_list.CopyResource(&buf.default_resource, upload);
+
+            let barrier = Self::transition_barrier(
+                &buf.default_resource,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            command_list.ResourceBarrier(&[barrier]);
+
+            command_list.Close().map_err(|e| {
+                BackendError::OperationFailed(format!("Close command list failed: {}", e))
+            })?;
+
+            let cmd_lists: [Option<ID3D12CommandList>; 1] = [Some(command_list.cast().unwrap())];
+            self.command_queue.ExecuteCommandLists(&cmd_lists);
+
+            *fence_val += 1;
+            self.command_queue.Signal(&self.fence, *fence_val).map_err(|e| {
+                BackendError::OperationFailed(format!("Signal fence failed: {}", e))
+            })?;
+            self.fence.SetEventOnCompletion(*fence_val, self.fence_event).map_err(|e| {
+                BackendError::OperationFailed(format!("SetEventOnCompletion failed: {}", e))
+            })?;
+            WaitForSingleObject(self.fence_event, INFINITE);
+        }
+
+        Ok(())
+    }
+
+    /// GPU-to-GPU buffer copy (default → default).
+    pub fn copy_buffer(
+        &self,
+        src: &GpuBuffer,
+        dst: &GpuBuffer,
+        size_bytes: u64,
+    ) -> Result<(), BackendError> {
+        unsafe {
+            let mut fence_val = self.fence_value.lock().unwrap();
+            self.command_allocator.Reset().map_err(|e| {
+                BackendError::OperationFailed(format!("Reset allocator failed: {}", e))
+            })?;
+
+            let command_list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &self.command_allocator, None)
+                .map_err(|e| BackendError::OperationFailed(format!("CreateCommandList failed: {}", e)))?;
+
+            let barrier_src = Self::transition_barrier(
+                &src.default_resource,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+            let barrier_dst = Self::transition_barrier(
+                &dst.default_resource,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            command_list.ResourceBarrier(&[barrier_src, barrier_dst]);
+
+            command_list.CopyBufferRegion(&dst.default_resource, 0, &src.default_resource, 0, size_bytes);
+
+            let barrier_src2 = Self::transition_barrier(
+                &src.default_resource,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            let barrier_dst2 = Self::transition_barrier(
+                &dst.default_resource,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            command_list.ResourceBarrier(&[barrier_src2, barrier_dst2]);
+
+            command_list.Close().map_err(|e| {
+                BackendError::OperationFailed(format!("Close command list failed: {}", e))
+            })?;
+
+            let cmd_lists: [Option<ID3D12CommandList>; 1] = [Some(command_list.cast().unwrap())];
+            self.command_queue.ExecuteCommandLists(&cmd_lists);
+
+            *fence_val += 1;
+            self.command_queue.Signal(&self.fence, *fence_val).map_err(|e| {
+                BackendError::OperationFailed(format!("Signal fence failed: {}", e))
+            })?;
+            self.fence.SetEventOnCompletion(*fence_val, self.fence_event).map_err(|e| {
+                BackendError::OperationFailed(format!("SetEventOnCompletion failed: {}", e))
+            })?;
+            WaitForSingleObject(self.fence_event, INFINITE);
+        }
+
+        Ok(())
+    }
+
+    /// Read specific number of floats from a persistent buffer via readback.
+    pub fn read_persistent_buffer(
+        &self,
+        buf: &GpuBuffer,
+        num_floats: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let readback = buf.readback_resource.as_ref().ok_or_else(|| {
+            BackendError::OperationFailed("Buffer has no readback resource".to_string())
+        })?;
+
+        unsafe {
+            let mut fence_val = self.fence_value.lock().unwrap();
+            self.command_allocator.Reset().map_err(|e| {
+                BackendError::OperationFailed(format!("Reset allocator failed: {}", e))
+            })?;
+
+            let command_list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &self.command_allocator, None)
+                .map_err(|e| BackendError::OperationFailed(format!("CreateCommandList failed: {}", e)))?;
+
+            let barrier = Self::transition_barrier(
+                &buf.default_resource,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+            command_list.ResourceBarrier(&[barrier]);
+
+            command_list.CopyResource(readback, &buf.default_resource);
+
+            let barrier = Self::transition_barrier(
+                &buf.default_resource,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            command_list.ResourceBarrier(&[barrier]);
+
+            command_list.Close().map_err(|e| {
+                BackendError::OperationFailed(format!("Close command list failed: {}", e))
+            })?;
+
+            let cmd_lists: [Option<ID3D12CommandList>; 1] = [Some(command_list.cast().unwrap())];
+            self.command_queue.ExecuteCommandLists(&cmd_lists);
+
+            *fence_val += 1;
+            self.command_queue.Signal(&self.fence, *fence_val).map_err(|e| {
+                BackendError::OperationFailed(format!("Signal fence failed: {}", e))
+            })?;
+            self.fence.SetEventOnCompletion(*fence_val, self.fence_event).map_err(|e| {
+                BackendError::OperationFailed(format!("SetEventOnCompletion failed: {}", e))
+            })?;
+            WaitForSingleObject(self.fence_event, INFINITE);
+
+            let mut mapped_ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped_ptr)).map_err(|e| {
+                BackendError::OperationFailed(format!("Map readback failed: {}", e))
+            })?;
+
+            let mut result = vec![0.0f32; num_floats];
+            std::ptr::copy_nonoverlapping(
+                mapped_ptr as *const f32,
+                result.as_mut_ptr(),
+                num_floats,
+            );
+            readback.Unmap(0, None);
+
+            Ok(result)
+        }
+    }
+
+    /// Dispatch a compute shader on persistent buffers (no automatic upload/readback copies).
+    /// Buffers are assumed to already have data in their default resources.
+    pub fn dispatch_persistent(
+        &self,
+        pipeline_name: &str,
+        buffers: &[&GpuBuffer],
+        root_constants: &[u32],
+        workgroup_count: (u32, u32, u32),
+    ) -> Result<(), BackendError> {
+        let pipeline = self.pipelines.get(pipeline_name).ok_or_else(|| {
+            BackendError::OperationFailed(format!("Pipeline not found: {}", pipeline_name))
+        })?;
+
+        unsafe {
+            let mut fence_val = self.fence_value.lock().unwrap();
+            self.command_allocator.Reset().map_err(|e| {
+                BackendError::OperationFailed(format!("Reset allocator failed: {}", e))
+            })?;
+
+            let command_list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                    &self.command_allocator,
+                    None,
+                )
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("CreateCommandList failed: {}", e))
+                })?;
+
+            // Transition all buffers COMMON → UNORDERED_ACCESS
+            let barriers: Vec<D3D12_RESOURCE_BARRIER> = buffers
+                .iter()
+                .map(|buf| {
+                    Self::transition_barrier(
+                        &buf.default_resource,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )
+                })
+                .collect();
+            if !barriers.is_empty() {
+                command_list.ResourceBarrier(&barriers);
+            }
+
+            command_list.SetComputeRootSignature(&pipeline.root_signature);
+            command_list.SetPipelineState(&pipeline.pipeline_state);
+
+            let mut param_idx = 0u32;
+            if pipeline.root_constant_count > 0 {
+                for (i, &val) in root_constants.iter().enumerate() {
+                    command_list.SetComputeRoot32BitConstant(param_idx, val, i as u32);
+                }
+                param_idx += 1;
+            }
+
+            for buf in buffers {
+                let gpu_addr = buf.default_resource.GetGPUVirtualAddress();
+                command_list.SetComputeRootUnorderedAccessView(param_idx, gpu_addr);
+                param_idx += 1;
+            }
+
+            command_list.Dispatch(workgroup_count.0, workgroup_count.1, workgroup_count.2);
+
+            // UAV barrier
+            let uav_barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            command_list.ResourceBarrier(&[uav_barrier]);
+
+            // Transition back to COMMON
+            let barriers_back: Vec<D3D12_RESOURCE_BARRIER> = buffers
+                .iter()
+                .map(|buf| {
+                    Self::transition_barrier(
+                        &buf.default_resource,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )
+                })
+                .collect();
+            if !barriers_back.is_empty() {
+                command_list.ResourceBarrier(&barriers_back);
+            }
+
+            command_list.Close().map_err(|e| {
+                BackendError::OperationFailed(format!("Close command list failed: {}", e))
+            })?;
+
+            let cmd_lists: [Option<ID3D12CommandList>; 1] = [Some(command_list.cast().unwrap())];
+            self.command_queue.ExecuteCommandLists(&cmd_lists);
+
+            *fence_val += 1;
+            self.command_queue
+                .Signal(&self.fence, *fence_val)
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("Signal fence failed: {}", e))
+                })?;
+            self.fence
+                .SetEventOnCompletion(*fence_val, self.fence_event)
+                .map_err(|e| {
+                    BackendError::OperationFailed(format!("SetEventOnCompletion failed: {}", e))
+                })?;
+
+            WaitForSingleObject(self.fence_event, INFINITE);
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for Dx12Context {

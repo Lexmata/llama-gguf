@@ -18,6 +18,8 @@
 #[cfg(all(feature = "dx12", target_os = "windows"))]
 pub(crate) mod context;
 #[cfg(all(feature = "dx12", target_os = "windows"))]
+pub mod gpu_only;
+#[cfg(all(feature = "dx12", target_os = "windows"))]
 pub(crate) mod ops;
 
 use crate::backend::{Backend, BackendError, BackendResult};

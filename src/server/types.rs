@@ -9,44 +9,93 @@ pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 /// Chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
+    #[serde(default)]
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// Tool definition for function calling
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDefinition,
+}
+
+/// Function definition within a tool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// Tool call in assistant response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+/// Function call within a tool call
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Tool choice for function calling
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(String),
+    Specific { #[serde(rename = "type")] tool_type: String, function: ToolChoiceFunction },
+}
+
+/// Specific function to call
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
 }
 
 /// Chat completion request
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
-    /// Model to use (ignored, uses loaded model)
     #[serde(default)]
     pub model: String,
-    /// Messages in the conversation
     pub messages: Vec<ChatMessage>,
-    /// Maximum tokens to generate
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
-    /// Sampling temperature
     #[serde(default = "default_temperature")]
     pub temperature: f32,
-    /// Top-P sampling
     #[serde(default = "default_top_p")]
     pub top_p: f32,
-    /// Whether to stream the response
     #[serde(default)]
     pub stream: bool,
-    /// Stop sequences
     #[serde(default)]
     pub stop: Option<Vec<String>>,
-    /// Frequency penalty
     #[serde(default)]
     pub frequency_penalty: f32,
-    /// Presence penalty
     #[serde(default)]
     pub presence_penalty: f32,
+    #[serde(default)]
+    pub tools: Option<Vec<ToolDefinition>>,
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 fn default_max_tokens() -> usize {
@@ -81,7 +130,7 @@ pub struct ChatCompletionResponse {
 }
 
 /// Usage statistics
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
@@ -96,6 +145,8 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatCompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// Streaming choice delta
@@ -113,6 +164,85 @@ pub struct ChatCompletionDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+// =============================================================================
+// Embeddings API Types
+// =============================================================================
+
+/// Embedding request (OpenAI-compatible)
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingRequest {
+    pub input: EmbeddingInput,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_encoding_format")]
+    pub encoding_format: String,
+}
+
+/// Embedding input: single string or array of strings
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+fn default_encoding_format() -> String {
+    "float".to_string()
+}
+
+/// Embedding response
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingResponse {
+    pub object: String,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+/// Single embedding result
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingData {
+    pub object: String,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+/// Embedding usage statistics
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+// =============================================================================
+// Model hot-swap types
+// =============================================================================
+
+/// Request to load/swap a model
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadModelRequest {
+    pub model_path: String,
+}
+
+/// Response after model load
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadModelResponse {
+    pub status: String,
+    pub model: String,
+    pub context_size: usize,
+}
+
+/// Server queue status
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStatusResponse {
+    pub active_requests: usize,
+    pub queued_requests: usize,
+    pub max_queue_depth: usize,
+    pub max_concurrent: usize,
 }
 
 /// Text completion request

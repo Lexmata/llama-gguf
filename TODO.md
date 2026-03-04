@@ -20,9 +20,9 @@ Metal, DX12, and Vulkan backends fall back to CPU for several operations. Bringi
 
 ### Dedicated inference engines
 
-- [ ] Metal `gpu_only.rs` equivalent — full GPU-resident inference for Apple Silicon
-- [ ] DX12 `gpu_only.rs` equivalent — full GPU-resident inference for Windows
-- [ ] Vulkan `gpu_only.rs` equivalent — full GPU-resident inference (cross-platform)
+- [x] Metal `gpu_only.rs` equivalent — full GPU-resident inference for Apple Silicon
+- [x] DX12 `gpu_only.rs` equivalent — full GPU-resident inference for Windows
+- [x] Vulkan `gpu_only.rs` equivalent — full GPU-resident inference (cross-platform)
 
 ## CUDA Backend
 

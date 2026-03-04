@@ -18,6 +18,8 @@
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) mod context;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod gpu_only;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) mod ops;
 
 use crate::backend::{Backend, BackendError, BackendResult};

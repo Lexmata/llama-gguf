@@ -10,76 +10,281 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::stream::{self, Stream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 
 use crate::engine::ChatTemplate;
 use crate::model::ModelConfig;
+use crate::model::embeddings::{EmbeddingConfig, EmbeddingExtractor};
 use crate::sampling::{Sampler, SamplerConfig};
+use crate::sampling::grammar::{Grammar, GrammarSampler};
 use crate::tokenizer::Tokenizer;
 use crate::{Backend, Model};
 
 use super::types::*;
 
+// =============================================================================
+// Application State
+// =============================================================================
+
 /// Shared application state
 pub struct AppState {
-    pub model: Arc<dyn Model>,
-    pub tokenizer: Arc<Tokenizer>,
-    pub config: ModelConfig,
-    pub model_name: String,
-    /// Detected chat template for the loaded model
-    pub chat_template: ChatTemplate,
-    /// Backend for inference (CPU or GPU)
-    pub backend: Arc<dyn Backend>,
-    /// Mutex to serialize inference requests (single-threaded for now)
-    pub inference_lock: Mutex<()>,
+    /// Model behind RwLock for hot-swapping
+    pub model: RwLock<Arc<dyn Model>>,
+    pub tokenizer: RwLock<Arc<Tokenizer>>,
+    pub config: RwLock<ModelConfig>,
+    pub model_name: RwLock<String>,
+    pub model_path: RwLock<String>,
+    pub chat_template: RwLock<ChatTemplate>,
+    pub backend: RwLock<Arc<dyn Backend>>,
+    /// Semaphore for concurrency control (replaces inference_lock)
+    pub inference_semaphore: Arc<Semaphore>,
+    /// Request queue
+    pub request_queue: RequestQueue,
 }
 
-/// Health check endpoint
+/// FIFO request queue with configurable depth
+pub struct RequestQueue {
+    pub max_queue_depth: usize,
+    pub max_concurrent: usize,
+    active: Mutex<usize>,
+    queue_depth: Mutex<usize>,
+}
+
+impl RequestQueue {
+    pub fn new(max_queue_depth: usize, max_concurrent: usize) -> Self {
+        Self {
+            max_queue_depth,
+            max_concurrent,
+            active: Mutex::new(0),
+            queue_depth: Mutex::new(0),
+        }
+    }
+
+    /// Try to enqueue a request. Returns Err if queue is full.
+    pub async fn try_enqueue(&self) -> Result<QueueGuard, ()> {
+        let mut depth = self.queue_depth.lock().await;
+        if *depth >= self.max_queue_depth {
+            return Err(());
+        }
+        *depth += 1;
+        Ok(QueueGuard {
+            queue_depth: &self.queue_depth,
+            active: &self.active,
+            promoted: false,
+        })
+    }
+
+    pub async fn active_count(&self) -> usize {
+        *self.active.lock().await
+    }
+
+    pub async fn queued_count(&self) -> usize {
+        *self.queue_depth.lock().await
+    }
+}
+
+pub struct QueueGuard<'a> {
+    queue_depth: &'a Mutex<usize>,
+    active: &'a Mutex<usize>,
+    promoted: bool,
+}
+
+impl<'a> QueueGuard<'a> {
+    pub async fn promote(&mut self) {
+        let mut active = self.active.lock().await;
+        *active += 1;
+        self.promoted = true;
+    }
+}
+
+impl<'a> Drop for QueueGuard<'a> {
+    fn drop(&mut self) {
+        let queue_depth = self.queue_depth;
+        let active = self.active;
+        let promoted = self.promoted;
+        // We need to use try_lock since Drop can't be async
+        if let Ok(mut depth) = queue_depth.try_lock() {
+            if *depth > 0 {
+                *depth -= 1;
+            }
+        }
+        if promoted {
+            if let Ok(mut act) = active.try_lock() {
+                if *act > 0 {
+                    *act -= 1;
+                }
+            }
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Acquire a queue slot, returning 429 if full, then acquire the inference semaphore.
+async fn acquire_inference_slot(
+    state: &AppState,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, QueueGuard<'_>), Response> {
+    let mut guard = state.request_queue.try_enqueue().await.map_err(|_| {
+        let error = ErrorResponse::new(
+            "Server overloaded: request queue is full",
+            "rate_limit_exceeded",
+        );
+        (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response()
+    })?;
+
+    // Wait for a semaphore permit (FIFO by tokio Semaphore fairness)
+    let permit = state
+        .inference_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            let error = ErrorResponse::new("Server shutting down", "server_error");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response()
+        })?;
+
+    guard.promote().await;
+    Ok((permit, guard))
+}
+
+// =============================================================================
+// Health & Models
+// =============================================================================
+
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let config = state.config.read().await;
+    let model_name = state.model_name.read().await;
     Json(HealthResponse {
         status: "ok".to_string(),
-        model: state.model_name.clone(),
-        context_size: state.config.max_seq_len,
+        model: model_name.clone(),
+        context_size: config.max_seq_len,
     })
 }
 
-/// List models endpoint
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
+    let model_name = state.model_name.read().await;
     Json(ModelsResponse {
         object: "list".to_string(),
         data: vec![ModelInfo {
-            id: state.model_name.clone(),
+            id: model_name.clone(),
             object: "model".to_string(),
-            created,
-            owned_by: "llama-rs".to_string(),
+            created: now_secs(),
+            owned_by: "llama-gguf".to_string(),
         }],
     })
 }
 
-/// Chat completions endpoint
+// =============================================================================
+// Queue Status
+// =============================================================================
+
+pub async fn queue_status(State(state): State<Arc<AppState>>) -> Json<QueueStatusResponse> {
+    Json(QueueStatusResponse {
+        active_requests: state.request_queue.active_count().await,
+        queued_requests: state.request_queue.queued_count().await,
+        max_queue_depth: state.request_queue.max_queue_depth,
+        max_concurrent: state.request_queue.max_concurrent,
+    })
+}
+
+// =============================================================================
+// Embeddings
+// =============================================================================
+
+pub async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<EmbeddingRequest>,
+) -> Response {
+    let (_permit, _guard) = match acquire_inference_slot(&state).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let texts = match request.input {
+        EmbeddingInput::Single(ref s) => vec![s.as_str()],
+        EmbeddingInput::Batch(ref v) => v.iter().map(|s| s.as_str()).collect(),
+    };
+
+    let model = state.model.read().await;
+    let tokenizer = state.tokenizer.read().await;
+    let config = state.config.read().await;
+    let backend = state.backend.read().await;
+    let model_name = state.model_name.read().await;
+
+    let embed_config = EmbeddingConfig::default();
+    let extractor = EmbeddingExtractor::new(embed_config, &config);
+
+    let mut results = Vec::with_capacity(texts.len());
+    let mut total_prompt_tokens = 0usize;
+
+    for (i, text) in texts.iter().enumerate() {
+        let tokens = match tokenizer.encode(text, true) {
+            Ok(t) => t,
+            Err(e) => {
+                let error = ErrorResponse::new(
+                    format!("Tokenization failed: {}", e),
+                    "invalid_request_error",
+                );
+                return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+            }
+        };
+        total_prompt_tokens += tokens.len();
+
+        let mut ctx = model.create_context(backend.clone());
+        match extractor.embed_text(model.as_ref(), &tokenizer, &mut ctx, text) {
+            Ok(embedding) => {
+                results.push(EmbeddingData {
+                    object: "embedding".to_string(),
+                    embedding,
+                    index: i,
+                });
+            }
+            Err(e) => {
+                let error =
+                    ErrorResponse::new(format!("Embedding failed: {}", e), "server_error");
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
+            }
+        }
+    }
+
+    Json(EmbeddingResponse {
+        object: "list".to_string(),
+        data: results,
+        model: model_name.clone(),
+        usage: EmbeddingUsage {
+            prompt_tokens: total_prompt_tokens,
+            total_tokens: total_prompt_tokens,
+        },
+    })
+    .into_response()
+}
+
+// =============================================================================
+// Chat Completions (with function calling)
+// =============================================================================
+
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
-    // Acquire inference lock
-    let _lock = state.inference_lock.lock().await;
+    let (_permit, _guard) = match acquire_inference_slot(&state).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
+    let created = now_secs();
     let request_id = format!("chatcmpl-{}", created);
 
-    // Format messages into prompt using the model's chat template
-    let prompt = format_chat_messages(&request.messages, &state.chat_template);
+    let chat_template = state.chat_template.read().await;
+    let model_name = state.model_name.read().await;
 
-    // Create sampler
+    let prompt = format_chat_messages(&request.messages, &chat_template, request.tools.as_deref());
+
     let sampler_config = SamplerConfig {
         temperature: request.temperature,
         top_p: request.top_p,
@@ -88,40 +293,77 @@ pub async fn chat_completions(
         ..Default::default()
     };
 
-    // Generate response
+    let has_tools = request.tools.is_some();
+    let forced_function = match &request.tool_choice {
+        Some(ToolChoice::Specific { function, .. }) => Some(function.name.clone()),
+        _ => None,
+    };
+
     match generate_response(
         &state,
         &prompt,
         request.max_tokens,
         sampler_config,
         request.stop.as_deref(),
+        has_tools,
     )
     .await
     {
         Ok((response_text, prompt_tokens, completion_tokens)) => {
+            let (message, finish_reason) =
+                if has_tools {
+                    match parse_tool_calls(&response_text, forced_function.as_deref()) {
+                        Some(tool_calls) => (
+                            ChatMessage {
+                                role: Role::Assistant,
+                                content: String::new(),
+                                tool_calls: Some(tool_calls),
+                                tool_call_id: None,
+                            },
+                            "tool_calls".to_string(),
+                        ),
+                        None => (
+                            ChatMessage {
+                                role: Role::Assistant,
+                                content: response_text.clone(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            },
+                            "stop".to_string(),
+                        ),
+                    }
+                } else {
+                    (
+                        ChatMessage {
+                            role: Role::Assistant,
+                            content: response_text.clone(),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                        "stop".to_string(),
+                    )
+                };
+
             if request.stream {
-                // Streaming response
                 let stream = create_chat_stream(
                     request_id,
-                    state.model_name.clone(),
+                    model_name.clone(),
                     created,
                     response_text,
+                    prompt_tokens,
+                    completion_tokens,
                 );
                 Sse::new(stream).into_response()
             } else {
-                // Non-streaming response
                 let response = ChatCompletionResponse {
                     id: request_id,
                     object: "chat.completion".to_string(),
                     created,
-                    model: state.model_name.clone(),
+                    model: model_name.clone(),
                     choices: vec![ChatCompletionChoice {
                         index: 0,
-                        message: ChatMessage {
-                            role: Role::Assistant,
-                            content: response_text,
-                        },
-                        finish_reason: "stop".to_string(),
+                        message,
+                        finish_reason,
                     }],
                     usage: Usage {
                         prompt_tokens,
@@ -139,19 +381,22 @@ pub async fn chat_completions(
     }
 }
 
-/// Text completions endpoint
+// =============================================================================
+// Text Completions
+// =============================================================================
+
 pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CompletionRequest>,
 ) -> Response {
-    let _lock = state.inference_lock.lock().await;
+    let (_permit, _guard) = match acquire_inference_slot(&state).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
+    let created = now_secs();
     let request_id = format!("cmpl-{}", created);
+    let model_name = state.model_name.read().await;
 
     let sampler_config = SamplerConfig {
         temperature: request.temperature,
@@ -165,6 +410,7 @@ pub async fn completions(
         request.max_tokens,
         sampler_config,
         request.stop.as_deref(),
+        false,
     )
     .await
     {
@@ -173,7 +419,7 @@ pub async fn completions(
                 id: request_id,
                 object: "text_completion".to_string(),
                 created,
-                model: state.model_name.clone(),
+                model: model_name.clone(),
                 choices: vec![CompletionChoice {
                     text: response_text,
                     index: 0,
@@ -194,9 +440,88 @@ pub async fn completions(
     }
 }
 
-/// Format chat messages into a prompt string using the detected chat template
-fn format_chat_messages(messages: &[ChatMessage], template: &ChatTemplate) -> String {
-    // Extract system prompt and conversation messages
+// =============================================================================
+// Model Hot-Swap
+// =============================================================================
+
+pub async fn load_model(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<LoadModelRequest>,
+) -> Response {
+    tracing::info!("Hot-swap: loading model from {}", request.model_path);
+
+    match reload_model_from_path(&state, &request.model_path).await {
+        Ok((name, ctx_size)) => {
+            Json(LoadModelResponse {
+                status: "loaded".to_string(),
+                model: name,
+                context_size: ctx_size,
+            })
+            .into_response()
+        }
+        Err(e) => {
+            let error = ErrorResponse::new(format!("Model load failed: {}", e), "server_error");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
+        }
+    }
+}
+
+/// Reload model, swapping all state atomically.
+pub async fn reload_model_from_path(
+    state: &AppState,
+    model_path: &str,
+) -> Result<(String, usize), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::{ChatTemplate, Engine};
+    use crate::gguf::GgufFile;
+    use crate::model::ModelLoader;
+
+    let gguf = GgufFile::open(model_path)?;
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let chat_template = ChatTemplate::detect(&gguf);
+    let loader = ModelLoader::load(model_path)?;
+    let model_config = loader.config().clone();
+    let model = loader.build_model()?;
+
+    let use_gpu = std::env::var("LLAMA_GPU")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let backend: Arc<dyn crate::Backend> = if use_gpu {
+        Engine::select_gpu_backend(&model)
+    } else {
+        Arc::new(crate::backend::cpu::CpuBackend::new())
+    };
+
+    let name = std::path::Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("llama")
+        .to_string();
+    let ctx_size = model_config.max_seq_len;
+
+    // Swap atomically
+    *state.model.write().await = Arc::new(model);
+    *state.tokenizer.write().await = Arc::new(tokenizer);
+    *state.config.write().await = model_config;
+    *state.model_name.write().await = name.clone();
+    *state.model_path.write().await = model_path.to_string();
+    *state.chat_template.write().await = chat_template;
+    *state.backend.write().await = backend;
+
+    tracing::info!("Hot-swap complete: {} (ctx={})", name, ctx_size);
+    Ok((name, ctx_size))
+}
+
+// =============================================================================
+// Internal helpers
+// =============================================================================
+
+/// Format chat messages into a prompt string, optionally injecting tool definitions
+fn format_chat_messages(
+    messages: &[ChatMessage],
+    template: &ChatTemplate,
+    tools: Option<&[ToolDefinition]>,
+) -> String {
     let mut system_prompt = String::new();
     let mut conversation: Vec<&ChatMessage> = Vec::new();
 
@@ -204,6 +529,18 @@ fn format_chat_messages(messages: &[ChatMessage], template: &ChatTemplate) -> St
         match msg.role {
             Role::System => system_prompt = msg.content.clone(),
             _ => conversation.push(msg),
+        }
+    }
+
+    // Inject tool definitions into the system prompt
+    if let Some(tools) = tools {
+        if !tools.is_empty() {
+            let tools_section = format_tools_for_prompt(tools);
+            if system_prompt.is_empty() {
+                system_prompt = tools_section;
+            } else {
+                system_prompt = format!("{}\n\n{}", system_prompt, tools_section);
+            }
         }
     }
 
@@ -222,14 +559,20 @@ fn format_chat_messages(messages: &[ChatMessage], template: &ChatTemplate) -> St
                 }
             }
             Role::Assistant => {
-                // Append assistant response as-is (template handles framing)
                 prompt.push_str(&msg.content);
             }
-            Role::System => {} // Already handled
+            Role::Tool => {
+                let tool_result = if let Some(ref id) = msg.tool_call_id {
+                    format!("[Tool Result (call_id={})]:\n{}", id, msg.content)
+                } else {
+                    format!("[Tool Result]:\n{}", msg.content)
+                };
+                prompt.push_str(&template.format_continuation(&tool_result));
+            }
+            Role::System => {}
         }
     }
 
-    // If there were no user messages but we have a system prompt, wrap it
     if is_first_user && !system_prompt.is_empty() {
         prompt.push_str(&template.format_first_turn(&system_prompt, ""));
     }
@@ -237,82 +580,261 @@ fn format_chat_messages(messages: &[ChatMessage], template: &ChatTemplate) -> St
     prompt
 }
 
-/// Generate text response
+/// Format tool definitions into a prompt-injectable string
+fn format_tools_for_prompt(tools: &[ToolDefinition]) -> String {
+    let mut section = String::from(
+        "You have access to the following tools. To call a tool, respond with a JSON object in this exact format:\n\
+         {\"tool_calls\": [{\"name\": \"function_name\", \"arguments\": {\"arg\": \"value\"}}]}\n\n\
+         Available tools:\n",
+    );
+
+    for tool in tools {
+        section.push_str(&format!("- {}", tool.function.name));
+        if let Some(ref desc) = tool.function.description {
+            section.push_str(&format!(": {}", desc));
+        }
+        section.push('\n');
+        if let Some(ref params) = tool.function.parameters {
+            if let Ok(pretty) = serde_json::to_string_pretty(params) {
+                section.push_str(&format!("  Parameters: {}\n", pretty));
+            }
+        }
+    }
+
+    section
+}
+
+/// Try to parse tool calls from the model's output.
+/// Looks for JSON with a "tool_calls" array, or a single function call object.
+fn parse_tool_calls(text: &str, forced_name: Option<&str>) -> Option<Vec<ToolCall>> {
+    let trimmed = text.trim();
+
+    // Try to find JSON in the response
+    let json_str = extract_json_from_text(trimmed)?;
+    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    let mut calls = Vec::new();
+
+    if let Some(arr) = value.get("tool_calls").and_then(|v| v.as_array()) {
+        for (i, item) in arr.iter().enumerate() {
+            let name = forced_name
+                .map(String::from)
+                .or_else(|| item.get("name").and_then(|v| v.as_str()).map(String::from))?;
+            let args = item
+                .get("arguments")
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_else(|| "{}".to_string());
+            calls.push(ToolCall {
+                id: format!("call_{}", i),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name,
+                    arguments: args,
+                },
+            });
+        }
+    } else if value.get("name").is_some() || forced_name.is_some() {
+        let name = forced_name
+            .map(String::from)
+            .or_else(|| value.get("name").and_then(|v| v.as_str()).map(String::from))?;
+        let args = value
+            .get("arguments")
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .unwrap_or_else(|| "{}".to_string());
+        calls.push(ToolCall {
+            id: "call_0".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name,
+                arguments: args,
+            },
+        });
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+/// Extract the first JSON object from text (handles markdown code blocks, etc.)
+fn extract_json_from_text(text: &str) -> Option<String> {
+    // Try the whole text first
+    if text.starts_with('{') {
+        if let Ok(_) = serde_json::from_str::<serde_json::Value>(text) {
+            return Some(text.to_string());
+        }
+    }
+
+    // Look for JSON inside code blocks
+    if let Some(start) = text.find("```json") {
+        let after = &text[start + 7..];
+        if let Some(end) = after.find("```") {
+            let candidate = after[..end].trim();
+            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    // Find first { and matching }
+    let mut depth = 0i32;
+    let mut start_idx = None;
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start_idx = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start_idx {
+                        let candidate = &text[s..=i];
+                        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                            return Some(candidate.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Generate text response using the model
 async fn generate_response(
     state: &AppState,
     prompt: &str,
     max_tokens: usize,
     sampler_config: SamplerConfig,
     _stop_sequences: Option<&[String]>,
+    use_json_grammar: bool,
 ) -> Result<(String, usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-    // Create a new context for this request using the shared backend
-    let mut ctx = state.model.create_context(state.backend.clone());
-    let mut sampler = Sampler::new(sampler_config, state.config.vocab_size);
+    let model = state.model.read().await;
+    let tokenizer = state.tokenizer.read().await;
+    let config = state.config.read().await;
+    let backend = state.backend.read().await;
+    let chat_template = state.chat_template.read().await;
 
-    // Encode prompt
-    let prompt_tokens = state.tokenizer.encode(prompt, true)?;
+    let mut ctx = model.create_context(backend.clone());
+    let mut sampler = Sampler::new(sampler_config, config.vocab_size);
+
+    // Optional grammar sampler for structured JSON output
+    let mut grammar_sampler = if use_json_grammar {
+        let vocab: Vec<String> = (0..config.vocab_size as u32)
+            .map(|id| {
+                tokenizer
+                    .get_token(id)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        Some(GrammarSampler::new(Grammar::Json, vocab))
+    } else {
+        None
+    };
+
+    let prompt_tokens = tokenizer.encode(prompt, true)?;
     let prompt_len = prompt_tokens.len();
-
     let mut all_tokens = prompt_tokens.clone();
 
-    // Process prompt tokens (prefill) — process all but the last token
-    // The last token's logits are what we sample from for the first generated token
+    // Prefill
     if prompt_tokens.len() > 1 {
         for (i, &token) in prompt_tokens[..prompt_tokens.len() - 1].iter().enumerate() {
-            if i < state.config.max_seq_len {
-                let _ = state.model.forward(&[token], &mut ctx);
+            if i < config.max_seq_len {
+                let _ = model.forward(&[token], &mut ctx);
             }
         }
     }
 
-    // Get stop patterns from the chat template
-    let stop_patterns = state.chat_template.stop_patterns();
-
-    // Generate response tokens
+    let stop_patterns = chat_template.stop_patterns();
     let mut response_text = String::new();
     let mut completion_tokens = 0;
 
     for _ in 0..max_tokens {
         let last_token = *all_tokens
             .last()
-            .unwrap_or(&state.tokenizer.special_tokens.bos_token_id);
+            .unwrap_or(&tokenizer.special_tokens.bos_token_id);
 
-        // Forward pass
-        let logits = state.model.forward(&[last_token], &mut ctx)?;
+        let logits = model.forward(&[last_token], &mut ctx)?;
 
-        // Sample next token
-        let next_token = sampler.sample(&logits, &all_tokens);
+        // Apply grammar constraint if active
+        if let Some(ref gs) = grammar_sampler {
+            let mut logit_data = logits.as_f32()?.to_vec();
+            gs.apply_mask(&mut logit_data);
+            // Sample from masked logits via the tensor
+            let masked_logits =
+                crate::tensor::Tensor::from_f32(&logit_data, logits.shape().to_vec())
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let next_token = sampler.sample(&masked_logits, &all_tokens);
 
-        // Check for EOS
-        if next_token == state.tokenizer.special_tokens.eos_token_id {
-            break;
-        }
-
-        // Decode token
-        if let Ok(text) = state.tokenizer.decode(&[next_token]) {
-            // Check for stop patterns using the chat template
-            let combined = format!("{}{}", response_text, text);
-            let should_stop = stop_patterns.iter().any(|p| combined.contains(p));
-
-            if should_stop {
-                // Trim stop pattern from response
-                for pattern in stop_patterns {
-                    if let Some(idx) = combined.find(pattern) {
-                        response_text = combined[..idx].to_string();
-                        return Ok((
-                            response_text.trim().to_string(),
-                            prompt_len,
-                            completion_tokens,
-                        ));
-                    }
-                }
+            if next_token == tokenizer.special_tokens.eos_token_id {
                 break;
             }
-            response_text.push_str(&text);
-        }
 
-        all_tokens.push(next_token);
-        completion_tokens += 1;
+            if let Ok(text) = tokenizer.decode(&[next_token]) {
+                if let Some(ref mut gs) = grammar_sampler {
+                    gs.record_token(&text);
+                }
+                let combined = format!("{}{}", response_text, text);
+                let should_stop = stop_patterns.iter().any(|p| combined.contains(p));
+                if should_stop {
+                    for pattern in &stop_patterns {
+                        if let Some(idx) = combined.find(pattern) {
+                            response_text = combined[..idx].to_string();
+                            return Ok((
+                                response_text.trim().to_string(),
+                                prompt_len,
+                                completion_tokens,
+                            ));
+                        }
+                    }
+                    break;
+                }
+                response_text.push_str(&text);
+            }
+
+            all_tokens.push(next_token);
+            completion_tokens += 1;
+
+            if grammar_sampler.as_ref().map_or(false, |gs| gs.is_complete()) {
+                break;
+            }
+        } else {
+            let next_token = sampler.sample(&logits, &all_tokens);
+
+            if next_token == tokenizer.special_tokens.eos_token_id {
+                break;
+            }
+
+            if let Ok(text) = tokenizer.decode(&[next_token]) {
+                let combined = format!("{}{}", response_text, text);
+                let should_stop = stop_patterns.iter().any(|p| combined.contains(p));
+                if should_stop {
+                    for pattern in &stop_patterns {
+                        if let Some(idx) = combined.find(pattern) {
+                            response_text = combined[..idx].to_string();
+                            return Ok((
+                                response_text.trim().to_string(),
+                                prompt_len,
+                                completion_tokens,
+                            ));
+                        }
+                    }
+                    break;
+                }
+                response_text.push_str(&text);
+            }
+
+            all_tokens.push(next_token);
+            completion_tokens += 1;
+        }
     }
 
     Ok((
@@ -322,17 +844,17 @@ async fn generate_response(
     ))
 }
 
-/// Create streaming response for chat completions
+/// Create streaming response for chat completions with usage in the final chunk
 fn create_chat_stream(
     request_id: String,
     model: String,
     created: u64,
     response_text: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    // For simplicity, we send the whole response as a single chunk
-    // A proper implementation would stream token by token
     let chunks = vec![
-        // Initial chunk with role
+        // Role chunk
         ChatCompletionChunk {
             id: request_id.clone(),
             object: "chat.completion.chunk".to_string(),
@@ -343,9 +865,11 @@ fn create_chat_stream(
                 delta: ChatCompletionDelta {
                     role: Some(Role::Assistant),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
+            usage: None,
         },
         // Content chunk
         ChatCompletionChunk {
@@ -358,11 +882,13 @@ fn create_chat_stream(
                 delta: ChatCompletionDelta {
                     role: None,
                     content: Some(response_text),
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
+            usage: None,
         },
-        // Final chunk
+        // Final chunk with finish reason and usage
         ChatCompletionChunk {
             id: request_id,
             object: "chat.completion.chunk".to_string(),
@@ -373,9 +899,15 @@ fn create_chat_stream(
                 delta: ChatCompletionDelta {
                     role: None,
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
+            usage: Some(Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            }),
         },
     ];
 
@@ -389,12 +921,9 @@ fn create_chat_stream(
 // RAG / Knowledge Base Handlers
 // =============================================================================
 
-/// RAG state for knowledge base operations
 #[cfg(feature = "rag")]
 pub struct RagState {
-    /// Knowledge base configurations (name -> config)
     pub knowledge_bases: tokio::sync::RwLock<HashMap<String, crate::rag::KnowledgeBaseConfig>>,
-    /// RAG config for database connection
     pub rag_config: crate::rag::RagConfig,
 }
 
@@ -408,7 +937,6 @@ impl RagState {
     }
 }
 
-/// Retrieve from knowledge base (Bedrock-style API)
 #[cfg(feature = "rag")]
 pub async fn retrieve(
     State(rag_state): State<Arc<RagState>>,
@@ -416,7 +944,6 @@ pub async fn retrieve(
 ) -> Response {
     use crate::rag::{KnowledgeBase, KnowledgeBaseConfig, RetrievalConfig};
 
-    // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
         kbs.get(&request.knowledge_base_id)
@@ -428,7 +955,6 @@ pub async fn retrieve(
             })
     };
 
-    // Connect to knowledge base
     let kb = match KnowledgeBase::connect(kb_config).await {
         Ok(kb) => kb,
         Err(e) => {
@@ -440,7 +966,6 @@ pub async fn retrieve(
         }
     };
 
-    // Build retrieval config
     let mut retrieval_config = RetrievalConfig::default();
 
     if let Some(ref config) = request.retrieval_configuration
@@ -448,13 +973,11 @@ pub async fn retrieve(
     {
         retrieval_config.max_results = vs_config.number_of_results;
 
-        // Convert filter if provided
         if let Some(ref filter) = vs_config.filter {
             retrieval_config.filter = convert_filter(filter);
         }
     }
 
-    // Perform retrieval
     match kb.retrieve(&request.query, Some(retrieval_config)).await {
         Ok(response) => {
             let results: Vec<RetrievalResult> = response
@@ -489,7 +1012,6 @@ pub async fn retrieve(
     }
 }
 
-/// Retrieve and generate (RAG pipeline)
 #[cfg(feature = "rag")]
 pub async fn retrieve_and_generate(
     State((app_state, rag_state)): State<(Arc<AppState>, Arc<RagState>)>,
@@ -502,7 +1024,6 @@ pub async fn retrieve_and_generate(
         .knowledge_base_configuration
         .knowledge_base_id;
 
-    // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
         kbs.get(kb_id)
@@ -514,7 +1035,6 @@ pub async fn retrieve_and_generate(
             })
     };
 
-    // Connect to knowledge base
     let kb = match KnowledgeBase::connect(kb_config).await {
         Ok(kb) => kb,
         Err(e) => {
@@ -526,7 +1046,6 @@ pub async fn retrieve_and_generate(
         }
     };
 
-    // Build retrieval config
     let mut retrieval_config = RetrievalConfig::default();
 
     if let Some(ref config) = request
@@ -538,14 +1057,12 @@ pub async fn retrieve_and_generate(
         retrieval_config.max_results = vs_config.number_of_results;
     }
 
-    // Get prompt template if provided
     if let Some(ref gen_config) = request
         .retrieve_and_generate_configuration
         .knowledge_base_configuration
         .generation_configuration
         && let Some(ref template) = gen_config.prompt_template
     {
-        // Convert Bedrock template format ($query$, $search_results$) to our format ({query}, {context})
         let converted = template
             .text_prompt_template
             .replace("$query$", "{query}")
@@ -553,7 +1070,6 @@ pub async fn retrieve_and_generate(
         retrieval_config.prompt_template = Some(converted);
     }
 
-    // Perform retrieval
     let rag_response = match kb
         .retrieve_and_generate(&request.input.text, Some(retrieval_config))
         .await
@@ -565,7 +1081,6 @@ pub async fn retrieve_and_generate(
         }
     };
 
-    // Get inference config
     let (temperature, top_p, max_tokens) = if let Some(ref gen_config) = request
         .retrieve_and_generate_configuration
         .knowledge_base_configuration
@@ -588,8 +1103,10 @@ pub async fn retrieve_and_generate(
         (0.7, 0.9, 256)
     };
 
-    // Generate response using the model
-    let _lock = app_state.inference_lock.lock().await;
+    let (_permit, _guard) = match acquire_inference_slot(&app_state).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
 
     let sampler_config = SamplerConfig {
         temperature,
@@ -603,6 +1120,7 @@ pub async fn retrieve_and_generate(
         max_tokens,
         sampler_config,
         None,
+        false,
     )
     .await
     {
@@ -613,7 +1131,6 @@ pub async fn retrieve_and_generate(
         }
     };
 
-    // Build citations
     let citations: Vec<Citation> = rag_response
         .citations
         .into_iter()
@@ -641,7 +1158,6 @@ pub async fn retrieve_and_generate(
     .into_response()
 }
 
-/// Ingest documents into knowledge base
 #[cfg(feature = "rag")]
 pub async fn ingest(
     State(rag_state): State<Arc<RagState>>,
@@ -649,7 +1165,6 @@ pub async fn ingest(
 ) -> Response {
     use crate::rag::{DataSource, KnowledgeBase, KnowledgeBaseConfig};
 
-    // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
         kbs.get(&request.knowledge_base_id)
@@ -661,7 +1176,6 @@ pub async fn ingest(
             })
     };
 
-    // Connect to knowledge base
     let kb = match KnowledgeBase::connect(kb_config).await {
         Ok(kb) => kb,
         Err(e) => {
@@ -712,7 +1226,6 @@ pub async fn ingest(
     .into_response()
 }
 
-/// List knowledge bases
 #[cfg(feature = "rag")]
 pub async fn list_knowledge_bases(
     State(rag_state): State<Arc<RagState>>,
@@ -738,7 +1251,6 @@ pub async fn list_knowledge_bases(
     .into_response()
 }
 
-/// Get knowledge base details
 #[cfg(feature = "rag")]
 pub async fn get_knowledge_base(
     State(rag_state): State<Arc<RagState>>,
@@ -746,7 +1258,6 @@ pub async fn get_knowledge_base(
 ) -> Response {
     use crate::rag::{KnowledgeBase, KnowledgeBaseConfig};
 
-    // Get or create knowledge base config
     let kb_config = {
         let kbs = rag_state.knowledge_bases.read().await;
         kbs.get(&kb_id)
@@ -758,7 +1269,6 @@ pub async fn get_knowledge_base(
             })
     };
 
-    // Try to connect to get stats
     match KnowledgeBase::connect(kb_config.clone()).await {
         Ok(kb) => match kb.stats().await {
             Ok(stats) => Json(GetKnowledgeBaseResponse {
@@ -790,7 +1300,6 @@ pub async fn get_knowledge_base(
     }
 }
 
-/// Delete knowledge base
 #[cfg(feature = "rag")]
 pub async fn delete_knowledge_base(
     State(rag_state): State<Arc<RagState>>,
@@ -798,7 +1307,6 @@ pub async fn delete_knowledge_base(
 ) -> Response {
     use crate::rag::{KnowledgeBase, KnowledgeBaseConfig};
 
-    // Get knowledge base config
     let kb_config = {
         let mut kbs = rag_state.knowledge_bases.write().await;
         kbs.remove(&kb_id).unwrap_or_else(|| KnowledgeBaseConfig {
@@ -808,7 +1316,6 @@ pub async fn delete_knowledge_base(
         })
     };
 
-    // Connect and delete
     match KnowledgeBase::connect(kb_config).await {
         Ok(kb) => match kb.delete().await {
             Ok(_) => Json(serde_json::json!({
@@ -828,12 +1335,10 @@ pub async fn delete_knowledge_base(
     }
 }
 
-/// Convert Bedrock filter to MetadataFilter
 #[cfg(feature = "rag")]
 fn convert_filter(filter: &RetrievalFilter) -> Option<crate::rag::MetadataFilter> {
     use crate::rag::MetadataFilter;
 
-    // Handle AND
     if let Some(ref and_filters) = filter.and_all {
         let converted: Vec<_> = and_filters.iter().filter_map(convert_filter).collect();
         if !converted.is_empty() {
@@ -841,7 +1346,6 @@ fn convert_filter(filter: &RetrievalFilter) -> Option<crate::rag::MetadataFilter
         }
     }
 
-    // Handle OR
     if let Some(ref or_filters) = filter.or_all {
         let converted: Vec<_> = or_filters.iter().filter_map(convert_filter).collect();
         if !converted.is_empty() {
@@ -849,34 +1353,28 @@ fn convert_filter(filter: &RetrievalFilter) -> Option<crate::rag::MetadataFilter
         }
     }
 
-    // Handle equals
     if let Some(ref cond) = filter.equals {
         return Some(MetadataFilter::eq(&cond.key, cond.value.clone()));
     }
 
-    // Handle not equals
     if let Some(ref cond) = filter.not_equals {
         return Some(MetadataFilter::ne(&cond.key, cond.value.clone()));
     }
 
-    // Handle greater than
     if let Some(ref cond) = filter.greater_than {
         return Some(MetadataFilter::gt(&cond.key, cond.value.clone()));
     }
 
-    // Handle less than
     if let Some(ref cond) = filter.less_than {
         return Some(MetadataFilter::lt(&cond.key, cond.value.clone()));
     }
 
-    // Handle string contains
     if let Some(ref cond) = filter.string_contains
         && let Some(s) = cond.value.as_str()
     {
         return Some(MetadataFilter::contains(&cond.key, s));
     }
 
-    // Handle starts with
     if let Some(ref cond) = filter.starts_with
         && let Some(s) = cond.value.as_str()
     {
@@ -886,7 +1384,6 @@ fn convert_filter(filter: &RetrievalFilter) -> Option<crate::rag::MetadataFilter
     None
 }
 
-/// Get current timestamp as ISO string
 #[cfg(feature = "rag")]
 fn current_timestamp() -> String {
     let now = SystemTime::now()

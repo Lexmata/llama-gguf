@@ -522,21 +522,25 @@ impl Engine {
         config: &ModelConfig,
         engine_config: &EngineConfig,
     ) -> (Arc<dyn Backend>, Box<dyn Model>) {
+        let gpu_seq_len = match engine_config.max_context_len {
+            Some(cap) if cap > 0 && cap < config.max_seq_len => {
+                tracing::info!(
+                    "Capping GPU context length from {} to {} (max_context_len)",
+                    config.max_seq_len,
+                    cap
+                );
+                cap
+            }
+            _ => config.max_seq_len,
+        };
+
+        // Priority: CUDA > Vulkan > Metal > DX12 > per-op fallback
+        // Each gpu_only engine consumes the model, so only one can be tried.
+
         #[cfg(feature = "cuda")]
         {
             if cudarc::driver::CudaDevice::new(0).is_ok() {
                 let architecture = model.architecture();
-                let gpu_seq_len = match engine_config.max_context_len {
-                    Some(cap) if cap > 0 && cap < config.max_seq_len => {
-                        tracing::info!(
-                            "Capping GPU context length from {} to {} (max_context_len)",
-                            config.max_seq_len,
-                            cap
-                        );
-                        cap
-                    }
-                    _ => config.max_seq_len,
-                };
                 match crate::backend::cuda::gpu_only::GpuOnlyInference::from_model(
                     model,
                     gpu_seq_len,
@@ -556,17 +560,110 @@ impl Engine {
                         );
                     }
                     Err(e) => {
-                        eprintln!("Error: GPU inference init failed: {}", e);
+                        eprintln!("Error: CUDA GPU inference init failed: {}", e);
                         eprintln!("The model was consumed during init. Please restart without --gpu.");
                         std::process::exit(1);
                     }
                 }
             } else {
-                tracing::warn!("No CUDA device available, falling back to CPU");
+                tracing::info!("No CUDA device available, trying other GPU backends...");
             }
         }
 
-        // No CUDA or device unavailable: CPU-only with per-op backend
+        #[cfg(feature = "vulkan")]
+        {
+            if crate::backend::vulkan::VulkanBackend::new().is_ok() {
+                let architecture = model.architecture();
+                match crate::backend::vulkan::gpu_only::VulkanGpuInference::from_model(
+                    model,
+                    gpu_seq_len,
+                ) {
+                    Ok(gpu) => {
+                        tracing::info!("Using full GPU inference on Vulkan");
+                        let wrapper = crate::backend::vulkan::gpu_only::VulkanGpuModelWrapper::new(
+                            gpu,
+                            config.clone(),
+                            architecture,
+                        );
+                        return (
+                            Arc::new(crate::backend::cpu::CpuBackend::new()),
+                            Box::new(wrapper),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Vulkan GPU inference init failed: {}", e);
+                        eprintln!("The model was consumed during init. Please restart without --gpu.");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                tracing::info!("No Vulkan device available, trying other GPU backends...");
+            }
+        }
+
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            if crate::backend::metal::MetalBackend::new().is_ok() {
+                let architecture = model.architecture();
+                match crate::backend::metal::gpu_only::MetalGpuInference::from_model(
+                    model,
+                    gpu_seq_len,
+                ) {
+                    Ok(gpu) => {
+                        tracing::info!("Using full GPU inference on Metal");
+                        let wrapper = crate::backend::metal::gpu_only::MetalGpuModelWrapper::new(
+                            gpu,
+                            config.clone(),
+                            architecture,
+                        );
+                        return (
+                            Arc::new(crate::backend::cpu::CpuBackend::new()),
+                            Box::new(wrapper),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Metal GPU inference init failed: {}", e);
+                        eprintln!("The model was consumed during init. Please restart without --gpu.");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                tracing::info!("No Metal device available, trying other GPU backends...");
+            }
+        }
+
+        #[cfg(all(feature = "dx12", target_os = "windows"))]
+        {
+            if crate::backend::dx12::Dx12Backend::new().is_ok() {
+                let architecture = model.architecture();
+                match crate::backend::dx12::gpu_only::Dx12GpuInference::from_model(
+                    model,
+                    gpu_seq_len,
+                ) {
+                    Ok(gpu) => {
+                        tracing::info!("Using full GPU inference on DX12");
+                        let wrapper = crate::backend::dx12::gpu_only::Dx12GpuModelWrapper::new(
+                            gpu,
+                            config.clone(),
+                            architecture,
+                        );
+                        return (
+                            Arc::new(crate::backend::cpu::CpuBackend::new()),
+                            Box::new(wrapper),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error: DX12 GPU inference init failed: {}", e);
+                        eprintln!("The model was consumed during init. Please restart without --gpu.");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                tracing::info!("No DX12 device available");
+            }
+        }
+
+        // No GPU-only engine available: fall back to per-op backend
         let backend = Self::select_gpu_backend(&model);
         (backend, Box::new(model))
     }

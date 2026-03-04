@@ -18,6 +18,8 @@
 #[cfg(feature = "vulkan")]
 pub(crate) mod context;
 #[cfg(feature = "vulkan")]
+pub mod gpu_only;
+#[cfg(feature = "vulkan")]
 pub(crate) mod ops;
 
 use crate::backend::{Backend, BackendError, BackendResult};

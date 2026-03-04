@@ -174,6 +174,71 @@ impl MetalContext {
     }
 
     // =========================================================================
+    // Persistent buffer management (for gpu_only inference)
+    // =========================================================================
+
+    /// Write f32 data into an existing Metal buffer (shared storage = direct access).
+    pub fn write_to_buffer(&self, buf: &Buffer, data: &[f32]) -> Result<(), BackendError> {
+        let byte_len = data.len() * std::mem::size_of::<f32>();
+        if byte_len as u64 > buf.length() {
+            return Err(BackendError::OperationFailed(format!(
+                "Data too large for buffer: {} bytes > {} bytes",
+                byte_len,
+                buf.length()
+            )));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                buf.contents() as *mut u8,
+                byte_len,
+            );
+        }
+        Ok(())
+    }
+
+    /// Write f32 data at a byte offset into an existing Metal buffer.
+    pub fn write_to_buffer_offset(
+        &self,
+        buf: &Buffer,
+        data: &[f32],
+        byte_offset: usize,
+    ) -> Result<(), BackendError> {
+        let byte_len = data.len() * std::mem::size_of::<f32>();
+        if (byte_offset + byte_len) as u64 > buf.length() {
+            return Err(BackendError::OperationFailed(
+                "Write exceeds buffer size".to_string(),
+            ));
+        }
+        unsafe {
+            let dst = (buf.contents() as *mut u8).add(byte_offset);
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, dst, byte_len);
+        }
+        Ok(())
+    }
+
+    /// GPU-to-GPU buffer copy using a blit command encoder.
+    pub fn copy_buffer(
+        &self,
+        src: &Buffer,
+        dst: &Buffer,
+        size_bytes: u64,
+    ) -> Result<(), BackendError> {
+        let command_buffer = self.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_buffer(src, 0, dst, 0, size_bytes);
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        Ok(())
+    }
+
+    /// Read a specific number of floats from a Metal buffer.
+    pub fn read_buffer_floats(&self, buf: &Buffer, num_floats: usize) -> Vec<f32> {
+        self.read_buffer(buf, num_floats)
+    }
+
+    // =========================================================================
     // Command submission
     // =========================================================================
 
