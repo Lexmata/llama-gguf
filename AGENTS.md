@@ -16,11 +16,14 @@ Monolithic library with feature flags. Key modules:
 | `onnx/` | ONNX model loading (HuggingFace Optimum exports) |
 | `tensor/` | Tensor types, quantization (Q2_K through Q8_0), operations |
 | `backend/` | Hardware backends (CPU, CUDA, Metal, DX12, Vulkan) |
-| `model/` | Model architectures (LLaMA, Mistral, Qwen2, TinyLlama, DeepSeek) |
+| `model/` | Model architectures (LLaMA, Mistral, Qwen2, Qwen3/Qwen3Next, Mixtral, TinyLlama, DeepSeek) |
 | `sampling/` | Token sampling strategies (greedy, top-k, top-p, temperature, grammar) |
 | `tokenizer/` | BPE tokenizer loaded from GGUF metadata |
 | `server/` | HTTP server with OpenAI-compatible API |
 | `rag/` | RAG with PostgreSQL/pgvector vector store |
+| `model/deltanet.rs` | Gated DeltaNet (SSM) recurrent layers for hybrid models |
+| `model/moe.rs` | Mixture-of-Experts routing and expert dispatch |
+| `distributed/` | Pipeline-parallel distributed inference via gRPC |
 | `huggingface.rs` | HuggingFace Hub model downloading |
 | `engine.rs` | High-level inference engine and chat templates |
 | `config.rs` | Global configuration |
@@ -32,10 +35,22 @@ Each backend implements the `Backend` trait from `backend/mod.rs`:
 | Backend | Feature Flag | Platform | Status |
 |---------|-------------|----------|--------|
 | `cpu/` | `cpu` (default) | All | Production - SIMD optimized (AVX2, AVX-512, NEON) |
-| `cuda/` | `cuda` | Linux/Windows | Production - NVIDIA GPUs with compute 6.0+ |
+| `cuda/` | `cuda` | Linux/Windows | Production - Full GPU-resident inference via `gpu_only.rs` (NVIDIA compute 6.0+) |
 | `metal/` | `metal` | macOS | Production - Apple Silicon and AMD GPUs |
 | `dx12/` | `dx12` | Windows | Production - DirectX 12 compatible GPUs |
 | `vulkan/` | `vulkan` | All | Experimental - Vulkan SDK required |
+
+### CUDA GPU-Only Inference
+
+The CUDA backend's primary inference engine is `backend/cuda/gpu_only.rs` (`GpuOnlyInference`). It keeps all model weights, KV cache, and intermediate tensors in VRAM:
+
+- **Quantized weights** are dequantized on-GPU via `dequant_weights.rs`
+- **Fused kernels** for RMS norm, RoPE, softmax, SiLU, and element-wise ops
+- **DeltaNet** recurrent layers execute entirely on GPU with custom kernels
+- **MoE** expert routing and dispatch run on GPU with weight streaming for active experts
+- **Attention** uses a hybrid CPU roundtrip for correctness with Qwen3Next-specific features (QK norm, partial RoPE, attention gating)
+
+Other GPU backends (Metal, DX12, Vulkan) use the generic `TransformerLayer::forward()` path from `model/layers.rs`, which dispatches to each backend's `Backend` trait implementation and falls back to CPU for unimplemented operations.
 
 ### RAG Architecture
 
@@ -61,6 +76,10 @@ Models verified to work correctly:
 | Model | RoPE Type | Notes |
 |-------|-----------|-------|
 | Qwen2/Qwen2.5 | NeoX | Uses attention biases |
+| Qwen3 | NeoX | QK norm, partial RoPE, attention gating |
+| Qwen3Moe | NeoX | MoE with top-k expert routing |
+| Qwen3Next | NeoX | Hybrid attention + DeltaNet recurrent layers, MoE |
+| Mixtral | Normal | MoE with top-2 expert routing |
 | TinyLlama | Normal | GQA with 4 KV heads |
 | Mistral | Normal | Requires instruction format `[INST]...[/INST]` |
 | DeepSeek-Coder | Normal | Uses `scale_linear=4.0` for RoPE |
@@ -77,17 +96,19 @@ See `docs/MODEL_COMPATIBILITY.md` for full details.
 ```toml
 [features]
 default = ["cpu", "huggingface", "cli", "client", "onnx"]
+cli = ["dep:clap", "dep:clap_mangen"]
+client = ["dep:reqwest"]
 cpu = []
 cuda = ["dep:cudarc"]
+vulkan = ["dep:ash", "dep:gpu-allocator"]
+vulkan-shaders = []  # Build-time shader compilation (requires glslc)
 metal = ["dep:metal", "dep:objc"]
 dx12 = ["dep:windows"]
-vulkan = ["dep:ash", "dep:gpu-allocator"]
-onnx = ["dep:prost"]
 server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:futures"]
 rag = ["dep:tokio-postgres", "dep:pgvector", "dep:deadpool-postgres", "dep:tokio", "dep:url", "dep:glob"]
 huggingface = ["dep:reqwest", "dep:indicatif", "dep:directories"]
-cli = ["dep:clap"]
-client = ["dep:reqwest"]
+onnx = ["dep:prost"]
+distributed = ["dep:tonic", "dep:tokio", "dep:prost", "dep:futures"]
 ```
 
 All platform-specific backends (`metal`, `dx12`) must be gated with `#[cfg(feature = "...")]`.
@@ -222,6 +243,7 @@ When a model produces incorrect output:
 - pgvector: https://github.com/pgvector/pgvector
 - Model compatibility: `docs/MODEL_COMPATIBILITY.md`
 - RAG design: `docs/plans/2026-02-13-pgvector-rag-design.md`
+- Changelog: `CHANGELOG.md`
 
 ## Do Not
 

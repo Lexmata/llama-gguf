@@ -9,11 +9,14 @@ A high-performance Rust implementation of [llama.cpp](https://github.com/ggergan
 
 - **Full GGUF Support** - Load any GGUF model file compatible with llama.cpp
 - **ONNX Support** - Load HuggingFace Optimum ONNX exports (F32, F16, BF16 with auto-conversion)
-- **Multiple Architectures** - LLaMA, Mistral, Qwen2, TinyLlama, DeepSeek, and more
+- **Multiple Architectures** - LLaMA, Mistral, Qwen2, Qwen3/Qwen3Next, Mixtral, TinyLlama, DeepSeek, and more
 - **Quantization** - All K-quant formats (Q2_K through Q8_0) plus F16/F32
 - **HuggingFace Integration** - Download models directly from HuggingFace Hub
 - **Fast CPU Inference** - SIMD-optimized (AVX2, AVX-512, NEON)
-- **Multi-GPU Support** - CUDA (NVIDIA), Metal (Apple Silicon), DX12 (Windows), Vulkan (cross-platform)
+- **GPU Inference** - Full GPU-resident inference on CUDA; Metal, DX12, Vulkan via Backend trait
+- **Mixture of Experts** - MoE support with top-k routing (Mixtral, Qwen3Moe, DeepSeek)
+- **DeltaNet/SSM** - Gated DeltaNet recurrent layers for hybrid attention/SSM models (Qwen3Next)
+- **Distributed Inference** - Pipeline-parallel inference across multiple nodes via gRPC
 - **RAG** - Retrieval-Augmented Generation with PostgreSQL/pgvector vector store
 - **OpenAI-compatible API** - HTTP server with streaming support
 - **Grouped Query Attention** - Efficient KV cache for GQA models
@@ -83,7 +86,7 @@ man llama-gguf-rag       # RAG operations
 
 ```toml
 [dependencies]
-llama-gguf = "0.6"
+llama-gguf = "0.10"
 ```
 
 ## Quick Start
@@ -128,6 +131,10 @@ llama-gguf info model.onnx
 | LLaMA/LLaMA2/LLaMA3 | ✅ | Full support |
 | Mistral | ✅ | Use `[INST]...[/INST]` format |
 | Qwen2/Qwen2.5 | ✅ | Includes attention biases |
+| Qwen3 | ✅ | Dense model with QK norm, partial RoPE |
+| Qwen3Moe | ✅ | MoE with top-k expert routing |
+| Qwen3Next | ✅ | Hybrid attention + DeltaNet recurrent layers |
+| Mixtral | ✅ | MoE with top-2 expert routing |
 | TinyLlama | ✅ | GQA support |
 | DeepSeek-Coder | ✅ | Linear RoPE scaling |
 | CodeLlama | ✅ | LLaMA-based |
@@ -162,6 +169,7 @@ See [MODEL_COMPATIBILITY.md](docs/MODEL_COMPATIBILITY.md) for detailed compatibi
 | `vulkan` | | Cross-platform GPU acceleration via Vulkan |
 | `server` | | HTTP server with OpenAI-compatible API |
 | `rag` | | RAG with PostgreSQL/pgvector vector store |
+| `distributed` | | Pipeline-parallel inference via gRPC |
 
 ## GPU Acceleration
 
@@ -173,6 +181,8 @@ llama-gguf run model.gguf -p "Hello" --gpu
 ```
 
 Requires NVIDIA GPU with compute capability 6.0+ and CUDA Toolkit 12.0+.
+
+The CUDA backend provides full GPU-resident inference via `GpuOnlyInference`, keeping all weights, KV cache, and intermediate tensors in VRAM. Custom kernels handle quantized dequantization, fused RMS norm, RoPE, DeltaNet, and MoE expert dispatch entirely on GPU.
 
 ### Metal (Apple Silicon / macOS)
 
@@ -201,7 +211,7 @@ llama-gguf run model.gguf -p "Hello" --gpu
 
 Requires Vulkan SDK and a Vulkan-capable GPU.
 
-**GPU-accelerated operations:**
+**GPU-accelerated operations (all backends):**
 - Element-wise: add, mul, scale
 - Activations: SiLU, GELU
 - Normalization: RMS norm
@@ -209,7 +219,12 @@ Requires Vulkan SDK and a Vulkan-capable GPU.
 - RoPE positional embeddings
 - Vector-matrix multiplication (f32)
 
-*Note: Quantized matrix operations currently fall back to CPU. Full GPU quantized inference is planned.*
+**CUDA-exclusive operations:**
+- Quantized dequantization (Q4_K_M, Q6_K, Q8_0, etc.) on GPU
+- Fused RMS norm kernels
+- DeltaNet recurrent layer kernels
+- MoE expert routing and dispatch
+- KV cache management on GPU
 
 ## RAG (Retrieval-Augmented Generation)
 
