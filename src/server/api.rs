@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use tokio::sync::{RwLock, Semaphore};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::engine::{ChatTemplate, Engine, EngineConfig};
+use crate::engine::{ChatTemplate, Engine};
 use crate::gguf::GgufFile;
 use crate::model::ModelLoader;
 use crate::tokenizer::Tokenizer;

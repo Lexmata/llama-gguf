@@ -1,7 +1,15 @@
 //! HTTP server with OpenAI-compatible API
 //!
 //! This module provides an HTTP server that implements the OpenAI API format
-//! for chat completions and text completions, plus AWS Bedrock-style RAG APIs.
+//! for chat completions, text completions, and embeddings, plus AWS Bedrock-style RAG APIs.
+//!
+//! # Features
+//!
+//! - **Embeddings** (`POST /v1/embeddings`) — OpenAI-compatible embedding extraction
+//! - **Function calling** — Tool definitions in chat completions with prompt injection + JSON grammar
+//! - **Token usage** — Reported in all responses including streaming
+//! - **Request queuing** — FIFO queue with configurable depth; rejects with 429 when full
+//! - **Model hot-swap** — `POST /v1/models/load` or `SIGHUP` to reload without restart
 //!
 //! # RAG Endpoints
 //!

@@ -1590,8 +1590,25 @@ pub struct CudaKernels {
 impl CudaKernels {
     /// Compile and load all CUDA kernels
     pub fn new(device: Arc<CudaDevice>) -> BackendResult<Self> {
-        // Compile PTX
-        let ptx = cudarc::nvrtc::compile_ptx(KERNEL_SOURCE).map_err(|e| {
+        let mut include_paths = Vec::new();
+        for candidate in &[
+            "/usr/local/cuda/include",
+            "/opt/cuda/targets/x86_64-linux/include",
+            "/opt/cuda/include",
+            "/usr/include",
+        ] {
+            if std::path::Path::new(candidate).join("cuda_fp16.h").exists() {
+                include_paths.push(candidate.to_string());
+                break;
+            }
+        }
+
+        let opts = cudarc::nvrtc::CompileOptions {
+            include_paths,
+            ..Default::default()
+        };
+
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(KERNEL_SOURCE, opts).map_err(|e| {
             BackendError::InitializationFailed(format!("NVRTC compile failed: {}", e))
         })?;
 

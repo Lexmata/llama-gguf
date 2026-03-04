@@ -1,16 +1,20 @@
 //! HTTP request handlers
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::stream::{self, Stream};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+
+#[cfg(feature = "rag")]
+use std::collections::HashMap;
+#[cfg(feature = "rag")]
+use axum::extract::Path;
 
 use crate::engine::ChatTemplate;
 use crate::model::ModelConfig;
@@ -61,7 +65,7 @@ impl RequestQueue {
     }
 
     /// Try to enqueue a request. Returns Err if queue is full.
-    pub async fn try_enqueue(&self) -> Result<QueueGuard, ()> {
+    pub async fn try_enqueue(&self) -> Result<QueueGuard<'_>, ()> {
         let mut depth = self.queue_depth.lock().await;
         if *depth >= self.max_queue_depth {
             return Err(());
@@ -735,7 +739,13 @@ async fn generate_response(
                     .to_string()
             })
             .collect();
-        Some(GrammarSampler::new(Grammar::Json, vocab))
+        Some(GrammarSampler::new(
+            Grammar::Json(crate::sampling::grammar::JsonGrammar {
+                allow_any: true,
+                ..Default::default()
+            }),
+            vocab,
+        ))
     } else {
         None
     };
@@ -785,7 +795,7 @@ async fn generate_response(
                 let combined = format!("{}{}", response_text, text);
                 let should_stop = stop_patterns.iter().any(|p| combined.contains(p));
                 if should_stop {
-                    for pattern in &stop_patterns {
+                    for pattern in stop_patterns {
                         if let Some(idx) = combined.find(pattern) {
                             response_text = combined[..idx].to_string();
                             return Ok((
@@ -817,7 +827,7 @@ async fn generate_response(
                 let combined = format!("{}{}", response_text, text);
                 let should_stop = stop_patterns.iter().any(|p| combined.contains(p));
                 if should_stop {
-                    for pattern in &stop_patterns {
+                    for pattern in stop_patterns {
                         if let Some(idx) = combined.find(pattern) {
                             response_text = combined[..idx].to_string();
                             return Ok((

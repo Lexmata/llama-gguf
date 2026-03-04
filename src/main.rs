@@ -1002,6 +1002,8 @@ fn run_server(
             host: host.to_string(),
             port,
             model_path: model_path.to_string(),
+            max_concurrent: 1,
+            max_queue_depth: 64,
             #[cfg(feature = "rag")]
             rag_database_url,
         })
