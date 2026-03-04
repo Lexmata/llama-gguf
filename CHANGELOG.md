@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-03-04
+
+### Added
+
+- GPU `matmul` shaders (tiled shared-memory) for Metal, DX12, and Vulkan backends
+- GPU `matvec` shaders (row-parallel) for Metal, DX12, and Vulkan backends
+- GPU dequantization shaders for Q8_0, Q4_K, Q6_K formats across Metal, DX12, and Vulkan
+- GPU `vec_mat_q` and `matvec_q` (2-pass: dequant + matop) for Metal, DX12, and Vulkan
+- GPU `attention` and `attention_cached` shaders with online softmax, GQA, and causal masking for Metal, DX12, and Vulkan
+- CUDA fully on-GPU attention pipeline (QK norm, partial RoPE, attention gating kernels)
+- CUDA batched inference kernels (batched RoPE, KV cache update, linear projections)
+- CUDA Flash Attention kernel with O(head_dim) shared memory and online softmax
+- CUDA FP16 compute path (f32↔f16 conversion, vec_mat_f16, element-wise ops, rms_norm_f16)
+
+### Changed
+
+- Metal, DX12, Vulkan: all operations now execute on GPU — no CPU fallbacks remain
+- GPU softmax dispatches all tensor sizes (removed small-tensor CPU threshold)
+- GPU RoPE supports all configurations (relaxed shape constraints)
+- CUDA `attention_cached` replaced with Flash Attention for O(n) memory usage
+
 ## [0.10.0] - 2026-03-04
 
 ### Added
@@ -147,6 +168,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - RoPE type support (Normal and NeoX) for multi-model compatibility
 - Benchmark suite with criterion
 
+[0.11.0]: https://github.com/Lexmata/llama-gguf/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/Lexmata/llama-gguf/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Lexmata/llama-gguf/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Lexmata/llama-gguf/compare/v0.6.1...v0.8.0
