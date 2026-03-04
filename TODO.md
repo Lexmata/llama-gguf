@@ -61,11 +61,11 @@ Metal, DX12, and Vulkan backends fall back to CPU for several operations. Bringi
 
 ## Server
 
-- [ ] OpenAI-compatible embeddings endpoint
-- [ ] OpenAI-compatible completions endpoint with function calling
-- [ ] Token usage reporting in API responses
-- [ ] Request queuing and concurrency limits
-- [ ] Model hot-swapping
+- [x] OpenAI-compatible embeddings endpoint
+- [x] OpenAI-compatible completions endpoint with function calling
+- [x] Token usage reporting in API responses
+- [x] Request queuing and concurrency limits
+- [x] Model hot-swapping
 
 ## RAG
 

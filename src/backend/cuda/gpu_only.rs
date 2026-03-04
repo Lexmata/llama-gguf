@@ -824,8 +824,7 @@ impl GpuOnlyInference {
             .attention()
             .ok_or_else(|| BackendError::OperationFailed("Expected attention layer".into()))?;
 
-        let prefix = format!("model.layers.{}", layer_idx);
-        let _hidden_size = self.config.hidden_size;
+        let prefix = format!("blk.{}", layer_idx);
         let num_heads = attn.num_heads;
         let num_kv_heads = attn.num_kv_heads;
         let kl = attn.key_length;
@@ -846,7 +845,7 @@ impl GpuOnlyInference {
             &self.kernels,
             &self.weights,
             &self.device,
-            &format!("{}.self_attn.q_proj.weight", prefix),
+            &format!("{}.attn_q.weight", prefix),
             None,
             &self.hidden_norm,
             &mut self.attn_q_raw,
@@ -855,7 +854,7 @@ impl GpuOnlyInference {
             &self.kernels,
             &self.weights,
             &self.device,
-            &format!("{}.self_attn.k_proj.weight", prefix),
+            &format!("{}.attn_k.weight", prefix),
             None,
             &self.hidden_norm,
             &mut self.attn_k,
@@ -864,7 +863,7 @@ impl GpuOnlyInference {
             &self.kernels,
             &self.weights,
             &self.device,
-            &format!("{}.self_attn.v_proj.weight", prefix),
+            &format!("{}.attn_v.weight", prefix),
             None,
             &self.hidden_norm,
             &mut self.attn_v,
@@ -1170,7 +1169,7 @@ impl GpuOnlyInference {
             &self.kernels,
             &self.weights,
             &self.device,
-            &format!("{}.self_attn.o_proj.weight", prefix),
+            &format!("{}.attn_output.weight", prefix),
             None,
             &self.attn_out,
             &mut self.hidden_norm,
