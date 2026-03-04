@@ -1,8 +1,7 @@
 //! GPU-accelerated inference engine for Qwen3Next and similar architectures.
 //!
-//! - Attention layers: CPU roundtrip for correct Qwen3Next handling
-//!   (QK norm, partial RoPE, attention gating, different kl/vl dims).
-//!   Transfer is ~16 KB per attention layer per token.
+//! - Attention layers: fully on GPU (QKV projections, QK norm, partial/full
+//!   RoPE, GPU KV cache, attention, optional gating, output projection)
 //! - DeltaNet layers: fully on GPU (matmul projections + fused CUDA kernels)
 //! - MoE layers: router on GPU, active expert weights streamed from CPU,
 //!   SwiGLU computed on GPU, weighted accumulation on GPU
@@ -42,9 +41,19 @@ pub struct GpuOnlyInference {
     layers: Vec<TransformerLayer>,
     // CPU backend for running attention forward passes
     cpu_backend: CpuBackend,
-    // CPU KV caches for attention layers [num_kv_heads, max_seq_len, key_length/value_length]
+    // CPU KV caches (kept as fallback for unsupported attention configs)
     cpu_k_caches: Vec<Option<Tensor>>,
     cpu_v_caches: Vec<Option<Tensor>>,
+    // GPU KV caches [num_kv_heads * max_seq_len * key_length]
+    gpu_k_caches: Vec<Option<CudaSlice<f32>>>,
+    gpu_v_caches: Vec<Option<CudaSlice<f32>>>,
+    // GPU attention scratch buffers
+    attn_q_raw: CudaSlice<f32>,
+    attn_k: CudaSlice<f32>,
+    attn_v: CudaSlice<f32>,
+    attn_q_proper: CudaSlice<f32>,
+    attn_gate: CudaSlice<f32>,
+    attn_out: CudaSlice<f32>,
     // DeltaNet config
     deltanet_config: Option<DeltaNetConfig>,
     // DeltaNet GPU state buffers (conv_state + ssm_state per DeltaNet layer)
@@ -431,15 +440,27 @@ impl GpuOnlyInference {
         let moe_expert_up = alloc(expert_intermediate)?;
         let moe_expert_down = alloc(model_config.hidden_size)?;
 
-        // CPU KV caches for attention layers (using correct per-model key_length/value_length)
+        // KV caches — GPU primary, CPU fallback
         let cpu_backend = CpuBackend::new();
         let mut cpu_k_caches: Vec<Option<Tensor>> = Vec::with_capacity(model_config.num_layers);
         let mut cpu_v_caches: Vec<Option<Tensor>> = Vec::with_capacity(model_config.num_layers);
+        let mut gpu_k_caches: Vec<Option<CudaSlice<f32>>> =
+            Vec::with_capacity(model_config.num_layers);
+        let mut gpu_v_caches: Vec<Option<CudaSlice<f32>>> =
+            Vec::with_capacity(model_config.num_layers);
+
+        let mut max_q_out = 0usize;
+        let mut max_kv_flat = 0usize;
+        let mut max_attn_flat = 0usize;
+
         for i in 0..model_config.num_layers {
             if has_gpu_attention[i] {
                 if let Some(attn) = layers[i].attention() {
                     let kl = attn.key_length;
                     let vl = attn.value_length;
+                    let kv_size = model_config.num_kv_heads * max_seq_len * kl;
+                    let kv_v_size = model_config.num_kv_heads * max_seq_len * vl;
+
                     cpu_k_caches.push(Some(Tensor::zeros(
                         vec![model_config.num_kv_heads, max_seq_len, kl],
                         DType::F32,
@@ -448,15 +469,34 @@ impl GpuOnlyInference {
                         vec![model_config.num_kv_heads, max_seq_len, vl],
                         DType::F32,
                     )));
+                    gpu_k_caches.push(Some(alloc(kv_size)?));
+                    gpu_v_caches.push(Some(alloc(kv_v_size)?));
+
+                    max_q_out = max_q_out.max(attn.wq.out_features);
+                    max_kv_flat = max_kv_flat.max(model_config.num_kv_heads * kl);
+                    max_kv_flat = max_kv_flat.max(model_config.num_kv_heads * vl);
+                    max_attn_flat =
+                        max_attn_flat.max(model_config.num_heads * vl.max(kl));
                 } else {
                     cpu_k_caches.push(None);
                     cpu_v_caches.push(None);
+                    gpu_k_caches.push(None);
+                    gpu_v_caches.push(None);
                 }
             } else {
                 cpu_k_caches.push(None);
                 cpu_v_caches.push(None);
+                gpu_k_caches.push(None);
+                gpu_v_caches.push(None);
             }
         }
+
+        let attn_q_raw = alloc(max_q_out.max(1))?;
+        let attn_k = alloc(max_kv_flat.max(1))?;
+        let attn_v = alloc(max_kv_flat.max(1))?;
+        let attn_q_proper = alloc(max_attn_flat.max(1))?;
+        let attn_gate = alloc(max_attn_flat.max(1))?;
+        let attn_out = alloc(max_attn_flat.max(1))?;
 
         // DeltaNet GPU state buffers
         let mut dn_conv_states = Vec::with_capacity(model_config.num_layers);
@@ -538,6 +578,14 @@ impl GpuOnlyInference {
             cpu_backend,
             cpu_k_caches,
             cpu_v_caches,
+            gpu_k_caches,
+            gpu_v_caches,
+            attn_q_raw,
+            attn_k,
+            attn_v,
+            attn_q_proper,
+            attn_gate,
+            attn_out,
             deltanet_config,
             dn_conv_states,
             dn_ssm_states,
@@ -601,6 +649,25 @@ impl GpuOnlyInference {
         Ok(logits)
     }
 
+    /// Process a batch of tokens during prefill. Returns logits for the last token.
+    /// Each token is processed sequentially through all layers but the batch
+    /// enables future optimization with batched attention during prefill.
+    pub fn forward_batch(&mut self, token_ids: &[u32]) -> BackendResult<Vec<f32>> {
+        if token_ids.is_empty() {
+            return Err(BackendError::InvalidArgument(
+                "Empty token batch".to_string(),
+            ));
+        }
+
+        // Process all tokens except the last as prefill
+        for &tid in &token_ids[..token_ids.len() - 1] {
+            self.prefill_token(tid)?;
+        }
+
+        // Process the last token and return logits
+        self.forward(*token_ids.last().unwrap())
+    }
+
     pub fn prefill_token(&mut self, token_id: u32) -> BackendResult<()> {
         self.embed_token(token_id)?;
 
@@ -639,6 +706,15 @@ impl GpuOnlyInference {
                 data.fill(0.0);
             }
         }
+        // Zero GPU KV caches
+        for kc in self.gpu_k_caches.iter_mut().flatten() {
+            let len = kc.len();
+            let _ = self.device.htod_sync_copy_into(&vec![0.0f32; len], kc);
+        }
+        for vc in self.gpu_v_caches.iter_mut().flatten() {
+            let len = vc.len();
+            let _ = self.device.htod_sync_copy_into(&vec![0.0f32; len], vc);
+        }
     }
 
     pub fn position(&self) -> usize {
@@ -672,9 +748,9 @@ impl GpuOnlyInference {
             &mut self.hidden_norm,
         )?;
 
-        // ---- Attention (CPU roundtrip) / DeltaNet (GPU) ----
+        // ---- Attention (GPU) / DeltaNet (GPU) ----
         if self.has_gpu_attention[layer_idx] {
-            self.attention_cpu_forward(layer_idx)?;
+            self.attention_gpu_forward(layer_idx)?;
         } else if self.is_deltanet[layer_idx] {
             self.deltanet_gpu_forward(layer_idx, &prefix)?;
         } else {
@@ -739,53 +815,366 @@ impl GpuOnlyInference {
     }
 
     // -----------------------------------------------------------------------
-    // Attention (CPU roundtrip for Qwen3Next-style: QK norm, partial RoPE,
-    // attention gating, different key_length/value_length)
+    // Attention (fully on GPU: QKV projections, QK norm, partial/full RoPE,
+    // KV cache update, attention, optional gating, output projection)
     // -----------------------------------------------------------------------
 
-    fn attention_cpu_forward(&mut self, layer_idx: usize) -> BackendResult<()> {
-        let hidden_size = self.config.hidden_size;
-
-        // Download normalized hidden state from GPU → CPU (~8 KB)
-        let hidden_cpu = self
-            .device
-            .dtoh_sync_copy(&self.hidden_norm)
-            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
-        let x_tensor = Tensor::from_f32(&hidden_cpu, vec![hidden_size])
-            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
-
-        // Run the full Attention::forward on CPU (handles QK norm, partial RoPE,
-        // attention gating, different kl/vl — all correctly)
+    fn attention_gpu_forward(&mut self, layer_idx: usize) -> BackendResult<()> {
         let attn = self.layers[layer_idx]
             .attention()
             .ok_or_else(|| BackendError::OperationFailed("Expected attention layer".into()))?;
 
-        let k_cache = self.cpu_k_caches[layer_idx]
-            .as_mut()
-            .ok_or_else(|| BackendError::OperationFailed("Missing CPU K cache".into()))?;
-        let v_cache = self.cpu_v_caches[layer_idx]
-            .as_mut()
-            .ok_or_else(|| BackendError::OperationFailed("Missing CPU V cache".into()))?;
+        let prefix = format!("model.layers.{}", layer_idx);
+        let _hidden_size = self.config.hidden_size;
+        let num_heads = attn.num_heads;
+        let num_kv_heads = attn.num_kv_heads;
+        let kl = attn.key_length;
+        let vl = attn.value_length;
+        let rope_dims = attn.rope_dims;
+        let scale = attn.scale;
+        let use_neox = attn.use_neox_rope;
+        let has_gate = attn.has_attention_gate;
+        let has_q_norm = attn.q_norm.is_some();
+        let has_k_norm = attn.k_norm.is_some();
+        let norm_eps = self.config.norm_eps;
+        let freq_base = self.config.freq_base;
+        let freq_scale = self.config.freq_scale;
+        let pos = self.pos;
 
-        let attn_out = attn
-            .forward(
-                &x_tensor,
-                k_cache,
-                v_cache,
-                self.pos,
-                self.config.freq_base,
-                self.config.freq_scale,
-                &self.cpu_backend,
+        // 1. Q/K/V projections on GPU
+        linear_gpu(
+            &self.kernels,
+            &self.weights,
+            &self.device,
+            &format!("{}.self_attn.q_proj.weight", prefix),
+            None,
+            &self.hidden_norm,
+            &mut self.attn_q_raw,
+        )?;
+        linear_gpu(
+            &self.kernels,
+            &self.weights,
+            &self.device,
+            &format!("{}.self_attn.k_proj.weight", prefix),
+            None,
+            &self.hidden_norm,
+            &mut self.attn_k,
+        )?;
+        linear_gpu(
+            &self.kernels,
+            &self.weights,
+            &self.device,
+            &format!("{}.self_attn.v_proj.weight", prefix),
+            None,
+            &self.hidden_norm,
+            &mut self.attn_v,
+        )?;
+
+        // 2. Split Q into q_proper and gate if needed
+        if has_gate {
+            let config = LaunchConfig {
+                grid_dim: (num_heads as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.kernels.split_q_gate.clone().launch(
+                    config,
+                    (
+                        &self.attn_q_raw,
+                        &mut self.attn_q_proper,
+                        &mut self.attn_gate,
+                        num_heads as i32,
+                        kl as i32,
+                        vl as i32,
+                    ),
+                )
+            }
+            .map_err(|e| {
+                BackendError::OperationFailed(format!("split_q_gate failed: {}", e))
+            })?;
+        } else {
+            self.device
+                .dtod_copy(&self.attn_q_raw, &mut self.attn_q_proper)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+        }
+
+        // 3. QK normalization (per-head RMS norm)
+        if has_q_norm {
+            let q_norm = self.layers[layer_idx]
+                .attention()
+                .and_then(|a| a.q_norm.as_ref())
+                .ok_or_else(|| BackendError::OperationFailed("Missing q_norm".into()))?;
+            let norm_w = q_norm.weight.as_f32().map_err(|e| {
+                BackendError::OperationFailed(format!("{}", e))
+            })?;
+            let norm_dim = norm_w.len();
+            let norm_gpu = self
+                .device
+                .htod_sync_copy(norm_w)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+
+            let block_size = 256.min(norm_dim.next_power_of_two());
+            let config = LaunchConfig {
+                grid_dim: (num_heads as u32, 1, 1),
+                block_dim: (block_size as u32, 1, 1),
+                shared_mem_bytes: (block_size * 4) as u32,
+            };
+            unsafe {
+                self.kernels.qk_norm_per_head.clone().launch(
+                    config,
+                    (
+                        &mut self.attn_q_proper,
+                        &norm_gpu,
+                        norm_eps,
+                        num_heads as i32,
+                        kl as i32,
+                        norm_dim as i32,
+                    ),
+                )
+            }
+            .map_err(|e| {
+                BackendError::OperationFailed(format!("qk_norm Q failed: {}", e))
+            })?;
+        }
+        if has_k_norm {
+            let k_norm = self.layers[layer_idx]
+                .attention()
+                .and_then(|a| a.k_norm.as_ref())
+                .ok_or_else(|| BackendError::OperationFailed("Missing k_norm".into()))?;
+            let norm_w = k_norm.weight.as_f32().map_err(|e| {
+                BackendError::OperationFailed(format!("{}", e))
+            })?;
+            let norm_dim = norm_w.len();
+            let norm_gpu = self
+                .device
+                .htod_sync_copy(norm_w)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+
+            let block_size = 256.min(norm_dim.next_power_of_two());
+            let config = LaunchConfig {
+                grid_dim: (num_kv_heads as u32, 1, 1),
+                block_dim: (block_size as u32, 1, 1),
+                shared_mem_bytes: (block_size * 4) as u32,
+            };
+            unsafe {
+                self.kernels.qk_norm_per_head.clone().launch(
+                    config,
+                    (
+                        &mut self.attn_k,
+                        &norm_gpu,
+                        norm_eps,
+                        num_kv_heads as i32,
+                        kl as i32,
+                        norm_dim as i32,
+                    ),
+                )
+            }
+            .map_err(|e| {
+                BackendError::OperationFailed(format!("qk_norm K failed: {}", e))
+            })?;
+        }
+
+        // 4. RoPE (full or partial)
+        if rope_dims > 0 && rope_dims < kl {
+            let total_blocks = (num_heads + num_kv_heads) as u32;
+            let half_rope = (rope_dims / 2) as u32;
+            let config = LaunchConfig {
+                grid_dim: (total_blocks, 1, 1),
+                block_dim: (half_rope.min(256), 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.kernels.partial_rope.clone().launch(
+                    config,
+                    (
+                        &mut self.attn_q_proper,
+                        &mut self.attn_k,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        kl as i32,
+                        rope_dims as i32,
+                        pos as i32,
+                        freq_base,
+                        freq_scale,
+                        if use_neox { 1i32 } else { 0i32 },
+                    ),
+                )
+            }
+            .map_err(|e| {
+                BackendError::OperationFailed(format!("partial_rope failed: {}", e))
+            })?;
+        } else {
+            let max_heads = num_heads.max(num_kv_heads) as u32;
+            let half_dim = (kl / 2) as u32;
+            let config = LaunchConfig {
+                grid_dim: (max_heads, 1, 1),
+                block_dim: (half_dim.min(256), 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.kernels.rope_single_pos.clone().launch(
+                    config,
+                    (
+                        &mut self.attn_q_proper,
+                        &mut self.attn_k,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        kl as i32,
+                        pos as i32,
+                        freq_base,
+                        freq_scale,
+                        if use_neox { 1i32 } else { 0i32 },
+                    ),
+                )
+            }
+            .map_err(|e| {
+                BackendError::OperationFailed(format!("rope_single_pos failed: {}", e))
+            })?;
+        }
+
+        // 5. Update GPU KV cache
+        let gpu_k_cache = self.gpu_k_caches[layer_idx]
+            .as_mut()
+            .ok_or_else(|| BackendError::OperationFailed("Missing GPU K cache".into()))?;
+        let gpu_v_cache = self.gpu_v_caches[layer_idx]
+            .as_mut()
+            .ok_or_else(|| BackendError::OperationFailed("Missing GPU V cache".into()))?;
+
+        let max_seq_len = gpu_k_cache.len() / (num_kv_heads * kl);
+        let total_kv = num_kv_heads * kl;
+        let block_size = 256.min(total_kv.next_power_of_two());
+        let grid = ((total_kv + block_size - 1) / block_size) as u32;
+        let config = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.kernels.update_kv_cache.clone().launch(
+                config,
+                (
+                    &self.attn_k,
+                    &self.attn_v,
+                    gpu_k_cache as &mut CudaSlice<f32>,
+                    gpu_v_cache as &mut CudaSlice<f32>,
+                    num_kv_heads as i32,
+                    kl as i32,
+                    max_seq_len as i32,
+                    pos as i32,
+                ),
             )
-            .map_err(|e| BackendError::OperationFailed(format!("CPU attention: {}", e)))?;
+        }
+        .map_err(|e| {
+            BackendError::OperationFailed(format!("update_kv_cache failed: {}", e))
+        })?;
 
-        // Upload attention output back to GPU → hidden_norm (~8 KB)
-        let out_data = attn_out
-            .as_f32()
-            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
-        self.device
-            .htod_sync_copy_into(out_data, &mut self.hidden_norm)
-            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+        // When vl != kl, we need a separate V cache update since the K update
+        // above used kl as head_dim. Re-update V with the correct vl stride.
+        if vl != kl {
+            let total_kv_v = num_kv_heads * vl;
+            let bs2 = 256.min(total_kv_v.next_power_of_two());
+            let grid2 = ((total_kv_v + bs2 - 1) / bs2) as u32;
+            let config2 = LaunchConfig {
+                grid_dim: (grid2, 1, 1),
+                block_dim: (bs2 as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let max_v_seq = self.gpu_v_caches[layer_idx]
+                .as_ref()
+                .map(|vc| vc.len() / (num_kv_heads * vl))
+                .unwrap_or(0);
+            let gpu_k_ref = self.gpu_k_caches[layer_idx].as_mut().unwrap();
+            let gpu_v_ref = self.gpu_v_caches[layer_idx].as_mut().unwrap();
+            unsafe {
+                self.kernels.update_kv_cache.clone().launch(
+                    config2,
+                    (
+                        &self.attn_v,
+                        &self.attn_v,
+                        gpu_k_ref as &mut CudaSlice<f32>,
+                        gpu_v_ref as &mut CudaSlice<f32>,
+                        num_kv_heads as i32,
+                        vl as i32,
+                        max_v_seq as i32,
+                        pos as i32,
+                    ),
+                )
+            }
+            .map_err(|e| {
+                BackendError::OperationFailed(format!("update_kv_cache V failed: {}", e))
+            })?;
+        }
+
+        // 6. Flash Attention — O(head_dim) shared memory, supports any kv_len
+        let kv_len = pos + 1;
+        let block_attn = 256u32;
+        let shared_bytes = (kl + 256 + 4) * 4;
+        let config_attn = LaunchConfig {
+            grid_dim: (num_heads as u32, 1, 1),
+            block_dim: (block_attn, 1, 1),
+            shared_mem_bytes: shared_bytes as u32,
+        };
+        unsafe {
+            self.kernels.flash_attention_cached.clone().launch(
+                config_attn,
+                (
+                    &self.attn_q_proper,
+                    &*self.gpu_k_caches[layer_idx].as_ref().unwrap(),
+                    &*self.gpu_v_caches[layer_idx].as_ref().unwrap(),
+                    &mut self.attn_out,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    kl as i32,
+                    max_seq_len as i32,
+                    kv_len as i32,
+                    scale,
+                ),
+            )
+        }
+        .map_err(|e| {
+            BackendError::OperationFailed(format!("flash_attention_cached failed: {}", e))
+        })?;
+
+        // 7. Apply attention gate: out = sigmoid(gate) * attn_out
+        if has_gate {
+            let total = num_heads * vl;
+            let bs = 256;
+            let grid_gate = ((total + bs - 1) / bs) as u32;
+            let config_gate = LaunchConfig {
+                grid_dim: (grid_gate, 1, 1),
+                block_dim: (bs as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.kernels.attention_gate_sigmoid.clone().launch(
+                    config_gate,
+                    (
+                        &self.attn_gate,
+                        &self.attn_out,
+                        &mut self.attn_q_raw, // reuse as temp output
+                        total as i32,
+                    ),
+                )
+            }
+            .map_err(|e| {
+                BackendError::OperationFailed(format!("attention_gate failed: {}", e))
+            })?;
+            self.device
+                .dtod_copy(&self.attn_q_raw, &mut self.attn_out)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+        }
+
+        // 8. Output projection: hidden_norm = wo @ attn_out
+        linear_gpu(
+            &self.kernels,
+            &self.weights,
+            &self.device,
+            &format!("{}.self_attn.o_proj.weight", prefix),
+            None,
+            &self.attn_out,
+            &mut self.hidden_norm,
+        )?;
 
         Ok(())
     }

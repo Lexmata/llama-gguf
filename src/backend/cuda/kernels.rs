@@ -1042,6 +1042,468 @@ __global__ void deltanet_recurrent(
     }
 }
 
+// Per-head RMS normalization for QK norm (Qwen3)
+// data: [num_heads * kl] in-place
+// norm_weight: [norm_dim]
+// One block per head, threads cooperate on the reduction
+__global__ void qk_norm_per_head(float* data, const float* norm_weight,
+                                  float eps, int num_heads, int kl, int norm_dim) {
+    extern __shared__ float shared[];
+    float* reduce = shared;
+
+    int head = blockIdx.x;
+    if (head >= num_heads) return;
+
+    float* head_data = data + head * kl;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+
+    // Sum of squares
+    float local_ss = 0.0f;
+    for (int d = tid; d < norm_dim; d += nt) {
+        local_ss += head_data[d] * head_data[d];
+    }
+    reduce[tid] = local_ss;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+
+    float rms_inv = rsqrtf(reduce[0] / (float)norm_dim + eps);
+
+    // Scale
+    for (int d = tid; d < norm_dim && d < kl; d += nt) {
+        head_data[d] = head_data[d] * rms_inv * norm_weight[d];
+    }
+}
+
+// Partial RoPE: apply RoPE only to the last rope_dims dimensions of each head
+// q: [num_q_heads * kl], k: [num_kv_heads * kl], both in-place
+// Dispatch: (num_q_heads + num_kv_heads) blocks
+__global__ void partial_rope(float* q, float* k,
+                              int num_q_heads, int num_kv_heads,
+                              int kl, int rope_dims,
+                              int pos, float freq_base, float freq_scale,
+                              int use_neox) {
+    int block = blockIdx.x;
+    int tid = threadIdx.x;
+    int half_dim = rope_dims / 2;
+    if (tid >= half_dim) return;
+
+    float* head_ptr;
+    int nope_dims = kl - rope_dims;
+
+    if (block < num_q_heads) {
+        head_ptr = q + block * kl + nope_dims;
+    } else {
+        int kv_head = block - num_q_heads;
+        if (kv_head >= num_kv_heads) return;
+        head_ptr = k + kv_head * kl + nope_dims;
+    }
+
+    float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)rope_dims);
+    float position = (float)pos / freq_scale;
+    float theta = position * freq;
+    float cos_val = cosf(theta);
+    float sin_val = sinf(theta);
+
+    if (use_neox) {
+        float x0 = head_ptr[tid];
+        float x1 = head_ptr[tid + half_dim];
+        head_ptr[tid]            = x0 * cos_val - x1 * sin_val;
+        head_ptr[tid + half_dim] = x1 * cos_val + x0 * sin_val;
+    } else {
+        float x0 = head_ptr[2 * tid];
+        float x1 = head_ptr[2 * tid + 1];
+        head_ptr[2 * tid]     = x0 * cos_val - x1 * sin_val;
+        head_ptr[2 * tid + 1] = x1 * cos_val + x0 * sin_val;
+    }
+}
+
+// Attention gate: out[i] = sigmoid(gate[i]) * attn[i]
+__global__ void attention_gate_sigmoid(const float* gate, const float* attn,
+                                        float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = 1.0f / (1.0f + expf(-gate[idx]));
+        out[idx] = g * attn[idx];
+    }
+}
+
+// Split Q output into q_proper and gate per head
+// q_raw: [num_heads * (kl + vl)] — per head: [q(kl) | gate(vl)]
+// q_out: [num_heads * kl], gate_out: [num_heads * vl]
+__global__ void split_q_gate(const float* q_raw, float* q_out, float* gate_out,
+                              int num_heads, int kl, int vl) {
+    int head = blockIdx.x;
+    if (head >= num_heads) return;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+    int per_head = kl + vl;
+
+    for (int d = tid; d < kl; d += nt) {
+        q_out[head * kl + d] = q_raw[head * per_head + d];
+    }
+    for (int d = tid; d < vl; d += nt) {
+        gate_out[head * vl + d] = q_raw[head * per_head + kl + d];
+    }
+}
+
+// Full attention with causal masking (for non-cached attention)
+// q: [num_heads, seq_len, head_dim], k: [num_kv_heads, kv_len, head_dim]
+// v: [num_kv_heads, kv_len, head_dim], out: [num_heads, seq_len, head_dim]
+// Online softmax — uses O(head_dim + blockDim.x) shared memory
+// Dispatch: grid(num_heads, seq_len), block(256)
+__global__ void attention_full(const float* q, const float* k, const float* v,
+                                float* out,
+                                int num_heads, int num_kv_heads,
+                                int seq_len, int kv_len, int head_dim,
+                                float scale) {
+    extern __shared__ float shared[];
+    float* accum     = shared;              // [head_dim]
+    float* reduction = shared + head_dim;   // [blockDim.x]
+    // 4 extra floats at shared + head_dim + blockDim.x
+    float* s_vals    = shared + head_dim + blockDim.x;
+
+    int head = blockIdx.x;
+    int s    = blockIdx.y;
+    int tid  = threadIdx.x;
+    int nt   = blockDim.x;
+
+    int kv_head = head / (num_heads / num_kv_heads);
+    int q_abs_pos = kv_len - seq_len + s;
+
+    for (int d = tid; d < head_dim; d += nt) {
+        accum[d] = 0.0f;
+    }
+    if (tid == 0) {
+        s_vals[0] = -CUDART_INF_F; // max_score
+        s_vals[1] = 0.0f;          // sum_exp
+    }
+    __syncthreads();
+
+    int q_base = head * seq_len * head_dim + s * head_dim;
+
+    for (int kv_pos = 0; kv_pos <= q_abs_pos && kv_pos < kv_len; kv_pos++) {
+        // Dot product Q · K
+        float local_dot = 0.0f;
+        int k_base = kv_head * kv_len * head_dim + kv_pos * head_dim;
+        for (int d = tid; d < head_dim; d += nt) {
+            local_dot += q[q_base + d] * k[k_base + d];
+        }
+        reduction[tid] = local_dot;
+        __syncthreads();
+        for (int stride = nt / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) reduction[tid] += reduction[tid + stride];
+            __syncthreads();
+        }
+
+        float score = reduction[0] * scale;
+
+        if (tid == 0) {
+            float old_max = s_vals[0];
+            if (score > old_max) {
+                s_vals[3] = expf(old_max - score); // correction
+                s_vals[1] *= s_vals[3];
+                s_vals[0] = score;
+            } else {
+                s_vals[3] = 1.0f;
+            }
+            s_vals[2] = expf(score - s_vals[0]); // weight
+            s_vals[1] += s_vals[2];
+        }
+        __syncthreads();
+
+        float w = s_vals[2];
+        float c = s_vals[3];
+        int v_base = kv_head * kv_len * head_dim + kv_pos * head_dim;
+        for (int d = tid; d < head_dim; d += nt) {
+            accum[d] = accum[d] * c + w * v[v_base + d];
+        }
+        __syncthreads();
+    }
+
+    float inv_sum = (s_vals[1] > 0.0f) ? 1.0f / s_vals[1] : 0.0f;
+    int out_base = head * seq_len * head_dim + s * head_dim;
+    for (int d = tid; d < head_dim; d += nt) {
+        out[out_base + d] = accum[d] * inv_sum;
+    }
+}
+
+// FP16 conversion: f32 -> f16
+__global__ void f32_to_f16(const float* input, half* output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __float2half(input[idx]);
+    }
+}
+
+// FP16 conversion: f16 -> f32
+__global__ void f16_to_f32(const half* input, float* output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __half2float(input[idx]);
+    }
+}
+
+// FP16 vector-matrix multiply: out = x @ W^T (FP16 compute, FP32 accumulation)
+// x: [in_dim] (f16), W: [out_dim, in_dim] (f16), out: [out_dim] (f16)
+// Each thread block computes one output element
+__global__ void vec_mat_f16(const half* x, const half* weight,
+                             half* out, int in_dim, int out_dim) {
+    extern __shared__ float reduce[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+    if (row >= out_dim) return;
+
+    float sum = 0.0f;
+    const half* w_row = weight + row * in_dim;
+    for (int i = tid; i < in_dim; i += nt) {
+        sum += __half2float(x[i]) * __half2float(w_row[i]);
+    }
+    reduce[tid] = sum;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[row] = __float2half(reduce[0]);
+    }
+}
+
+// FP16 element-wise add
+__global__ void add_f16(const half* a, const half* b, half* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = __float2half(__half2float(a[idx]) + __half2float(b[idx]));
+    }
+}
+
+// FP16 SiLU activation
+__global__ void silu_f16(const half* input, half* output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = __half2float(input[idx]);
+        output[idx] = __float2half(x / (1.0f + expf(-x)));
+    }
+}
+
+// FP16 element-wise multiply
+__global__ void mul_f16(const half* a, const half* b, half* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = __float2half(__half2float(a[idx]) * __half2float(b[idx]));
+    }
+}
+
+// FP16 RMS norm (fused: normalize and scale)
+__global__ void rms_norm_f16(const half* x, const half* weight,
+                              half* out, int n, float eps) {
+    extern __shared__ float reduce[];
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+
+    float local_ss = 0.0f;
+    for (int i = tid; i < n; i += nt) {
+        float xi = __half2float(x[i]);
+        local_ss += xi * xi;
+    }
+    reduce[tid] = local_ss;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    float rms_inv = rsqrtf(reduce[0] / (float)n + eps);
+    for (int i = tid; i < n; i += nt) {
+        out[i] = __float2half(__half2float(x[i]) * rms_inv * __half2float(weight[i]));
+    }
+}
+
+// Flash Attention (cached) — O(head_dim) shared memory, supports any kv_len
+// Replaces attention_multihead for generation (single query per head)
+// Uses online softmax: no materialization of full score array
+// Dispatch: grid(num_heads), block(256)
+__global__ void flash_attention_cached(
+    const float* q,         // [num_heads * head_dim]
+    const float* k_cache,   // [num_kv_heads * max_seq_len * head_dim]
+    const float* v_cache,   // [num_kv_heads * max_seq_len * head_dim]
+    float* out,             // [num_heads * head_dim]
+    int num_heads, int num_kv_heads,
+    int head_dim, int max_seq_len,
+    int kv_len, float scale
+) {
+    extern __shared__ float smem[];
+    float* accum   = smem;                         // [head_dim]
+    float* reduce  = smem + head_dim;              // [blockDim.x]
+    float* s_vals  = smem + head_dim + blockDim.x; // [4]: max, sum, weight, correction
+
+    int head = blockIdx.x;
+    int tid  = threadIdx.x;
+    int nt   = blockDim.x;
+    int kv_head = head / (num_heads / num_kv_heads);
+
+    for (int d = tid; d < head_dim; d += nt) accum[d] = 0.0f;
+    if (tid == 0) { s_vals[0] = -CUDART_INF_F; s_vals[1] = 0.0f; }
+    __syncthreads();
+
+    const float* q_head = q + head * head_dim;
+    int k_off = kv_head * max_seq_len * head_dim;
+    int v_off = kv_head * max_seq_len * head_dim;
+
+    for (int pos = 0; pos < kv_len; pos++) {
+        float local_dot = 0.0f;
+        for (int d = tid; d < head_dim; d += nt)
+            local_dot += q_head[d] * k_cache[k_off + pos * head_dim + d];
+        reduce[tid] = local_dot;
+        __syncthreads();
+        for (int s = nt / 2; s > 0; s >>= 1) {
+            if (tid < s) reduce[tid] += reduce[tid + s];
+            __syncthreads();
+        }
+        float score = reduce[0] * scale;
+
+        if (tid == 0) {
+            float old_max = s_vals[0];
+            if (score > old_max) {
+                s_vals[3] = expf(old_max - score);
+                s_vals[1] *= s_vals[3];
+                s_vals[0] = score;
+            } else {
+                s_vals[3] = 1.0f;
+            }
+            s_vals[2] = expf(score - s_vals[0]);
+            s_vals[1] += s_vals[2];
+        }
+        __syncthreads();
+
+        float w = s_vals[2], c = s_vals[3];
+        for (int d = tid; d < head_dim; d += nt)
+            accum[d] = accum[d] * c + w * v_cache[v_off + pos * head_dim + d];
+        __syncthreads();
+    }
+
+    float inv = (s_vals[1] > 0.0f) ? 1.0f / s_vals[1] : 0.0f;
+    int out_base = head * head_dim;
+    for (int d = tid; d < head_dim; d += nt)
+        out[out_base + d] = accum[d] * inv;
+}
+
+// Batched RoPE: apply RoPE to [num_heads, seq_len, head_dim] tensors
+// Each position gets a different frequency based on (start_pos + s)
+// Dispatch: grid(max(num_heads, num_kv_heads), seq_len), block(half_dim)
+__global__ void rope_batch(float* q, float* k,
+                            int num_heads, int num_kv_heads, int head_dim,
+                            int seq_len, int start_pos,
+                            float freq_base, float freq_scale,
+                            int use_neox) {
+    int head = blockIdx.x;
+    int s    = blockIdx.y;
+    int i    = threadIdx.x;
+    int half_dim = head_dim / 2;
+
+    if (i >= half_dim) return;
+
+    int pos = start_pos + s;
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+    float position = (float)pos / freq_scale;
+    float theta = position * freq;
+    float cos_theta = cosf(theta);
+    float sin_theta = sinf(theta);
+
+    if (head < num_heads) {
+        int base = head * seq_len * head_dim + s * head_dim;
+        int idx0, idx1;
+        if (use_neox) {
+            idx0 = base + i;
+            idx1 = base + i + half_dim;
+        } else {
+            idx0 = base + 2 * i;
+            idx1 = base + 2 * i + 1;
+        }
+        float q0 = q[idx0];
+        float q1 = q[idx1];
+        q[idx0] = q0 * cos_theta - q1 * sin_theta;
+        q[idx1] = q0 * sin_theta + q1 * cos_theta;
+    }
+
+    if (head < num_kv_heads) {
+        int base = head * seq_len * head_dim + s * head_dim;
+        int idx0, idx1;
+        if (use_neox) {
+            idx0 = base + i;
+            idx1 = base + i + half_dim;
+        } else {
+            idx0 = base + 2 * i;
+            idx1 = base + 2 * i + 1;
+        }
+        float k0 = k[idx0];
+        float k1 = k[idx1];
+        k[idx0] = k0 * cos_theta - k1 * sin_theta;
+        k[idx1] = k0 * sin_theta + k1 * cos_theta;
+    }
+}
+
+// Batched KV cache update: write seq_len positions to cache starting at start_pos
+// k_new: [num_kv_heads, seq_len, head_dim]
+// k_cache: [num_kv_heads, max_seq_len, head_dim]
+// Dispatch: grid((total + 255) / 256), block(256)
+__global__ void update_kv_cache_batch(const float* k_new, const float* v_new,
+                                       float* k_cache, float* v_cache,
+                                       int num_kv_heads, int head_dim,
+                                       int max_seq_len, int seq_len,
+                                       int start_pos) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_kv_heads * seq_len * head_dim;
+    if (idx >= total) return;
+
+    int head = idx / (seq_len * head_dim);
+    int remainder = idx % (seq_len * head_dim);
+    int s = remainder / head_dim;
+    int d = remainder % head_dim;
+
+    int cache_pos = start_pos + s;
+    int cache_idx = head * max_seq_len * head_dim + cache_pos * head_dim + d;
+
+    k_cache[cache_idx] = k_new[idx];
+    v_cache[cache_idx] = v_new[idx];
+}
+
+// Batched matrix-vector multiply for linear projections on batch of tokens
+// x: [batch_size, in_dim], weight: [out_dim, in_dim], out: [batch_size, out_dim]
+// Dispatch: grid(out_dim, batch_size), block(256)
+__global__ void batched_linear(const float* x, const float* weight,
+                                float* out, int batch_size,
+                                int in_dim, int out_dim) {
+    int row = blockIdx.x;   // output dimension
+    int b   = blockIdx.y;   // batch index
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+
+    if (row >= out_dim || b >= batch_size) return;
+
+    extern __shared__ float reduce[];
+
+    float sum = 0.0f;
+    const float* x_ptr = x + b * in_dim;
+    const float* w_ptr = weight + row * in_dim;
+    for (int i = tid; i < in_dim; i += nt) {
+        sum += x_ptr[i] * w_ptr[i];
+    }
+    reduce[tid] = sum;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[b * out_dim + row] = reduce[0];
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -1089,6 +1551,30 @@ pub struct CudaKernels {
 
     // Attention
     pub attention_single_head: CudaFunction,
+    pub attention_full: CudaFunction,
+
+    // GPU attention support
+    pub qk_norm_per_head: CudaFunction,
+    pub partial_rope: CudaFunction,
+    pub attention_gate_sigmoid: CudaFunction,
+    pub split_q_gate: CudaFunction,
+
+    // FP16 compute
+    pub f32_to_f16: CudaFunction,
+    pub f16_to_f32: CudaFunction,
+    pub vec_mat_f16: CudaFunction,
+    pub add_f16: CudaFunction,
+    pub silu_f16: CudaFunction,
+    pub mul_f16: CudaFunction,
+    pub rms_norm_f16: CudaFunction,
+
+    // Flash Attention
+    pub flash_attention_cached: CudaFunction,
+
+    // Batched inference
+    pub rope_batch: CudaFunction,
+    pub update_kv_cache_batch: CudaFunction,
+    pub batched_linear: CudaFunction,
 
     // DeltaNet
     pub deltanet_conv1d_silu: CudaFunction,
@@ -1132,8 +1618,24 @@ impl CudaKernels {
                     "vec_mat_q6k",
                     "vec_mat_q5k",
                     "attention_single_head",
+                    "attention_full",
                     "update_kv_cache",
                     "attention_multihead",
+                    "qk_norm_per_head",
+                    "partial_rope",
+                    "attention_gate_sigmoid",
+                    "split_q_gate",
+                    "f32_to_f16",
+                    "f16_to_f32",
+                    "vec_mat_f16",
+                    "add_f16",
+                    "silu_f16",
+                    "mul_f16",
+                    "rms_norm_f16",
+                    "flash_attention_cached",
+                    "rope_batch",
+                    "update_kv_cache_batch",
+                    "batched_linear",
                     "scaled_add_f32",
                     "deltanet_conv1d_silu",
                     "deltanet_recurrent",
@@ -1239,6 +1741,118 @@ impl CudaKernels {
                 .ok_or_else(|| {
                     BackendError::InitializationFailed(
                         "Kernel 'attention_single_head' not found".into(),
+                    )
+                })?,
+            attention_full: device
+                .get_func("llama_kernels", "attention_full")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'attention_full' not found".into(),
+                    )
+                })?,
+            qk_norm_per_head: device
+                .get_func("llama_kernels", "qk_norm_per_head")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'qk_norm_per_head' not found".into(),
+                    )
+                })?,
+            partial_rope: device
+                .get_func("llama_kernels", "partial_rope")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'partial_rope' not found".into(),
+                    )
+                })?,
+            attention_gate_sigmoid: device
+                .get_func("llama_kernels", "attention_gate_sigmoid")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'attention_gate_sigmoid' not found".into(),
+                    )
+                })?,
+            split_q_gate: device
+                .get_func("llama_kernels", "split_q_gate")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'split_q_gate' not found".into(),
+                    )
+                })?,
+            f32_to_f16: device
+                .get_func("llama_kernels", "f32_to_f16")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'f32_to_f16' not found".into(),
+                    )
+                })?,
+            f16_to_f32: device
+                .get_func("llama_kernels", "f16_to_f32")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'f16_to_f32' not found".into(),
+                    )
+                })?,
+            vec_mat_f16: device
+                .get_func("llama_kernels", "vec_mat_f16")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'vec_mat_f16' not found".into(),
+                    )
+                })?,
+            add_f16: device
+                .get_func("llama_kernels", "add_f16")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'add_f16' not found".into(),
+                    )
+                })?,
+            silu_f16: device
+                .get_func("llama_kernels", "silu_f16")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'silu_f16' not found".into(),
+                    )
+                })?,
+            mul_f16: device
+                .get_func("llama_kernels", "mul_f16")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'mul_f16' not found".into(),
+                    )
+                })?,
+            rms_norm_f16: device
+                .get_func("llama_kernels", "rms_norm_f16")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'rms_norm_f16' not found".into(),
+                    )
+                })?,
+            flash_attention_cached: device
+                .get_func("llama_kernels", "flash_attention_cached")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'flash_attention_cached' not found".into(),
+                    )
+                })?,
+            rope_batch: device
+                .get_func("llama_kernels", "rope_batch")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'rope_batch' not found".into(),
+                    )
+                })?,
+            update_kv_cache_batch: device
+                .get_func("llama_kernels", "update_kv_cache_batch")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'update_kv_cache_batch' not found".into(),
+                    )
+                })?,
+            batched_linear: device
+                .get_func("llama_kernels", "batched_linear")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'batched_linear' not found".into(),
                     )
                 })?,
             update_kv_cache: device

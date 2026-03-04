@@ -268,11 +268,7 @@ impl Backend for Dx12Backend {
     }
 
     fn softmax(&self, x: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        // Fall back to CPU for small tensors
-        match ops::softmax(&self.ctx, x, out) {
-            Err(BackendError::Unsupported(_)) => self.cpu_fallback.softmax(x, out),
-            other => other,
-        }
+        ops::softmax(&self.ctx, x, out)
     }
 
     fn rms_norm(
@@ -286,12 +282,11 @@ impl Backend for Dx12Backend {
     }
 
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        // Fall back to CPU for full matrix multiply (complex GPU implementation)
-        self.cpu_fallback.matmul(a, b, out)
+        ops::matmul(&self.ctx, a, b, out)
     }
 
     fn matvec(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        self.cpu_fallback.matvec(a, b, out)
+        ops::matvec(&self.ctx, a, b, out)
     }
 
     fn vec_mat(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
@@ -299,23 +294,24 @@ impl Backend for Dx12Backend {
     }
 
     fn dequantize(&self, src: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        // Fall back to CPU for dequantization (requires quantized format support in shaders)
-        self.cpu_fallback.dequantize(src, out)
+        match ops::dequantize(&self.ctx, src, out) {
+            Err(BackendError::Unsupported(_)) => self.cpu_fallback.dequantize(src, out),
+            other => other,
+        }
     }
 
     fn matvec_q(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        // Fall back to CPU for quantized ops
-        self.cpu_fallback.matvec_q(a, b, out)
+        match ops::matvec_q(&self.ctx, a, b, out) {
+            Err(BackendError::Unsupported(_)) => self.cpu_fallback.matvec_q(a, b, out),
+            other => other,
+        }
     }
 
     fn vec_mat_q(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        // For quantized vector-matrix multiply, dequantize on CPU then use GPU vec_mat
-        if b.dtype() == DType::F32 {
-            return ops::vec_mat(&self.ctx, a, b, out);
+        match ops::vec_mat_q(&self.ctx, a, b, out) {
+            Err(BackendError::Unsupported(_)) => self.cpu_fallback.vec_mat_q(a, b, out),
+            other => other,
         }
-
-        // CPU fallback for quantized weights
-        self.cpu_fallback.vec_mat_q(a, b, out)
     }
 
     fn rope(
@@ -327,12 +323,7 @@ impl Backend for Dx12Backend {
         freq_scale: f32,
         use_neox: bool,
     ) -> BackendResult<()> {
-        match ops::rope(&self.ctx, q, k, pos, freq_base, freq_scale, use_neox) {
-            Err(BackendError::Unsupported(_)) => self
-                .cpu_fallback
-                .rope(q, k, pos, freq_base, freq_scale, use_neox),
-            other => other,
-        }
+        ops::rope(&self.ctx, q, k, pos, freq_base, freq_scale, use_neox)
     }
 
     fn attention(
@@ -343,8 +334,7 @@ impl Backend for Dx12Backend {
         out: &mut Tensor,
         scale: f32,
     ) -> BackendResult<()> {
-        // Fall back to CPU for attention (complex multi-step GPU implementation)
-        self.cpu_fallback.attention(q, k, v, out, scale)
+        ops::attention(&self.ctx, q, k, v, out, scale)
     }
 
     fn attention_cached(
@@ -356,10 +346,7 @@ impl Backend for Dx12Backend {
         scale: f32,
         kv_len: usize,
     ) -> BackendResult<()> {
-        // Route directly to CPU strided attention — avoids the default trait
-        // impl that copies the cache into contiguous tensors first.
-        self.cpu_fallback
-            .attention_cached(q, k_cache, v_cache, out, scale, kv_len)
+        ops::attention_cached(&self.ctx, q, k_cache, v_cache, out, scale, kv_len)
     }
 }
 

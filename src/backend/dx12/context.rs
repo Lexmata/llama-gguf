@@ -403,6 +403,39 @@ impl Dx12Context {
     // =========================================================================
 
     /// Create a GPU buffer and upload f32 data to it.
+    /// Create a GPU buffer from raw bytes.
+    pub fn create_buffer_with_raw_bytes(&self, data: &[u8]) -> Result<GpuBuffer, BackendError> {
+        let size = data.len() as u64;
+        unsafe {
+            let upload_resource = self.create_committed_resource(
+                D3D12_HEAP_TYPE_UPLOAD,
+                size,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?;
+
+            let mut mapped_ptr = std::ptr::null_mut();
+            upload_resource
+                .Map(0, None, Some(&mut mapped_ptr))
+                .map_err(|e| BackendError::AllocationFailed(format!("Map upload failed: {}", e)))?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped_ptr as *mut u8, data.len());
+            upload_resource.Unmap(0, None);
+
+            let default_resource = self.create_committed_resource(
+                D3D12_HEAP_TYPE_DEFAULT,
+                size,
+                D3D12_RESOURCE_STATE_COMMON,
+            )?;
+
+            Ok(GpuBuffer {
+                default_resource,
+                upload_resource: Some(upload_resource),
+                readback_resource: None,
+                size,
+                num_elements: data.len(),
+            })
+        }
+    }
+
     pub fn create_buffer_with_data(&self, data: &[f32]) -> Result<GpuBuffer, BackendError> {
         let size = (data.len() * std::mem::size_of::<f32>()) as u64;
         let byte_data = bytemuck::cast_slice(data);

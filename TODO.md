@@ -8,15 +8,15 @@ Metal, DX12, and Vulkan backends fall back to CPU for several operations. Bringi
 
 ### Operations needing GPU implementation (Metal, DX12, Vulkan)
 
-- [ ] `matmul` — general matrix multiplication
-- [ ] `matvec` — matrix-vector multiplication
-- [ ] `dequantize` — quantized tensor dequantization on GPU
-- [ ] `matvec_q` — quantized matrix-vector multiplication
-- [ ] `vec_mat_q` — quantized vector-matrix multiplication (currently GPU for F32 only)
-- [ ] `attention` — full attention computation
-- [ ] `attention_cached` — KV-cached attention
-- [ ] `softmax` — GPU path for all tensor sizes (currently falls back on small tensors)
-- [ ] `rope` — GPU path for all configurations (currently falls back on some variants)
+- [x] `matmul` — general matrix multiplication
+- [x] `matvec` — matrix-vector multiplication
+- [x] `dequantize` — quantized tensor dequantization on GPU (Q8_0, Q4_K, Q6_K)
+- [x] `matvec_q` — quantized matrix-vector multiplication (2-pass: dequant + matvec)
+- [x] `vec_mat_q` — quantized vector-matrix multiplication (2-pass: dequant + vec_mat)
+- [x] `attention` — full attention computation (online softmax, GQA, causal masking)
+- [x] `attention_cached` — KV-cached attention (online softmax, GQA)
+- [x] `softmax` — GPU path for all tensor sizes
+- [x] `rope` — GPU path for all configurations
 
 ### Dedicated inference engines
 
@@ -26,10 +26,10 @@ Metal, DX12, and Vulkan backends fall back to CPU for several operations. Bringi
 
 ## CUDA Backend
 
-- [ ] Move attention from CPU roundtrip to fully on-GPU (Qwen3Next QK norm, partial RoPE, attention gating)
-- [ ] Batched inference (process multiple sequences simultaneously)
-- [ ] Flash Attention kernel implementation
-- [ ] FP16 compute path (currently dequantizes to F32)
+- [x] Move attention from CPU roundtrip to fully on-GPU (QK norm, partial RoPE, attention gating)
+- [x] Batched inference (batched RoPE, KV cache update, linear kernels, `forward_batch`)
+- [x] Flash Attention kernel (`flash_attention_cached` with O(head_dim) shared memory)
+- [x] FP16 compute path (f32↔f16 conversion, vec_mat_f16, element-wise ops, rms_norm_f16)
 
 ## Model Support
 

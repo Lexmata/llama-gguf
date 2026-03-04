@@ -56,6 +56,13 @@ fn compile_vulkan_shaders() {
         "rms_norm_scale",
         "vec_mat",
         "rope",
+        "matmul",
+        "matvec",
+        "dequant_q8_0",
+        "dequant_q4_k",
+        "dequant_q6_k",
+        "attention",
+        "attention_cached",
     ];
 
     for shader_name in &shaders {
@@ -172,6 +179,13 @@ fn compile_metal_shaders() {
         "rms_norm_scale",
         "vec_mat",
         "rope",
+        "matmul",
+        "matvec",
+        "dequant_q8_0",
+        "dequant_q4_k",
+        "dequant_q6_k",
+        "attention",
+        "attention_cached",
     ];
 
     // Compile each .metal -> .air (Apple Intermediate Representation)
@@ -281,6 +295,13 @@ fn compile_dx12_shaders() {
         "rms_norm_scale",
         "vec_mat",
         "rope",
+        "matmul",
+        "matvec",
+        "dequant_q8_0",
+        "dequant_q4_k",
+        "dequant_q6_k",
+        "attention",
+        "attention_cached",
     ];
 
     let compiler = find_dxc_compiler();

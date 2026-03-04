@@ -95,6 +95,13 @@ impl MetalContext {
             ("rms_norm_scale", "rms_norm_scale_f32"),
             ("vec_mat", "vec_mat_f32"),
             ("rope", "rope_f32"),
+            ("matmul", "matmul_f32"),
+            ("matvec", "matvec_f32"),
+            ("dequant_q8_0", "dequant_q8_0"),
+            ("dequant_q4_k", "dequant_q4_k"),
+            ("dequant_q6_k", "dequant_q6_k"),
+            ("attention", "attention_f32"),
+            ("attention_cached", "attention_cached_f32"),
         ];
 
         for (pipeline_name, function_name) in &shader_functions {
@@ -132,6 +139,16 @@ impl MetalContext {
             bytes.len() as u64,
             // Use shared storage for Apple Silicon unified memory.
             // This avoids copies between CPU and GPU.
+            MTLResourceOptions::StorageModeShared,
+        );
+        Ok(buffer)
+    }
+
+    /// Create a Metal buffer from raw bytes.
+    pub fn create_buffer_with_raw_bytes(&self, data: &[u8]) -> Result<Buffer, BackendError> {
+        let buffer = self.device.new_buffer_with_data(
+            data.as_ptr() as *const _,
+            data.len() as u64,
             MTLResourceOptions::StorageModeShared,
         );
         Ok(buffer)
