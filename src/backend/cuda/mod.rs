@@ -16,15 +16,7 @@
 #[cfg(feature = "cuda")]
 pub mod dequant_weights;
 #[cfg(feature = "cuda")]
-pub mod fast_inference;
-#[cfg(feature = "cuda")]
-pub mod gpu_inference;
-#[cfg(feature = "cuda")]
-pub mod gpu_model;
-#[cfg(feature = "cuda")]
 pub mod gpu_only;
-#[cfg(feature = "cuda")]
-pub mod gpu_ops;
 #[cfg(feature = "cuda")]
 mod kernels;
 #[cfg(feature = "cuda")]
@@ -215,16 +207,6 @@ fn launch_config_1d(n: usize, block_size: usize) -> LaunchConfig {
     }
 }
 
-/// Helper function with shared memory
-#[cfg(feature = "cuda")]
-fn launch_config_1d_shared(n: usize, block_size: usize, shared_bytes: usize) -> LaunchConfig {
-    let grid_size = (n + block_size - 1) / block_size;
-    LaunchConfig {
-        grid_dim: (grid_size as u32, 1, 1),
-        block_dim: (block_size as u32, 1, 1),
-        shared_mem_bytes: shared_bytes as u32,
-    }
-}
 
 #[cfg(feature = "cuda")]
 impl Backend for CudaBackend {
@@ -527,35 +509,99 @@ impl Backend for CudaBackend {
     }
 
     fn vec_mat_q(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-        // Check if we have pre-dequantized GPU weights for this tensor
         if let Some(ref gpu_weights) = self.gpu_weights {
             if let Some(weight_name) = b.name() {
-                if let Some(gpu_weight) = gpu_weights.get(weight_name) {
+                // Try quantized GPU weight first (most MoE expert weights)
+                if let Some(qw) = gpu_weights.get_quantized(weight_name) {
                     self.gpu_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                    // GPU-accelerated path: weight is already dequantized on GPU
                     let a_data = a.as_f32()?;
                     let out_data = out.as_f32_mut()?;
 
-                    // a: [k], b: [k, n], out: [n]
-                    let k = gpu_weight.shape[0];
-                    let n_out = gpu_weight.shape[1];
+                    let k = qw.shape[0];
+                    let n_out = if qw.shape.len() >= 2 { qw.shape[1] } else { 1 };
 
-                    // Verify dimensions match
                     if a_data.len() != k {
                         return Err(BackendError::OperationFailed(format!(
-                            "vec_mat_q (GPU) dimension mismatch: expected {}, got {}",
+                            "vec_mat_q (GPU quant) dim mismatch: expected {}, got {}",
                             k,
                             a_data.len()
                         )));
                     }
 
-                    // Upload input vector
                     let a_gpu = self.to_device(a_data)?;
                     let mut out_gpu = self.alloc_gpu(n_out)?;
 
-                    // Launch vec_mat kernel
+                    let config = launch_config_1d(n_out, 256);
+                    match qw.dtype {
+                        DType::Q4K => unsafe {
+                            self.kernels.vec_mat_q4k.clone().launch(
+                                config,
+                                (&qw.data, &a_gpu, &mut out_gpu, k as i32, n_out as i32),
+                            )
+                        },
+                        DType::Q6K => unsafe {
+                            self.kernels.vec_mat_q6k.clone().launch(
+                                config,
+                                (&qw.data, &a_gpu, &mut out_gpu, k as i32, n_out as i32),
+                            )
+                        },
+                        DType::Q5K => unsafe {
+                            self.kernels.vec_mat_q5k.clone().launch(
+                                config,
+                                (&qw.data, &a_gpu, &mut out_gpu, k as i32, n_out as i32),
+                            )
+                        },
+                        DType::Q4_0 => unsafe {
+                            self.kernels.vec_mat_q4_0.clone().launch(
+                                config,
+                                (&qw.data, &a_gpu, &mut out_gpu, k as i32, n_out as i32),
+                            )
+                        },
+                        DType::Q8_0 => unsafe {
+                            self.kernels.vec_mat_q8_0.clone().launch(
+                                config,
+                                (&qw.data, &a_gpu, &mut out_gpu, k as i32, n_out as i32),
+                            )
+                        },
+                        _ => {
+                            self.cpu_fallbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return self.cpu_backend.vec_mat_q(a, b, out);
+                        }
+                    }
+                    .map_err(|e| {
+                        BackendError::OperationFailed(format!("vec_mat_q kernel: {}", e))
+                    })?;
+
+                    let result = self.from_device(&out_gpu)?;
+                    out_data.copy_from_slice(&result);
+                    return Ok(());
+                }
+
+                // Try f32 (dequantized) GPU weight
+                if let Some(gpu_weight) = gpu_weights.get(weight_name) {
+                    self.gpu_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let a_data = a.as_f32()?;
+                    let out_data = out.as_f32_mut()?;
+
+                    let k = gpu_weight.shape[0];
+                    let n_out = gpu_weight.shape[1];
+
+                    if a_data.len() != k {
+                        return Err(BackendError::OperationFailed(format!(
+                            "vec_mat_q (GPU f32) dim mismatch: expected {}, got {}",
+                            k,
+                            a_data.len()
+                        )));
+                    }
+
+                    let a_gpu = self.to_device(a_data)?;
+                    let mut out_gpu = self.alloc_gpu(n_out)?;
+
                     let config = launch_config_1d(n_out, 256);
                     unsafe {
                         self.kernels.vec_mat_f32.clone().launch(
@@ -570,19 +616,16 @@ impl Backend for CudaBackend {
                         )
                     }
                     .map_err(|e| {
-                        BackendError::OperationFailed(format!("vec_mat kernel failed: {}", e))
+                        BackendError::OperationFailed(format!("vec_mat kernel: {}", e))
                     })?;
 
-                    // Copy result back
                     let result = self.from_device(&out_gpu)?;
                     out_data.copy_from_slice(&result);
-
                     return Ok(());
                 }
             }
         }
 
-        // Fallback to CPU for weights not in GPU store
         self.cpu_fallbacks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.cpu_backend.vec_mat_q(a, b, out)

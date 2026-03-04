@@ -11,7 +11,9 @@
 //! - DeepSeek MoE
 
 use crate::backend::Backend;
+use crate::backend::cpu::simd;
 use crate::tensor::{DType, Tensor};
+use rayon::prelude::*;
 
 /// MoE configuration
 #[derive(Debug, Clone)]
@@ -144,16 +146,12 @@ impl MoeRouter {
         let mut all_weights = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
-            // Compute router logits: hidden @ weight.T
             let h_offset = b * h_offset_stride;
+            let h_slice = &h_data[h_offset..h_offset + hidden_dim];
             let mut logits = vec![0.0f32; self.num_experts];
 
             for e in 0..self.num_experts {
-                let mut sum = 0.0f32;
-                for d in 0..hidden_dim {
-                    sum += h_data[h_offset + d] * w_data[e * hidden_dim + d];
-                }
-                logits[e] = sum;
+                logits[e] = simd::dot_f32(h_slice, &w_data[e * hidden_dim..e * hidden_dim + hidden_dim]);
             }
 
             // Optionally normalize logits
@@ -212,12 +210,12 @@ pub struct MoeExpert {
 }
 
 impl MoeExpert {
-    /// Create a new expert
+    /// Create a new expert with GGUF-convention weight shapes [in_features, out_features]
     pub fn new(hidden_dim: usize, intermediate_dim: usize) -> Self {
         Self {
-            gate_proj: Tensor::zeros(vec![intermediate_dim, hidden_dim], DType::F32),
-            up_proj: Tensor::zeros(vec![intermediate_dim, hidden_dim], DType::F32),
-            down_proj: Tensor::zeros(vec![hidden_dim, intermediate_dim], DType::F32),
+            gate_proj: Tensor::zeros(vec![hidden_dim, intermediate_dim], DType::F32),
+            up_proj: Tensor::zeros(vec![hidden_dim, intermediate_dim], DType::F32),
+            down_proj: Tensor::zeros(vec![intermediate_dim, hidden_dim], DType::F32),
         }
     }
 
@@ -343,7 +341,6 @@ impl MoeLayer {
             .zip(selection.weights.iter())
             .enumerate()
         {
-            // Get input for this token
             let h_offset = b * hidden_dim;
             let token_input = if h_shape.len() == 1 {
                 hidden_states.clone()
@@ -351,13 +348,22 @@ impl MoeLayer {
                 Tensor::from_f32(&h_data[h_offset..h_offset + hidden_dim], vec![hidden_dim])?
             };
 
-            // Compute weighted sum of expert outputs
-            for (&expert_idx, &weight) in indices.iter().zip(weights.iter()) {
-                let expert_output = self.experts[expert_idx].forward(&token_input, backend)?;
-                let expert_data = expert_output.as_f32()?;
+            // Run selected experts in parallel
+            let expert_results: Vec<(Vec<f32>, f32)> = indices
+                .par_iter()
+                .zip(weights.par_iter())
+                .map(|(&expert_idx, &weight)| {
+                    let out = self.experts[expert_idx]
+                        .forward(&token_input, backend)
+                        .expect("expert forward failed");
+                    (out.as_f32().unwrap().to_vec(), weight)
+                })
+                .collect();
 
-                for d in 0..hidden_dim {
-                    output_data[b * hidden_dim + d] += weight * expert_data[d];
+            for (expert_data, weight) in &expert_results {
+                let out_slice = &mut output_data[b * hidden_dim..(b + 1) * hidden_dim];
+                for (o, &e) in out_slice.iter_mut().zip(expert_data.iter()) {
+                    *o += weight * e;
                 }
             }
 
@@ -365,25 +371,32 @@ impl MoeLayer {
             if !self.shared_experts.is_empty() {
                 let gate_scale = if let Some(ref gate_w) = self.shared_expert_gate {
                     let gw = gate_w.as_f32()?;
-                    let mut dot = 0.0f32;
                     let h_slice = if h_shape.len() == 1 {
                         h_data
                     } else {
                         &h_data[h_offset..h_offset + hidden_dim]
                     };
-                    for d in 0..hidden_dim.min(gw.len()) {
-                        dot += h_slice[d] * gw[d];
-                    }
+                    let len = hidden_dim.min(gw.len());
+                    let dot = simd::dot_f32(&h_slice[..len], &gw[..len]);
                     1.0 / (1.0 + (-dot).exp())
                 } else {
                     1.0
                 };
 
-                for shared_expert in &self.shared_experts {
-                    let shared_output = shared_expert.forward(&token_input, backend)?;
-                    let shared_data = shared_output.as_f32()?;
-                    for d in 0..hidden_dim {
-                        output_data[b * hidden_dim + d] += gate_scale * shared_data[d];
+                // Run shared experts in parallel too
+                let shared_results: Vec<Vec<f32>> = self.shared_experts
+                    .par_iter()
+                    .map(|expert| {
+                        let out = expert.forward(&token_input, backend)
+                            .expect("shared expert forward failed");
+                        out.as_f32().unwrap().to_vec()
+                    })
+                    .collect();
+
+                for shared_data in &shared_results {
+                    let out_slice = &mut output_data[b * hidden_dim..(b + 1) * hidden_dim];
+                    for (o, &s) in out_slice.iter_mut().zip(shared_data.iter()) {
+                        *o += gate_scale * s;
                     }
                 }
             }

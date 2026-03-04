@@ -522,52 +522,51 @@ impl Engine {
         config: &ModelConfig,
         engine_config: &EngineConfig,
     ) -> (Arc<dyn Backend>, Box<dyn Model>) {
-        // Try full GPU-only inference first (CUDA only)
         #[cfg(feature = "cuda")]
         {
-            let architecture = model.architecture();
-            // Cap context length if max_context_len is configured
-            let gpu_seq_len = match engine_config.max_context_len {
-                Some(cap) if cap > 0 && cap < config.max_seq_len => {
-                    tracing::info!(
-                        "Capping GPU context length from {} to {} (max_context_len)",
-                        config.max_seq_len,
+            if cudarc::driver::CudaDevice::new(0).is_ok() {
+                let architecture = model.architecture();
+                let gpu_seq_len = match engine_config.max_context_len {
+                    Some(cap) if cap > 0 && cap < config.max_seq_len => {
+                        tracing::info!(
+                            "Capping GPU context length from {} to {} (max_context_len)",
+                            config.max_seq_len,
+                            cap
+                        );
                         cap
-                    );
-                    cap
+                    }
+                    _ => config.max_seq_len,
+                };
+                match crate::backend::cuda::gpu_only::GpuOnlyInference::from_model(
+                    model,
+                    gpu_seq_len,
+                ) {
+                    Ok(gpu) => {
+                        tracing::info!(
+                            "Using full GPU inference (attention + DeltaNet + MoE all on CUDA)"
+                        );
+                        let wrapper = crate::backend::cuda::gpu_only::GpuModelWrapper::new(
+                            gpu,
+                            config.clone(),
+                            architecture,
+                        );
+                        return (
+                            Arc::new(crate::backend::cpu::CpuBackend::new()),
+                            Box::new(wrapper),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error: GPU inference init failed: {}", e);
+                        eprintln!("The model was consumed during init. Please restart without --gpu.");
+                        std::process::exit(1);
+                    }
                 }
-                _ => config.max_seq_len,
-            };
-            match crate::backend::cuda::gpu_only::GpuOnlyInference::from_model(
-                &model,
-                gpu_seq_len,
-            ) {
-                Ok(gpu) => {
-                    tracing::info!(
-                        "Using GPU-only inference (all computation on GPU, minimal transfers)"
-                    );
-                    let wrapper = crate::backend::cuda::gpu_only::GpuModelWrapper::new(
-                        gpu,
-                        config.clone(),
-                        architecture,
-                    );
-                    // The Backend is only needed for InferenceContext construction;
-                    // computation goes through GpuModelWrapper directly.
-                    return (
-                        Arc::new(crate::backend::cpu::CpuBackend::new()),
-                        Box::new(wrapper),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "GPU-only inference init failed ({}), trying per-op GPU backend",
-                        e
-                    );
-                }
+            } else {
+                tracing::warn!("No CUDA device available, falling back to CPU");
             }
         }
 
-        // Fall back to per-op GPU backend
+        // No CUDA or device unavailable: CPU-only with per-op backend
         let backend = Self::select_gpu_backend(&model);
         (backend, Box::new(model))
     }

@@ -1796,11 +1796,9 @@ fn run_benchmark(
         eprintln!("Run {}/{}...", rep + 1, repetitions);
         ctx.reset();
 
-        // Benchmark prompt processing (prefill)
+        // Benchmark prompt processing (prefill) — batch all tokens at once
         let start = Instant::now();
-        for &token in &prompt_tokens {
-            let _ = model.forward(&[token], &mut ctx)?;
-        }
+        let _ = model.forward(&prompt_tokens, &mut ctx)?;
         let prompt_time = start.elapsed();
         prompt_times.push(prompt_time);
 

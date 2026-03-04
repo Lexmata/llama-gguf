@@ -531,9 +531,13 @@ impl ModelLoader {
 
         let mut experts = Vec::with_capacity(num_experts);
         for e in 0..num_experts {
-            let gate_proj = self.extract_expert_tensor(&gate_exps, e)?;
-            let up_proj = self.extract_expert_tensor(&up_exps, e)?;
-            let down_proj = self.extract_expert_tensor(&down_exps, e)?;
+            let mut gate_proj = self.extract_expert_tensor(&gate_exps, e)?;
+            let mut up_proj = self.extract_expert_tensor(&up_exps, e)?;
+            let mut down_proj = self.extract_expert_tensor(&down_exps, e)?;
+
+            gate_proj.set_name(format!("blk.{}.ffn_gate.{}.weight", layer_idx, e));
+            up_proj.set_name(format!("blk.{}.ffn_up.{}.weight", layer_idx, e));
+            down_proj.set_name(format!("blk.{}.ffn_down.{}.weight", layer_idx, e));
 
             experts.push(MoeExpert {
                 gate_proj,
@@ -544,11 +548,14 @@ impl ModelLoader {
 
         // Load shared experts if present (Qwen3Next)
         let mut shared_experts = Vec::new();
-        if let (Some(gate_shexp), Some(up_shexp), Some(down_shexp)) = (
+        if let (Some(mut gate_shexp), Some(mut up_shexp), Some(mut down_shexp)) = (
             self.try_load_tensor(&format!("{}.ffn_gate_shexp.weight", prefix)),
             self.try_load_tensor(&format!("{}.ffn_up_shexp.weight", prefix)),
             self.try_load_tensor(&format!("{}.ffn_down_shexp.weight", prefix)),
         ) {
+            gate_shexp.set_name(format!("blk.{}.ffn_gate_shexp.0.weight", layer_idx));
+            up_shexp.set_name(format!("blk.{}.ffn_up_shexp.0.weight", layer_idx));
+            down_shexp.set_name(format!("blk.{}.ffn_down_shexp.0.weight", layer_idx));
             shared_experts.push(MoeExpert {
                 gate_proj: gate_shexp,
                 up_proj: up_shexp,

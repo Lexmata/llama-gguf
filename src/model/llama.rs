@@ -119,6 +119,33 @@ impl LlamaModel {
         &self.layers
     }
 
+    /// Decompose the model into its parts for GPU hybrid inference.
+    /// The layers are moved out to avoid duplicating the weights.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        ModelConfig,
+        Tensor,
+        Vec<TransformerLayer>,
+        RMSNorm,
+        Linear,
+        Architecture,
+        Vec<bool>,
+        Option<DeltaNetConfig>,
+    ) {
+        (
+            self.config,
+            self.token_embedding,
+            self.layers,
+            self.norm,
+            self.output,
+            self.architecture,
+            self.recurrent_mask,
+            self.deltanet_config,
+        )
+    }
+
     /// Get final normalization layer
     pub fn norm(&self) -> &RMSNorm {
         &self.norm
@@ -224,9 +251,10 @@ impl Model for LlamaModel {
 
     fn forward(&self, tokens: &[u32], ctx: &mut InferenceContext) -> ModelResult<Tensor> {
         let backend = ctx.backend.as_ref();
+        let num_tokens = tokens.len();
 
         // Check context length
-        let new_pos = ctx.position + tokens.len();
+        let new_pos = ctx.position + num_tokens;
         if new_pos > self.config.max_seq_len {
             return Err(ModelError::ContextLengthExceeded {
                 current: new_pos,
@@ -234,47 +262,42 @@ impl Model for LlamaModel {
             });
         }
 
-        // Dequantize the embedding table ONCE for all tokens in this forward
-        // pass.  Previously, embed_tokens() dequantized the entire table for
-        // every single token, making prefill cost O(n × vocab × hidden) instead
-        // of O(vocab × hidden).
         let embedding_data = self.dequantize_embeddings(backend)?;
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
 
-        // Pre-allocate a reusable hidden-state buffer.
-        let mut hidden_buf = vec![0.0f32; hidden_size];
-
-        // Process each token sequentially through all layers.
-        // Tokens must be processed one at a time because each token's KV cache
-        // entry at position `p` must be populated before the next token at
-        // position `p+1` can attend to it.
-        for (token_offset, &token) in tokens.iter().enumerate() {
-            let current_pos = ctx.position + token_offset;
+        // Build per-token hidden states from embeddings
+        let mut hiddens: Vec<Tensor> = Vec::with_capacity(num_tokens);
+        for &token in tokens {
             let token_idx = token as usize;
-
             if token_idx >= vocab_size {
                 return Err(ModelError::InvalidMetadata {
                     key: "token".into(),
                     message: format!("Token ID {} exceeds vocab size {}", token, vocab_size),
                 });
             }
-
-            // Look up embedding from cached (dequantized) table — O(hidden_size) copy.
             let src = token_idx * hidden_size;
-            hidden_buf.copy_from_slice(&embedding_data[src..src + hidden_size]);
+            hiddens.push(Tensor::from_f32(
+                &embedding_data[src..src + hidden_size],
+                vec![hidden_size],
+            )?);
+        }
 
-            let mut hidden = Tensor::from_f32(&hidden_buf, vec![hidden_size])?;
-
-            // Run through transformer layers
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
+        // Layer-first ordering: process ALL tokens through each layer before
+        // moving to the next. This keeps each layer's weight matrices hot in
+        // CPU cache across all tokens, dramatically reducing memory bandwidth
+        // during prefill (each ~32MB weight set is read once from RAM instead
+        // of once per token).
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            for (token_offset, hidden) in hiddens.iter_mut().enumerate() {
+                let current_pos = ctx.position + token_offset;
                 let recurrent_state = ctx
                     .recurrent_state
                     .as_mut()
                     .and_then(|rs| rs.states[layer_idx].as_mut());
 
-                hidden = layer.forward(
-                    &hidden,
+                *hidden = layer.forward(
+                    hidden,
                     &mut ctx.kv_cache.k_cache[layer_idx],
                     &mut ctx.kv_cache.v_cache[layer_idx],
                     current_pos,
@@ -284,17 +307,13 @@ impl Model for LlamaModel {
                     recurrent_state,
                 )?;
             }
-
-            // Keep the last hidden state for logits (reuse buffer on next iter).
-            if token_offset + 1 == tokens.len() {
-                // Last token — compute logits from this hidden state.
-                ctx.position = new_pos;
-                ctx.kv_cache.seq_len = new_pos;
-                return self.compute_logits(&hidden, backend);
-            }
         }
 
-        Err(ModelError::ConfigError("No tokens to process".into()))
+        ctx.position = new_pos;
+        ctx.kv_cache.seq_len = new_pos;
+
+        // Compute logits from the last token's hidden state
+        self.compute_logits(hiddens.last().unwrap(), backend)
     }
 
     fn config(&self) -> &ModelConfig {

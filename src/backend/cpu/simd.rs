@@ -740,139 +740,250 @@ unsafe fn rms_norm_neon(x: &[f32], weight: &[f32], inv_rms: f32, out: &mut [f32]
 }
 
 // =============================================================================
-// Quantized Dot Product (SIMD-optimized Q4_0)
+// Fused Quantized Dot Products
 // =============================================================================
+//
+// These compute dot(dequant(blocks), x) without materializing the full
+// dequantized vector, saving both the allocation and the extra memory read.
 
-use crate::tensor::quant::BlockQ4_0;
+use crate::tensor::quant::{BlockQ4_0, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8K};
 
-/// SIMD-optimized dot product with Q4_0 quantized weights
+/// Fused dot product: Q4_0 blocks against f32 vector (32 elements/block)
 pub fn dot_q4_0(weights: &[BlockQ4_0], x: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if has_avx2() {
-            return unsafe { dot_q4_0_avx2(weights, x) };
-        }
-        dot_q4_0_scalar(weights, x)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { dot_q4_0_neon(weights, x) };
-    }
-
-    // Scalar fallback
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    dot_q4_0_scalar(weights, x)
-}
-
-fn dot_q4_0_scalar(weights: &[BlockQ4_0], x: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     let mut offset = 0;
 
     for block in weights {
         let d = block.d.to_f32();
+        let mut acc_lo = 0.0f32;
+        let mut acc_hi = 0.0f32;
 
         for i in 0..16 {
             let byte = block.qs[i];
-            let lo = ((byte & 0x0F) as i32 - 8) as f32;
-            let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-
-            sum += lo * d * x[offset + i];
-            sum += hi * d * x[offset + i + 16];
+            acc_lo += ((byte & 0x0F) as i32 - 8) as f32 * x[offset + i];
+            acc_hi += (((byte >> 4) & 0x0F) as i32 - 8) as f32 * x[offset + i + 16];
         }
 
+        sum += d * (acc_lo + acc_hi);
         offset += 32;
     }
 
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn dot_q4_0_avx2(weights: &[BlockQ4_0], x: &[f32]) -> f32 {
-    let mut sum = _mm256_setzero_ps();
+/// Fused dot product: Q8_0 blocks against f32 vector (32 elements/block)
+pub fn dot_q8_0(weights: &[BlockQ8_0], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
     let mut offset = 0;
-
-    let _mask_lo = _mm256_set1_epi8(0x0F);
-    let _sub8 = _mm256_set1_epi8(8);
 
     for block in weights {
         let d = block.d.to_f32();
-        let _vd = _mm256_set1_ps(d);
+        let mut acc = 0.0f32;
 
-        // Load 16 bytes of quantized data
-        let q_bytes = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
-
-        // Expand to 32 int8 values
-        let _q_lo = _mm256_cvtepu8_epi16(q_bytes);
-
-        // Extract low and high nibbles - this is simplified, full impl would be more complex
-        // For now, use scalar for the inner loop
-        for i in 0..16 {
-            let byte = block.qs[i];
-            let lo = ((byte & 0x0F) as i32 - 8) as f32;
-            let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-
-            let x_lo = x[offset + i];
-            let x_hi = x[offset + i + 16];
-
-            // Accumulate
-            let contrib_lo = lo * d * x_lo;
-            let contrib_hi = hi * d * x_hi;
-
-            sum = _mm256_add_ps(sum, _mm256_set1_ps(contrib_lo + contrib_hi));
+        for i in 0..32 {
+            acc += block.qs[i] as f32 * x[offset + i];
         }
 
+        sum += d * acc;
         offset += 32;
     }
 
-    hsum_avx2(sum)
+    sum
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_q4_0_neon(weights: &[BlockQ4_0], x: &[f32]) -> f32 {
-    let mut sum = vdupq_n_f32(0.0);
-    let mut offset = 0;
+/// Fused dot product: Q4_K blocks against f32 vector (256 elements/block)
+///
+/// Separates the scale*q and dmin*min terms so that the inner loops only
+/// accumulate integer-weighted sums, multiplying by the per-sub-block
+/// scale/min factors once per 32-element group.
+pub fn dot_q4_k(weights: &[BlockQ4K], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut x_off = 0;
 
     for block in weights {
         let d = block.d.to_f32();
-        let vd = vdupq_n_f32(d);
+        let dmin = block.dmin.to_f32();
 
-        // Process 4 elements at a time from each half (lo/hi nibbles)
-        // Each block has 16 bytes = 32 nibbles = 32 values
-        for chunk in 0..4 {
-            let chunk_offset = chunk * 4;
-
-            // Extract 4 lo nibbles and 4 hi nibbles
-            let mut lo_vals = [0.0f32; 4];
-            let mut hi_vals = [0.0f32; 4];
-
-            for i in 0..4 {
-                let byte = block.qs[chunk_offset + i];
-                lo_vals[i] = ((byte & 0x0F) as i32 - 8) as f32;
-                hi_vals[i] = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-            }
-
-            // Load x values
-            let x_lo = vld1q_f32(x.as_ptr().add(offset + chunk_offset));
-            let x_hi = vld1q_f32(x.as_ptr().add(offset + chunk_offset + 16));
-
-            // Load quantized values as f32
-            let q_lo = vld1q_f32(lo_vals.as_ptr());
-            let q_hi = vld1q_f32(hi_vals.as_ptr());
-
-            // Compute: sum += d * q * x
-            let scaled_lo = vmulq_f32(q_lo, vd);
-            let scaled_hi = vmulq_f32(q_hi, vd);
-
-            sum = vfmaq_f32(sum, scaled_lo, x_lo);
-            sum = vfmaq_f32(sum, scaled_hi, x_hi);
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        for j in 0..4 {
+            scales[j] = block.scales[j] & 0x3F;
+            mins[j] = block.scales[j + 4] & 0x3F;
+        }
+        for j in 4..8 {
+            scales[j] = (block.scales[j + 4] & 0x0F) | ((block.scales[j - 4] >> 6) << 4);
+            mins[j] = ((block.scales[j + 4] >> 4) & 0x0F) | ((block.scales[j] >> 6) << 4);
         }
 
-        offset += 32;
+        let mut qs_ptr = 0;
+        let mut is = 0;
+
+        for _ in 0..4 {
+            let d1 = d * scales[is] as f32;
+            let m1 = dmin * mins[is] as f32;
+            let d2 = d * scales[is + 1] as f32;
+            let m2 = dmin * mins[is + 1] as f32;
+
+            let mut q_acc1 = 0.0f32;
+            let mut x_acc1 = 0.0f32;
+            for l in 0..32 {
+                let q = (block.qs[qs_ptr + l] & 0x0F) as f32;
+                q_acc1 += q * x[x_off + l];
+                x_acc1 += x[x_off + l];
+            }
+            sum += d1 * q_acc1 - m1 * x_acc1;
+            x_off += 32;
+
+            let mut q_acc2 = 0.0f32;
+            let mut x_acc2 = 0.0f32;
+            for l in 0..32 {
+                let q = ((block.qs[qs_ptr + l] >> 4) & 0x0F) as f32;
+                q_acc2 += q * x[x_off + l];
+                x_acc2 += x[x_off + l];
+            }
+            sum += d2 * q_acc2 - m2 * x_acc2;
+            x_off += 32;
+
+            qs_ptr += 32;
+            is += 2;
+        }
     }
 
-    vaddvq_f32(sum)
+    sum
+}
+
+/// Fused dot product: Q5_K blocks against f32 vector (256 elements/block)
+pub fn dot_q5_k(weights: &[BlockQ5K], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut x_off = 0;
+
+    for block in weights {
+        let d = block.d.to_f32();
+        let dmin = block.dmin.to_f32();
+
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        for j in 0..4 {
+            scales[j] = block.scales[j] & 0x3F;
+            mins[j] = block.scales[j + 4] & 0x3F;
+        }
+        for j in 4..8 {
+            scales[j] = (block.scales[j + 4] & 0x0F) | ((block.scales[j - 4] >> 6) << 4);
+            mins[j] = ((block.scales[j + 4] >> 4) & 0x0F) | ((block.scales[j] >> 6) << 4);
+        }
+
+        let mut ql_ptr = 0;
+        let mut is = 0;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+
+        for _ in 0..4 {
+            let d1 = d * scales[is] as f32;
+            let m1 = dmin * mins[is] as f32;
+            let d2 = d * scales[is + 1] as f32;
+            let m2 = dmin * mins[is + 1] as f32;
+
+            let mut q_acc1 = 0.0f32;
+            let mut x_acc1 = 0.0f32;
+            for l in 0..32 {
+                let lo4 = (block.qs[ql_ptr + l] & 0x0F) as f32;
+                let hi5 = if block.qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+                q_acc1 += (lo4 + hi5) * x[x_off + l];
+                x_acc1 += x[x_off + l];
+            }
+            sum += d1 * q_acc1 - m1 * x_acc1;
+            x_off += 32;
+
+            let mut q_acc2 = 0.0f32;
+            let mut x_acc2 = 0.0f32;
+            for l in 0..32 {
+                let hi4 = ((block.qs[ql_ptr + l] >> 4) & 0x0F) as f32;
+                let hi5 = if block.qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+                q_acc2 += (hi4 + hi5) * x[x_off + l];
+                x_acc2 += x[x_off + l];
+            }
+            sum += d2 * q_acc2 - m2 * x_acc2;
+            x_off += 32;
+
+            ql_ptr += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    sum
+}
+
+/// Fused dot product: Q6_K blocks against f32 vector (256 elements/block)
+pub fn dot_q6_k(weights: &[BlockQ6K], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut x_off = 0;
+
+    for block in weights {
+        let d = block.d.to_f32();
+
+        for n in 0..2 {
+            let ql_base = n * 64;
+            let qh_base = n * 32;
+            let sc_base = n * 8;
+
+            for l in 0..32 {
+                let is = l / 16;
+
+                let q1 = ((block.ql[ql_base + l] & 0x0F)
+                    | ((block.qh[qh_base + l] & 0x03) << 4)) as i32
+                    - 32;
+                let q2 = ((block.ql[ql_base + l + 32] & 0x0F)
+                    | (((block.qh[qh_base + l] >> 2) & 0x03) << 4))
+                    as i32
+                    - 32;
+                let q3 = ((block.ql[ql_base + l] >> 4)
+                    | (((block.qh[qh_base + l] >> 4) & 0x03) << 4))
+                    as i32
+                    - 32;
+                let q4 = ((block.ql[ql_base + l + 32] >> 4)
+                    | (((block.qh[qh_base + l] >> 6) & 0x03) << 4))
+                    as i32
+                    - 32;
+
+                let out_base = n * 128;
+                let s1 = block.scales[sc_base + is] as f32;
+                let s2 = block.scales[sc_base + is + 2] as f32;
+                let s3 = block.scales[sc_base + is + 4] as f32;
+                let s4 = block.scales[sc_base + is + 6] as f32;
+
+                sum += d * s1 * q1 as f32 * x[x_off + out_base + l];
+                sum += d * s2 * q2 as f32 * x[x_off + out_base + l + 32];
+                sum += d * s3 * q3 as f32 * x[x_off + out_base + l + 64];
+                sum += d * s4 * q4 as f32 * x[x_off + out_base + l + 96];
+            }
+        }
+
+        x_off += 256;
+    }
+
+    sum
+}
+
+/// Fused dot product: Q8_K blocks against f32 vector (256 elements/block)
+pub fn dot_q8_k(weights: &[BlockQ8K], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut offset = 0;
+
+    for block in weights {
+        let d = block.d;
+        let mut acc = 0.0f32;
+
+        for i in 0..256 {
+            acc += block.qs[i] as f32 * x[offset + i];
+        }
+
+        sum += d * acc;
+        offset += 256;
+    }
+
+    sum
 }
 
 // =============================================================================

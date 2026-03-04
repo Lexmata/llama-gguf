@@ -847,10 +847,206 @@ __global__ void attention_multihead(const float* q,
     }
 }
 
+// ============================================================================
+// Weighted accumulation: out[i] += scale * x[i]
+// ============================================================================
+
+__global__ void scaled_add_f32(float* out, const float* x, float scale, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] += scale * x[idx];
+    }
+}
+
+// ============================================================================
+// DeltaNet: Depthwise 1D Convolution + SiLU
+// ============================================================================
+//
+// conv_state: [(kernel_size-1), channels] ring buffer
+// qkv_in: [channels] current input
+// conv_w: [channels * kernel_size] (GGML: weight[ch * ks + ki])
+// conv_out: [channels] = silu(conv(state, qkv))
+// Updates conv_state in-place.
+
+__global__ void deltanet_conv1d_silu(
+    float* conv_state,
+    const float* qkv_in,
+    const float* conv_w,
+    float* conv_out,
+    int channels,
+    int kernel_size
+) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels) return;
+
+    int buf_len = kernel_size - 1;
+
+    float sum = 0.0f;
+    for (int ki = 0; ki < buf_len; ki++) {
+        sum += conv_state[ki * channels + ch] * conv_w[ch * kernel_size + ki];
+    }
+    sum += qkv_in[ch] * conv_w[ch * kernel_size + (kernel_size - 1)];
+
+    // SiLU
+    float sig = 1.0f / (1.0f + expf(-sum));
+    conv_out[ch] = sum * sig;
+
+    // Update state: shift left and append current input
+    // Each thread handles its own channel - no race
+    for (int ki = 0; ki < buf_len - 1; ki++) {
+        conv_state[ki * channels + ch] = conv_state[(ki + 1) * channels + ch];
+    }
+    conv_state[(buf_len - 1) * channels + ch] = qkv_in[ch];
+}
+
+// ============================================================================
+// DeltaNet: Full recurrent state update + gated RMS norm output
+// ============================================================================
+//
+// One block per value head. Single thread per block handles all per-head math
+// (head dimensions are small ~64-128, so GPU parallelism is across heads).
+//
+// conv_out: [qkv_dim] - output of conv1d+silu
+// gate_z: [d_inner] - output of gate projection
+// ba_raw: [num_k_heads * ba_per_group] - beta/alpha from ssm_ba projection
+// ssm_a: [num_v_heads] - decay multiplier
+// dt_bias: [num_v_heads] - decay bias
+// norm_w: [head_v_dim] - RMS norm weights
+// ssm_state: [num_v_heads * head_v_dim * head_k_dim] - recurrent state (modified)
+// output: [d_inner] - final output before output projection
+
+// config_buf: [num_v_heads, num_k_heads, head_v_dim, head_k_dim, kv_ratio, d_inner, qkv_dim]
+// norm_eps passed as separate float parameter
+__global__ void deltanet_recurrent(
+    float* ssm_state,
+    const float* conv_out,
+    const float* gate_z,
+    const float* ba_raw,
+    const float* ssm_a,
+    const float* dt_bias,
+    const float* norm_w,
+    float* output,
+    const int* config_buf,
+    float norm_eps
+) {
+    int num_v_heads = config_buf[0];
+    int num_k_heads = config_buf[1];
+    int head_v_dim  = config_buf[2];
+    int head_k_dim  = config_buf[3];
+    int kv_ratio    = config_buf[4];
+
+    int vh = blockIdx.x;
+    if (vh >= num_v_heads) return;
+    if (threadIdx.x != 0) return;
+
+    int kh = vh / kv_ratio;
+    int r = vh % kv_ratio;
+
+    // Beta and alpha from ba_raw
+    int ba_per_group = 2 * kv_ratio;
+    int group_offset = kh * ba_per_group;
+    float beta_raw = ba_raw[group_offset + r];
+    float alpha_raw = ba_raw[group_offset + kv_ratio + r];
+
+    float beta = 1.0f / (1.0f + expf(-beta_raw));
+
+    // Gate: softplus(alpha + dt_bias) * ssm_a
+    float gate_val = alpha_raw + dt_bias[vh];
+    float gate;
+    if (gate_val > 20.0f) gate = gate_val;
+    else gate = logf(1.0f + expf(gate_val));
+    gate *= ssm_a[vh];
+
+    // Q, K, V offsets into conv_out
+    // Layout: [Q: num_k_heads*head_k_dim | K: num_k_heads*head_k_dim | V: d_inner]
+    int q_dim = num_k_heads * head_k_dim;
+    int q_offset = kh * head_k_dim;          // Q for this v-head's k-head
+    int k_offset = q_dim + kh * head_k_dim;  // K for this v-head's k-head
+    int v_offset = q_dim + q_dim + vh * head_v_dim;
+
+    // L2 normalize Q (per k-head)
+    float q_norm_sq = 0.0f;
+    for (int i = 0; i < head_k_dim; i++) {
+        float val = conv_out[q_offset + i];
+        q_norm_sq += val * val;
+    }
+    float q_inv_norm = rsqrtf(q_norm_sq + 1e-6f);
+    float q_scale = rsqrtf((float)head_k_dim);
+
+    // L2 normalize K (per k-head)
+    float k_norm_sq = 0.0f;
+    for (int i = 0; i < head_k_dim; i++) {
+        float val = conv_out[k_offset + i];
+        k_norm_sq += val * val;
+    }
+    float k_inv_norm = rsqrtf(k_norm_sq + 1e-6f);
+
+    // State pointer for this head
+    int s_offset = vh * head_v_dim * head_k_dim;
+    float* s = ssm_state + s_offset;
+
+    // Decay state: s *= exp(gate)
+    float decay = expf(gate);
+    if (decay > 1e10f) decay = 1e10f;
+    for (int i = 0; i < head_v_dim * head_k_dim; i++) {
+        s[i] *= decay;
+    }
+
+    // sk = S^T @ k_normalized → [head_v_dim]
+    // S is [head_v_dim, head_k_dim], k is [head_k_dim]
+    // sk[vi] = sum_ki(S[vi, ki] * k[ki])
+    for (int vi = 0; vi < head_v_dim; vi++) {
+        float dot = 0.0f;
+        for (int ki = 0; ki < head_k_dim; ki++) {
+            float k_val = conv_out[k_offset + ki] * k_inv_norm;
+            dot += s[vi * head_k_dim + ki] * k_val;
+        }
+
+        // delta = (v - sk) * beta
+        float v_val = conv_out[v_offset + vi];
+        float delta = (v_val - dot) * beta;
+
+        // State update: s[vi, :] += delta * k^T
+        for (int ki = 0; ki < head_k_dim; ki++) {
+            float k_val = conv_out[k_offset + ki] * k_inv_norm;
+            s[vi * head_k_dim + ki] += delta * k_val;
+        }
+    }
+
+    // Output: o = S @ q_normalized → [head_v_dim]
+    int o_offset = vh * head_v_dim;
+    for (int vi = 0; vi < head_v_dim; vi++) {
+        float dot = 0.0f;
+        for (int ki = 0; ki < head_k_dim; ki++) {
+            float q_val = conv_out[q_offset + ki] * q_inv_norm * q_scale;
+            dot += s[vi * head_k_dim + ki] * q_val;
+        }
+        output[o_offset + vi] = dot;
+    }
+
+    // Gated RMS norm: output = rms_norm(output) * silu(gate_z)
+    float ss = 0.0f;
+    for (int d = 0; d < head_v_dim; d++) {
+        float val = output[o_offset + d];
+        ss += val * val;
+    }
+    float rms = sqrtf(ss / (float)head_v_dim + norm_eps);
+    float rms_inv = 1.0f / rms;
+
+    int norm_w_len = head_v_dim;
+    for (int d = 0; d < head_v_dim; d++) {
+        float normed = output[o_offset + d] * rms_inv * norm_w[d % norm_w_len];
+        float z = gate_z[o_offset + d];
+        float silu_z = z / (1.0f + expf(-z));
+        output[o_offset + d] = normed * silu_z;
+    }
+}
+
 } // extern "C"
 "#;
 
 /// Compiled CUDA kernels
+#[allow(dead_code)]
 pub struct CudaKernels {
     // Element-wise
     pub add_f32: CudaFunction,
@@ -893,6 +1089,13 @@ pub struct CudaKernels {
 
     // Attention
     pub attention_single_head: CudaFunction,
+
+    // DeltaNet
+    pub deltanet_conv1d_silu: CudaFunction,
+    pub deltanet_recurrent: CudaFunction,
+
+    // MoE accumulation
+    pub scaled_add_f32: CudaFunction,
 }
 
 impl CudaKernels {
@@ -931,6 +1134,9 @@ impl CudaKernels {
                     "attention_single_head",
                     "update_kv_cache",
                     "attention_multihead",
+                    "scaled_add_f32",
+                    "deltanet_conv1d_silu",
+                    "deltanet_recurrent",
                 ],
             )
             .map_err(|e| BackendError::InitializationFailed(format!("PTX load failed: {}", e)))?;
@@ -1045,6 +1251,27 @@ impl CudaKernels {
                 .ok_or_else(|| {
                     BackendError::InitializationFailed(
                         "Kernel 'attention_multihead' not found".into(),
+                    )
+                })?,
+            scaled_add_f32: device
+                .get_func("llama_kernels", "scaled_add_f32")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'scaled_add_f32' not found".into(),
+                    )
+                })?,
+            deltanet_conv1d_silu: device
+                .get_func("llama_kernels", "deltanet_conv1d_silu")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'deltanet_conv1d_silu' not found".into(),
+                    )
+                })?,
+            deltanet_recurrent: device
+                .get_func("llama_kernels", "deltanet_recurrent")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'deltanet_recurrent' not found".into(),
                     )
                 })?,
         })

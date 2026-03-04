@@ -915,19 +915,39 @@ pub fn dequantize(src: &Tensor, out: &mut Tensor) -> BackendResult<()> {
     }
 }
 
-/// Quantized matrix-vector multiply
+/// Quantized matrix-vector multiply: out = A @ x
 ///
-/// For now, this dequantizes and uses regular matvec.
-/// TODO: Implement fused quantized matmul for better performance.
+/// A is [m, k] quantized (row-major), x is [k] f32, out is [m] f32.
+/// Each row of A is a contiguous sequence of quantized blocks.
 pub fn matvec_q(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-    // For now, dequantize first then use regular matvec
-    // This is not optimal but correct
+    check_dtype(b, DType::F32)?;
+    check_dtype(out, DType::F32)?;
 
-    // Dequantize the matrix first, then use regular matvec
-    let mut a_f32 = Tensor::zeros(a.shape().to_vec(), DType::F32);
+    if a.ndim() != 2 || b.ndim() != 1 {
+        return Err(BackendError::InvalidArgument(
+            "matvec_q requires 2D quantized matrix and 1D vector".into(),
+        ));
+    }
 
-    dequantize(a, &mut a_f32)?;
-    matvec(&a_f32, b, out)
+    let (m, k) = (a.shape()[0], a.shape()[1]);
+    if b.shape()[0] != k {
+        return Err(BackendError::ShapeMismatch {
+            expected: vec![k],
+            got: b.shape().to_vec(),
+        });
+    }
+    if out.shape() != [m] {
+        return Err(BackendError::ShapeMismatch {
+            expected: vec![m],
+            got: out.shape().to_vec(),
+        });
+    }
+
+    let x = b.as_f32()?;
+    let out_data = out.as_f32_mut()?;
+    let raw = a.data();
+
+    fused_matvec_dispatch(a.dtype(), raw, x, out_data, m, k)
 }
 
 /// Vector-matrix multiplication: out = a @ b where a is 1D, b is 2D
@@ -981,16 +1001,201 @@ pub fn vec_mat(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
     Ok(())
 }
 
-/// Quantized vector-matrix multiply
+/// Fused quantized vector-matrix multiply: out = x @ W
 ///
-/// For now, this dequantizes and uses regular vec_mat.
-/// TODO: Implement fused quantized vecmat for better performance.
+/// x is [k] f32, W is [k, n] quantized (GGUF column-major), out is [n] f32.
+/// Each column of W is a contiguous sequence of quantized blocks.
 pub fn vec_mat_q(a: &Tensor, b: &Tensor, out: &mut Tensor) -> BackendResult<()> {
-    // Dequantize the matrix first, then use regular vec_mat
-    let mut b_f32 = Tensor::zeros(b.shape().to_vec(), DType::F32);
+    check_dtype(a, DType::F32)?;
+    check_dtype(out, DType::F32)?;
 
-    dequantize(b, &mut b_f32)?;
-    vec_mat(a, &b_f32, out)
+    if a.ndim() != 1 || b.ndim() != 2 {
+        return Err(BackendError::InvalidArgument(
+            "vec_mat_q requires 1D vector and 2D quantized matrix".into(),
+        ));
+    }
+
+    let k = a.shape()[0];
+    let (k2, n) = (b.shape()[0], b.shape()[1]);
+
+    if k != k2 {
+        return Err(BackendError::ShapeMismatch {
+            expected: vec![k],
+            got: vec![k2],
+        });
+    }
+    if out.shape() != [n] {
+        return Err(BackendError::ShapeMismatch {
+            expected: vec![n],
+            got: out.shape().to_vec(),
+        });
+    }
+
+    let x = a.as_f32()?;
+    let out_data = out.as_f32_mut()?;
+    let raw = b.data();
+
+    fused_vecmat_dispatch(b.dtype(), raw, x, out_data, k, n)
+}
+
+// =============================================================================
+// Fused Quantized Dispatch Helpers
+// =============================================================================
+
+/// Dispatch fused matvec (A @ x) over quantized row data.
+/// Each of the `m` rows consists of `k/block_size` contiguous blocks.
+fn fused_matvec_dispatch(
+    dtype: DType,
+    raw: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> BackendResult<()> {
+    use super::simd;
+
+    match dtype {
+        DType::Q4_0 => {
+            let all: &[BlockQ4_0] = bytemuck::cast_slice(raw);
+            let bpc = k / 32;
+            out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                *o = simd::dot_q4_0(&all[i * bpc..(i + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q8_0 => {
+            let all: &[BlockQ8_0] = bytemuck::cast_slice(raw);
+            let bpc = k / 32;
+            out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                *o = simd::dot_q8_0(&all[i * bpc..(i + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q4K => {
+            let all: &[BlockQ4K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                *o = simd::dot_q4_k(&all[i * bpc..(i + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q5K => {
+            let all: &[BlockQ5K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                *o = simd::dot_q5_k(&all[i * bpc..(i + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q6K => {
+            let all: &[BlockQ6K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                *o = simd::dot_q6_k(&all[i * bpc..(i + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q8K => {
+            let all: &[BlockQ8K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                *o = simd::dot_q8_k(&all[i * bpc..(i + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        _ => {
+            let mut a_f32 = Tensor::zeros(vec![m, k], DType::F32);
+            let a_tensor = Tensor::new(raw.to_vec(), vec![m, k], dtype)
+                .map_err(|e| BackendError::InvalidArgument(format!("tensor rebuild: {e}")))?;
+            dequantize(&a_tensor, &mut a_f32)?;
+            let a_data = a_f32.as_f32()?;
+            out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                *o = simd::dot_f32(&a_data[i * k..(i + 1) * k], x);
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Dispatch fused vecmat (x @ W) over quantized column data.
+/// W is [k, n] in GGUF column-major: each of the `n` columns consists of
+/// `k/block_size` contiguous blocks.
+fn fused_vecmat_dispatch(
+    dtype: DType,
+    raw: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    k: usize,
+    n: usize,
+) -> BackendResult<()> {
+    use super::simd;
+
+    match dtype {
+        DType::Q4_0 => {
+            let all: &[BlockQ4_0] = bytemuck::cast_slice(raw);
+            let bpc = k / 32;
+            out.par_iter_mut().enumerate().for_each(|(j, o)| {
+                *o = simd::dot_q4_0(&all[j * bpc..(j + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q8_0 => {
+            let all: &[BlockQ8_0] = bytemuck::cast_slice(raw);
+            let bpc = k / 32;
+            out.par_iter_mut().enumerate().for_each(|(j, o)| {
+                *o = simd::dot_q8_0(&all[j * bpc..(j + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q4K => {
+            let all: &[BlockQ4K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(j, o)| {
+                *o = simd::dot_q4_k(&all[j * bpc..(j + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q5K => {
+            let all: &[BlockQ5K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(j, o)| {
+                *o = simd::dot_q5_k(&all[j * bpc..(j + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q6K => {
+            let all: &[BlockQ6K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(j, o)| {
+                *o = simd::dot_q6_k(&all[j * bpc..(j + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        DType::Q8K => {
+            let all: &[BlockQ8K] = bytemuck::cast_slice(raw);
+            let bpc = k / 256;
+            out.par_iter_mut().enumerate().for_each(|(j, o)| {
+                *o = simd::dot_q8_k(&all[j * bpc..(j + 1) * bpc], x);
+            });
+            Ok(())
+        }
+        _ => {
+            let mut b_f32 = Tensor::zeros(vec![k, n], DType::F32);
+            let b_tensor = Tensor::new(raw.to_vec(), vec![k, n], dtype)
+                .map_err(|e| BackendError::InvalidArgument(format!("tensor rebuild: {e}")))?;
+            dequantize(&b_tensor, &mut b_f32)?;
+            vec_mat_f32_inner(x, b_f32.as_f32()?, out, k, n);
+            Ok(())
+        }
+    }
+}
+
+fn vec_mat_f32_inner(x: &[f32], w: &[f32], out: &mut [f32], k: usize, n: usize) {
+    use super::simd;
+    out.par_iter_mut().enumerate().for_each(|(j, o)| {
+        *o = simd::dot_f32(x, &w[j * k..(j + 1) * k]);
+    });
+    let _ = n;
 }
 
 // =============================================================================

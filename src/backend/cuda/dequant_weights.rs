@@ -66,7 +66,7 @@ impl GpuWeightStore {
         let numel = tensor.numel();
         let shape = tensor.shape().to_vec();
 
-        let key = tensor.name().unwrap_or(name).to_string();
+        let key = name.to_string();
 
         let f32_data: Vec<f32> = if tensor.dtype() == DType::F32 {
             tensor.as_f32()?.to_vec()
@@ -103,7 +103,7 @@ impl GpuWeightStore {
         let dtype = tensor.dtype();
         let shape = tensor.shape().to_vec();
         let numel = tensor.numel();
-        let key = tensor.name().unwrap_or(name).to_string();
+        let key = name.to_string();
 
         if !dtype.is_quantized() {
             return Err(BackendError::OperationFailed(format!(
@@ -230,10 +230,17 @@ fn upload_weight(store: &mut GpuWeightStore, name: &str, tensor: &Tensor) -> Bac
     }
 }
 
-/// Upload all model weights to GPU.
+/// Upload ALL model weights to GPU for full GPU inference.
 ///
-/// Large weight matrices are kept in quantized format when a GPU matmul kernel
-/// exists for their dtype. Small weights (norms, biases) are always stored as f32.
+/// Permanently uploads:
+/// - Attention layer weights (Q/K/V/O projections + biases)
+/// - DeltaNet layer weights (QKV, gate, ssm_ba, ssm_out, conv1d, ssm_a, dt_bias, ssm_norm)
+/// - MoE router weights + shared expert weights
+/// - All normalization weights, embeddings, output projection
+///
+/// MoE expert weights (512 per layer) are NOT pre-uploaded — they are streamed
+/// on-the-fly (only the 10 active experts per token per layer) via
+/// `upload_expert_weight`.
 pub fn upload_model_weights(
     device: Arc<CudaDevice>,
     layers: &[crate::model::TransformerLayer],
@@ -241,9 +248,10 @@ pub fn upload_model_weights(
     output: &crate::model::layers::Linear,
     norm: &crate::model::layers::RMSNorm,
 ) -> BackendResult<GpuWeightStore> {
+    use crate::model::layers::AttentionLayer;
+
     let mut store = GpuWeightStore::new(device);
 
-    // Embedding: always dequantize to f32 (looked up by index on CPU)
     store.upload("token_embd.weight", embedding)?;
 
     for (i, layer) in layers.iter().enumerate() {
@@ -251,49 +259,86 @@ pub fn upload_model_weights(
             eprintln!("  Layer {}/{}", i + 1, layers.len());
         }
 
-        // Upload attention weights if this layer has them (DeltaNet/recurrent layers don't)
-        if let Some(attn) = layer.attention() {
-            upload_weight(
-                &mut store,
-                &format!("blk.{}.attn_q.weight", i),
-                &attn.wq.weight,
-            )?;
-            upload_weight(
-                &mut store,
-                &format!("blk.{}.attn_k.weight", i),
-                &attn.wk.weight,
-            )?;
-            upload_weight(
-                &mut store,
-                &format!("blk.{}.attn_v.weight", i),
-                &attn.wv.weight,
-            )?;
-            upload_weight(
-                &mut store,
-                &format!("blk.{}.attn_output.weight", i),
-                &attn.wo.weight,
-            )?;
+        match &layer.attn_layer {
+            AttentionLayer::FullAttention(attn) => {
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.attn_q.weight", i),
+                    &attn.wq.weight,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.attn_k.weight", i),
+                    &attn.wk.weight,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.attn_v.weight", i),
+                    &attn.wv.weight,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.attn_output.weight", i),
+                    &attn.wo.weight,
+                )?;
 
-            if let Some(ref bias) = attn.wq.bias {
-                store.upload(&format!("blk.{}.attn_q.bias", i), bias)?;
+                if let Some(ref bias) = attn.wq.bias {
+                    store.upload(&format!("blk.{}.attn_q.bias", i), bias)?;
+                }
+                if let Some(ref bias) = attn.wk.bias {
+                    store.upload(&format!("blk.{}.attn_k.bias", i), bias)?;
+                }
+                if let Some(ref bias) = attn.wv.bias {
+                    store.upload(&format!("blk.{}.attn_v.bias", i), bias)?;
+                }
             }
-            if let Some(ref bias) = attn.wk.bias {
-                store.upload(&format!("blk.{}.attn_k.bias", i), bias)?;
+            AttentionLayer::DeltaNet(dn) => {
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.attn_qkv.weight", i),
+                    &dn.attn_qkv.weight,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.attn_gate.weight", i),
+                    &dn.attn_gate.weight,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ssm_ba.weight", i),
+                    &dn.ssm_ba.weight,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ssm_out.weight", i),
+                    &dn.ssm_out.weight,
+                )?;
+                store.upload(
+                    &format!("blk.{}.ssm_conv1d.weight", i),
+                    &dn.ssm_conv1d_weight,
+                )?;
+                store.upload(&format!("blk.{}.ssm_a", i), &dn.ssm_a)?;
+                store.upload(&format!("blk.{}.ssm_dt.bias", i), &dn.ssm_dt_bias)?;
+                store.upload(
+                    &format!("blk.{}.ssm_norm.weight", i),
+                    &dn.ssm_norm.weight,
+                )?;
             }
-            if let Some(ref bias) = attn.wv.bias {
-                store.upload(&format!("blk.{}.attn_v.bias", i), bias)?;
-            }
-        } else {
-            tracing::debug!("Layer {}: skipping attention weight upload (recurrent layer)", i);
         }
 
-        // Norms are always f32 (small 1D tensors)
         store.upload(
             &format!("blk.{}.attn_norm.weight", i),
             &layer.attn_norm.weight,
         )?;
 
-        // FFN weights — quantized path when possible (dense FFN only)
+        if let Some(ref pan) = layer.post_attn_norm {
+            store.upload(
+                &format!("blk.{}.post_attention_norm.weight", i),
+                &pan.weight,
+            )?;
+        }
+
+        // Dense FFN weights
         if let Some(ffn) = layer.ffn() {
             upload_weight(
                 &mut store,
@@ -312,17 +357,42 @@ pub fn upload_model_weights(
             )?;
         }
 
-        // FFN norm
+        // MoE router + shared expert weights
+        if let Some(moe) = layer.moe() {
+            store.upload(
+                &format!("blk.{}.ffn_gate_inp.weight", i),
+                &moe.router.weight,
+            )?;
+            for (se_idx, se) in moe.shared_experts.iter().enumerate() {
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ffn_gate_shexp.{}.weight", i, se_idx),
+                    &se.gate_proj,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ffn_up_shexp.{}.weight", i, se_idx),
+                    &se.up_proj,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ffn_down_shexp.{}.weight", i, se_idx),
+                    &se.down_proj,
+                )?;
+            }
+            if let Some(ref gate_w) = moe.shared_expert_gate {
+                store.upload(&format!("blk.{}.ffn_gate_shexp_gate", i), gate_w)?;
+            }
+        }
+
         store.upload(
             &format!("blk.{}.ffn_norm.weight", i),
             &layer.ffn_norm.weight,
         )?;
     }
 
-    // Final norm (f32)
     store.upload("output_norm.weight", &norm.weight)?;
 
-    // Output projection — quantized path when possible
     upload_weight(&mut store, "output.weight", &output.weight)?;
     if let Some(ref bias) = output.bias {
         store.upload("output.bias", bias)?;
@@ -332,8 +402,21 @@ pub fn upload_model_weights(
     eprintln!(
         "Upload complete: {} weights, {:.1} MB VRAM",
         store.len(),
-        vram_mb
+        vram_mb,
     );
 
     Ok(store)
+}
+
+/// Upload a single expert weight to GPU for on-the-fly MoE streaming.
+///
+/// Returns a `QuantizedGpuWeight` or `GpuWeight` that can be used for one
+/// matmul, then dropped. The caller should reuse a name-keyed scratch slot
+/// to avoid repeated allocations.
+pub fn upload_expert_weight_to_store(
+    store: &mut GpuWeightStore,
+    name: &str,
+    tensor: &Tensor,
+) -> BackendResult<()> {
+    upload_weight(store, name, tensor)
 }

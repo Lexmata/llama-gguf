@@ -615,6 +615,14 @@ impl TransformerLayer {
         }
     }
 
+    /// Get the MoE layer if this is not a dense FFN layer
+    pub fn moe(&self) -> Option<&super::moe::MoeLayer> {
+        match &self.ffn_layer {
+            FfnLayer::Dense(_) => None,
+            FfnLayer::Moe(moe) => Some(moe),
+        }
+    }
+
     /// Whether this is a recurrent (delta-net) layer
     pub fn is_recurrent(&self) -> bool {
         matches!(&self.attn_layer, AttentionLayer::DeltaNet(_))
