@@ -13,6 +13,7 @@ pub mod cache;
 mod config;
 mod kv_quantized;
 pub mod deltanet;
+pub mod mamba;
 pub mod embeddings;
 mod error;
 pub mod layers;
@@ -35,7 +36,11 @@ pub use embeddings::{
     cosine_similarity, dot_product, euclidean_distance, find_nearest,
 };
 pub use error::{ModelError, ModelResult};
-pub use deltanet::{DeltaNetConfig, DeltaNetLayer, DeltaNetState, RecurrentState};
+pub use deltanet::{
+    DeltaNetConfig, DeltaNetLayer, DeltaNetState, RecurrentConfig, RecurrentLayerState,
+    RecurrentState,
+};
+pub use mamba::{MambaConfig, MambaState, MambaLayer};
 pub use bert::{BertLayer, BertModel};
 pub use layers::{AttentionLayer, FfnLayer, TransformerLayer};
 pub use llama::LlamaModel;
@@ -197,12 +202,12 @@ impl InferenceContext {
     }
 
     /// Create inference context with recurrent state for SSM layers.
-    /// `is_recurrent[i]` marks which layers are delta-net layers.
+    /// `is_recurrent[i]` marks which layers are recurrent (DeltaNet or Mamba).
     pub fn new_with_recurrent(
         config: &ModelConfig,
         backend: Arc<dyn Backend>,
         is_recurrent: &[bool],
-        dn_config: &DeltaNetConfig,
+        rc: &RecurrentConfig,
     ) -> Self {
         Self {
             kv_cache: KVCache::new(
@@ -216,7 +221,7 @@ impl InferenceContext {
             recurrent_state: Some(RecurrentState::new(
                 config.num_layers,
                 is_recurrent,
-                dn_config,
+                rc,
             )),
         }
     }

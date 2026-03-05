@@ -11,6 +11,7 @@ use crate::tensor::{DType, Tensor};
 use super::Architecture;
 use super::config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType, RopeType};
 use super::deltanet::{DeltaNetConfig, DeltaNetLayer};
+use super::mamba::{MambaConfig, MambaLayer};
 use super::error::{ModelError, ModelResult};
 use super::layers::{
     Attention, AttentionLayer, FeedForward, FfnLayer, LayerNorm, Linear, NoGateFeedForward,
@@ -112,7 +113,9 @@ impl ModelLoader {
                 let nh = get_u32(&format!("{}.attention.head_count", arch))? as usize;
                 let nkv = get_u32(&format!("{}.attention.head_count_kv", arch))
                     .unwrap_or(nh as u32) as usize;
-                let hd = hidden_size / nh;
+                let hd = get_u32(&format!("{}.attention.key_length", arch))
+                    .map(|v| v as usize)
+                    .unwrap_or(hidden_size / nh);
                 (nh, nkv, hd)
             };
 
@@ -320,7 +323,7 @@ impl ModelLoader {
         }
 
         // Load final normalization
-        let norm_weight = self.load_tensor("output_norm.weight")?;
+        let norm_weight = self.apply_gemma_norm_weight_offset(self.load_tensor("output_norm.weight")?)?;
         let norm = RMSNorm::new(norm_weight, self.config.norm_eps)?;
 
         // Load output projection (may be tied to embeddings)
@@ -523,17 +526,19 @@ impl ModelLoader {
         )
     }
 
-    /// Get the DeltaNet config for creating recurrent state.
-    /// Returns None if the model has no SSM layers.
+    /// Get the DeltaNet config for creating recurrent state (Qwen3Next).
+    /// Returns None if the model has no SSM layers or is Mamba.
     pub fn deltanet_config(&self) -> Option<DeltaNetConfig> {
-        if !self.config.has_ssm() {
+        if !self.config.has_ssm()
+            || matches!(self.architecture, Architecture::Mamba | Architecture::Mamba2)
+        {
             return None;
         }
         let d_inner = self.config.ssm_d_inner;
         let d_state = self.config.ssm_d_state;
         let num_v_heads = self.config.ssm_dt_rank;
-        let num_k_heads = self.config.ssm_n_group;
-        let head_v_dim = d_inner / num_v_heads;
+        let num_k_heads = self.config.ssm_n_group.max(1);
+        let head_v_dim = d_inner / num_v_heads.max(1);
         let head_k_dim = d_state;
         let conv_kernel = self.config.ssm_conv_kernel;
         let q_dim = num_k_heads * head_k_dim;
@@ -552,6 +557,25 @@ impl ModelLoader {
         })
     }
 
+    /// Get the recurrent config (DeltaNet or Mamba) for creating inference context.
+    pub fn recurrent_config(&self) -> Option<super::deltanet::RecurrentConfig> {
+        if !self.config.has_ssm() {
+            return None;
+        }
+        if matches!(self.architecture, Architecture::Mamba | Architecture::Mamba2) {
+            Some(super::deltanet::RecurrentConfig::Mamba(MambaConfig {
+                d_inner: self.config.ssm_d_inner,
+                d_state: self.config.ssm_d_state,
+                dt_rank: self.config.ssm_dt_rank,
+                conv_kernel: self.config.ssm_conv_kernel.max(1),
+            }))
+        } else if let Some(dn) = self.deltanet_config() {
+            Some(super::deltanet::RecurrentConfig::DeltaNet(dn))
+        } else {
+            None
+        }
+    }
+
     /// Load a single transformer layer
     fn load_transformer_layer(&self, layer_idx: usize) -> ModelResult<TransformerLayer> {
         let prefix = format!("blk.{}", layer_idx);
@@ -562,15 +586,17 @@ impl ModelLoader {
             .try_load_tensor(&format!("{}.attn_norm.weight", prefix))
             .or_else(|| self.try_load_tensor(&format!("{}.norm.weight", prefix)))
             .ok_or_else(|| ModelError::MissingTensor(format!("{}.attn_norm.weight", prefix)))?;
+        let attn_norm_weight = self.apply_gemma_norm_weight_offset(attn_norm_weight)?;
         let attn_norm = RMSNorm::new(attn_norm_weight, self.config.norm_eps)?;
 
         // Load attention based on available tensors
         let attn_layer = self.load_attention_layer(layer_idx)?;
 
-        // Post-attention normalization (Qwen3Next has this separate from ffn_norm)
+        // Post-attention normalization (Gemma2, Cohere2, Qwen3Next)
         let post_attn_norm =
             if let Some(w) = self.try_load_tensor(&format!("{}.post_attention_norm.weight", prefix))
             {
+                let w = self.apply_gemma_norm_weight_offset(w)?;
                 Some(RMSNorm::new(w, self.config.norm_eps)?)
             } else {
                 None
@@ -589,7 +615,10 @@ impl ModelLoader {
             });
 
         let ffn_norm = match ffn_norm_weight {
-            Ok(w) => RMSNorm::new(w, self.config.norm_eps)?,
+            Ok(w) => {
+                let w = self.apply_gemma_norm_weight_offset(w)?;
+                RMSNorm::new(w, self.config.norm_eps)?
+            }
             Err(_) => {
                 if post_attn_norm.is_some() || is_mamba || self.config.use_parallel_residual {
                     // Parallel residual models (Phi-2, GPT-NeoX, GPT-J) share the
@@ -665,6 +694,7 @@ impl ModelLoader {
         // Post-FFN normalization (Gemma2, Cohere2)
         let post_ffn_norm =
             if let Some(w) = self.try_load_tensor(&format!("{}.post_ffw_norm.weight", prefix)) {
+                let w = self.apply_gemma_norm_weight_offset(w)?;
                 Some(RMSNorm::new(w, self.config.norm_eps)?)
             } else {
                 None
@@ -706,8 +736,8 @@ impl ModelLoader {
             && self.try_load_tensor(&format!("{}.ssm_in.weight", prefix)).is_some()
         {
             // Pure Mamba/Mamba2 SSM layer (no attention tensors at all)
-            let dn = self.load_mamba_layer(layer_idx)?;
-            Ok(AttentionLayer::DeltaNet(Box::new(dn)))
+            let mamba = self.load_mamba_layer(layer_idx)?;
+            Ok(AttentionLayer::Mamba(Box::new(mamba)))
         } else {
             Err(ModelError::MissingTensor(format!(
                 "{}.attn_q.weight or {}.attn_qkv.weight or {}.ssm_in.weight",
@@ -769,6 +799,10 @@ impl ModelLoader {
             let q_norm = RMSNorm::new(q_norm_w, self.config.norm_eps)?;
             let k_norm = RMSNorm::new(k_norm_w, self.config.norm_eps)?;
             attention.set_qk_norms(q_norm, k_norm);
+        }
+
+        if self.config.attn_logit_softcap > 0.0 {
+            attention.set_attn_logit_softcap(self.config.attn_logit_softcap);
         }
 
         Ok(attention)
@@ -990,96 +1024,49 @@ impl ModelLoader {
 
     /// Load a pure Mamba/Mamba2 SSM layer from Mamba-specific tensor names.
     ///
-    /// Mamba uses different tensor names than DeltaNet (Qwen3Next). This maps
-    /// Mamba tensors to DeltaNetLayer for structural compatibility. Note: the
-    /// DeltaNet forward pass implements the delta rule, not the Mamba SSM
-    /// formulation—correct Mamba inference requires a dedicated forward path.
-    fn load_mamba_layer(&self, layer_idx: usize) -> ModelResult<DeltaNetLayer> {
+    /// Mamba v1 uses: ssm_in, ssm_conv1d, ssm_x, ssm_dt, ssm_a, ssm_d, ssm_out.
+    fn load_mamba_layer(&self, layer_idx: usize) -> ModelResult<MambaLayer> {
         let prefix = format!("blk.{}", layer_idx);
         let cfg = &self.config;
 
         let d_inner = cfg.ssm_d_inner;
         let d_state = cfg.ssm_d_state;
-        let num_v_heads = cfg.ssm_dt_rank.max(1);
-        let num_k_heads = cfg.ssm_n_group.max(1);
-        let head_v_dim = d_inner / num_v_heads;
-        let head_k_dim = d_state;
-        let conv_kernel = cfg.ssm_conv_kernel;
-        let q_dim = num_k_heads * head_k_dim;
-        let k_dim = num_k_heads * head_k_dim;
-        let qkv_dim = q_dim + k_dim + d_inner;
+        let dt_rank = cfg.ssm_dt_rank;
+        let conv_kernel = cfg.ssm_conv_kernel.max(1);
 
-        let dn_config = DeltaNetConfig {
+        let mamba_config = MambaConfig {
             d_inner,
             d_state,
-            num_v_heads,
-            num_k_heads,
-            head_v_dim,
-            head_k_dim,
+            dt_rank,
             conv_kernel,
-            qkv_dim,
         };
 
-        // ssm_in.weight [hidden_size, d_inner] -> attn_qkv. DeltaNet expects qkv_dim.
-        // Mamba's ssm_in outputs d_inner; pad with zeros to reach qkv_dim.
-        let ssm_in_weight = self.load_tensor(&format!("{}.ssm_in.weight", prefix))?;
-        let ssm_in_shape = ssm_in_weight.shape();
-        let hidden = ssm_in_shape[0];
-        let ssm_in_out = ssm_in_shape[1];
+        let ssm_in = Linear::new(
+            self.load_tensor(&format!("{}.ssm_in.weight", prefix))?,
+            None,
+        )?;
 
-        let attn_qkv = if ssm_in_out >= qkv_dim {
-            Linear::new(ssm_in_weight, None)?
-        } else {
-            // Pad: [hidden, qkv_dim] with zeros for first (qkv_dim - ssm_in_out) cols
-            let ssm_in_data = ssm_in_weight.as_f32()?;
-            let mut padded = vec![0.0f32; hidden * qkv_dim];
-            for row in 0..hidden {
-                let src = row * ssm_in_out;
-                let dst = row * qkv_dim + (qkv_dim - ssm_in_out);
-                padded[dst..dst + ssm_in_out].copy_from_slice(&ssm_in_data[src..src + ssm_in_out]);
-            }
-            let padded_t = Tensor::from_f32(&padded, vec![hidden, qkv_dim])?;
-            Linear::new(padded_t, None)?
-        };
+        let ssm_conv1d_weight = self.load_tensor(&format!("{}.ssm_conv1d.weight", prefix))?;
+        let ssm_conv1d_bias = self.try_load_tensor(&format!("{}.ssm_conv1d.bias", prefix));
 
-        // attn_gate: Mamba has no gate; use bias-only placeholder so silu(z) ≈ 1
-        let gate_bias = vec![10.0f32; d_inner];
-        let gate_weight = Tensor::from_f32(&vec![0.0f32; hidden * d_inner], vec![hidden, d_inner])?;
-        let gate_bias_t = Tensor::from_f32(&gate_bias, vec![d_inner])?;
-        let attn_gate = Linear::new(gate_weight, Some(gate_bias_t))?;
+        let ssm_x = Linear::new(
+            self.load_tensor(&format!("{}.ssm_x.weight", prefix))?,
+            None,
+        )?;
 
-        // ssm_ba: Mamba has ssm_dt (time step), not beta/alpha. Create placeholder.
-        let ba_out = num_v_heads * 2;
-        let ssm_ba_weight =
-            Tensor::from_f32(&vec![0.0f32; hidden * ba_out], vec![hidden, ba_out])?;
-        let ssm_ba = Linear::new(ssm_ba_weight, None)?;
+        let ssm_dt = Linear::new(
+            self.load_tensor(&format!("{}.ssm_dt.weight", prefix))?,
+            None,
+        )?;
 
-        // ssm_conv1d: Mamba has [conv_kernel, d_inner]. DeltaNet expects [conv_kernel, qkv_dim].
-        let mamba_conv = self.load_tensor(&format!("{}.ssm_conv1d.weight", prefix))?;
-        let mamba_conv_shape = mamba_conv.shape();
-        let mamba_conv_out = mamba_conv_shape[1];
-
-        let ssm_conv1d_weight = if mamba_conv_out >= qkv_dim {
-            mamba_conv
-        } else {
-            let mamba_data = mamba_conv.as_f32()?;
-            let mut padded = vec![0.0f32; conv_kernel * qkv_dim];
-            for row in 0..conv_kernel {
-                let dst = row * qkv_dim + (qkv_dim - mamba_conv_out);
-                padded[dst..dst + mamba_conv_out].copy_from_slice(
-                    &mamba_data[row * mamba_conv_out..(row + 1) * mamba_conv_out],
-                );
-            }
-            Tensor::from_f32(&padded, vec![conv_kernel, qkv_dim])?
-        };
-
-        let ssm_a = self.load_tensor(&format!("{}.ssm_a", prefix))?;
         let ssm_dt_bias = self.load_tensor(&format!("{}.ssm_dt.bias", prefix))?;
+        let ssm_a = self.load_tensor(&format!("{}.ssm_a", prefix))?;
+        let ssm_d = self.try_load_tensor(&format!("{}.ssm_d", prefix));
 
-        let ssm_norm_weight = self
-            .try_load_tensor(&format!("{}.ssm_norm.weight", prefix))
-            .unwrap_or_else(|| Tensor::from_f32(&vec![1.0f32; d_inner], vec![d_inner]).unwrap());
-        let ssm_norm = RMSNorm::new(ssm_norm_weight, cfg.norm_eps)?;
+        let ssm_norm = match self.try_load_tensor(&format!("{}.ssm_norm.weight", prefix)) {
+            Some(w) => Some(RMSNorm::new(w, cfg.norm_eps)?),
+            None => None,
+        };
 
         let ssm_out = Linear::new(
             self.load_tensor(&format!("{}.ssm_out.weight", prefix))?,
@@ -1087,20 +1074,22 @@ impl ModelLoader {
         )?;
 
         tracing::info!(
-            "Layer {}: loaded Mamba SSM (d_inner={}, d_state={}, v_heads={}, k_heads={}, conv={})",
-            layer_idx, d_inner, d_state, num_v_heads, num_k_heads, conv_kernel
+            "Layer {}: loaded Mamba SSM (d_inner={}, d_state={}, dt_rank={}, conv={})",
+            layer_idx, d_inner, d_state, dt_rank, conv_kernel
         );
 
-        Ok(DeltaNetLayer {
-            config: dn_config,
-            attn_qkv,
-            attn_gate,
-            ssm_ba,
+        Ok(MambaLayer {
+            ssm_in,
             ssm_conv1d_weight,
-            ssm_a,
+            ssm_conv1d_bias,
+            ssm_x,
+            ssm_dt,
             ssm_dt_bias,
+            ssm_a,
+            ssm_d,
             ssm_norm,
             ssm_out,
+            config: mamba_config,
         })
     }
 
@@ -1294,6 +1283,15 @@ impl ModelLoader {
                 t.set_name(name);
                 t
             })
+    }
+
+    /// Gemma's HuggingFace implementation uses `(1 + weight)` in RMS norm, but
+    /// the GGUF converter (`convert_hf_to_gguf.py`) already adds +1 to norm
+    /// weights during conversion. The GGUF file contains final-form weights,
+    /// so no adjustment is needed at load time. This method is kept as a no-op
+    /// identity for documentation.
+    fn apply_gemma_norm_weight_offset(&self, weight: Tensor) -> ModelResult<Tensor> {
+        Ok(weight)
     }
 
     /// Load a tensor from the GGUF file

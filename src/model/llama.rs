@@ -13,9 +13,10 @@ use crate::backend::Backend;
 use crate::tensor::{DType, Tensor};
 
 use super::config::ModelConfig;
-use super::deltanet::DeltaNetConfig;
+use super::deltanet::RecurrentConfig;
 use super::error::{ModelError, ModelResult};
 use super::layers::{Linear, RMSNorm, TransformerLayer};
+use super::deltanet::DeltaNetConfig;
 use super::{Architecture, InferenceContext, Model};
 
 /// LLaMA model implementation
@@ -32,10 +33,10 @@ pub struct LlamaModel {
     output: Linear,
     /// Model architecture variant
     architecture: Architecture,
-    /// Per-layer recurrent flag (true = delta-net, false = full attention)
+    /// Per-layer recurrent flag (true = delta-net or Mamba, false = full attention)
     recurrent_mask: Vec<bool>,
-    /// DeltaNet config (None if no recurrent layers)
-    deltanet_config: Option<DeltaNetConfig>,
+    /// Recurrent config (None if no recurrent layers)
+    recurrent_config: Option<RecurrentConfig>,
 }
 
 impl LlamaModel {
@@ -59,26 +60,37 @@ impl LlamaModel {
         let recurrent_mask: Vec<bool> = layers.iter().map(|l| l.is_recurrent()).collect();
         let has_recurrent = recurrent_mask.iter().any(|&r| r);
 
-        let deltanet_config = if has_recurrent && config.has_ssm() {
-            let d_inner = config.ssm_d_inner;
-            let d_state = config.ssm_d_state;
-            let num_v_heads = config.ssm_dt_rank;
-            let num_k_heads = config.ssm_n_group;
-            let head_v_dim = d_inner / num_v_heads;
-            let head_k_dim = d_state;
-            let conv_kernel = config.ssm_conv_kernel;
-            let q_dim = num_k_heads * head_k_dim;
-            let k_dim = num_k_heads * head_k_dim;
-            let qkv_dim = q_dim + k_dim + d_inner;
-            Some(DeltaNetConfig {
-                d_inner,
-                d_state,
-                num_v_heads,
-                num_k_heads,
-                head_v_dim,
-                head_k_dim,
-                conv_kernel,
-                qkv_dim,
+        let recurrent_config = if has_recurrent && config.has_ssm() {
+            let is_mamba =
+                matches!(architecture, Architecture::Mamba | Architecture::Mamba2);
+            Some(if is_mamba {
+                RecurrentConfig::Mamba(super::mamba::MambaConfig {
+                    d_inner: config.ssm_d_inner,
+                    d_state: config.ssm_d_state,
+                    dt_rank: config.ssm_dt_rank,
+                    conv_kernel: config.ssm_conv_kernel.max(1),
+                })
+            } else {
+                let d_inner = config.ssm_d_inner;
+                let d_state = config.ssm_d_state;
+                let num_v_heads = config.ssm_dt_rank;
+                let num_k_heads = config.ssm_n_group.max(1);
+                let head_v_dim = d_inner / num_v_heads.max(1);
+                let head_k_dim = d_state;
+                let conv_kernel = config.ssm_conv_kernel;
+                let q_dim = num_k_heads * head_k_dim;
+                let k_dim = num_k_heads * head_k_dim;
+                let qkv_dim = q_dim + k_dim + d_inner;
+                RecurrentConfig::DeltaNet(DeltaNetConfig {
+                    d_inner,
+                    d_state,
+                    num_v_heads,
+                    num_k_heads,
+                    head_v_dim,
+                    head_k_dim,
+                    conv_kernel,
+                    qkv_dim,
+                })
             })
         } else {
             None
@@ -92,18 +104,18 @@ impl LlamaModel {
             output,
             architecture,
             recurrent_mask,
-            deltanet_config,
+            recurrent_config,
         })
     }
 
     /// Create an InferenceContext appropriate for this model (with recurrent state if needed).
     pub fn create_context(&self, backend: Arc<dyn Backend>) -> InferenceContext {
-        if let Some(ref dn_cfg) = self.deltanet_config {
+        if let Some(ref rc) = self.recurrent_config {
             InferenceContext::new_with_recurrent(
                 &self.config,
                 backend,
                 &self.recurrent_mask,
-                dn_cfg,
+                rc,
             )
         } else {
             InferenceContext::new(&self.config, backend)
@@ -133,7 +145,7 @@ impl LlamaModel {
         Linear,
         Architecture,
         Vec<bool>,
-        Option<DeltaNetConfig>,
+        Option<RecurrentConfig>,
     ) {
         (
             self.config,
@@ -143,7 +155,7 @@ impl LlamaModel {
             self.output,
             self.architecture,
             self.recurrent_mask,
-            self.deltanet_config,
+            self.recurrent_config,
         )
     }
 
@@ -292,6 +304,17 @@ impl Model for LlamaModel {
                 &embedding_data[src..src + hidden_size],
                 vec![hidden_size],
             )?);
+        }
+
+        // Gemma scales token embeddings by sqrt(hidden_size)
+        if self.architecture.is_gemma() {
+            let scale = (hidden_size as f32).sqrt();
+            for hidden in &mut hiddens {
+                let data = hidden.as_f32_mut()?;
+                for v in data.iter_mut() {
+                    *v *= scale;
+                }
+            }
         }
 
         // Layer-first ordering: process ALL tokens through each layer before

@@ -550,6 +550,18 @@ impl Architecture {
         matches!(self, Self::Gemma2)
     }
 
+    /// Check if this architecture is in the Gemma family (uses weight+1 in RMS norm)
+    pub fn is_gemma(&self) -> bool {
+        matches!(
+            self,
+            Self::Gemma
+                | Self::Gemma2
+                | Self::Gemma3
+                | Self::Gemma3N
+                | Self::GemmaEmbedding
+        )
+    }
+
     /// Check if this architecture uses LayerNorm (not RMSNorm)
     pub fn uses_layer_norm(&self) -> bool {
         matches!(

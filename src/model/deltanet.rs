@@ -14,6 +14,7 @@ use crate::tensor::{DType, Tensor};
 
 use super::error::ModelResult;
 use super::layers::{Linear, RMSNorm};
+use super::mamba::{MambaConfig, MambaState};
 
 /// Configuration for a DeltaNet layer, derived from GGUF SSM metadata.
 #[derive(Debug, Clone)]
@@ -68,22 +69,55 @@ pub struct DeltaNetState {
     pub ssm_state: Vec<f32>,
 }
 
-/// Recurrent state for all layers in a Qwen3Next model.
+/// Per-layer recurrent state: either DeltaNet (Qwen3Next) or Mamba.
+#[derive(Debug, Clone)]
+pub enum RecurrentLayerState {
+    DeltaNet(DeltaNetState),
+    Mamba(MambaState),
+}
+
+impl RecurrentLayerState {
+    pub fn reset(&mut self) {
+        match self {
+            Self::DeltaNet(ds) => {
+                ds.conv_state.fill(0.0);
+                ds.ssm_state.fill(0.0);
+            }
+            Self::Mamba(ms) => ms.reset(),
+        }
+    }
+}
+
+/// Configuration for recurrent layers (DeltaNet or Mamba).
+#[derive(Debug, Clone)]
+pub enum RecurrentConfig {
+    DeltaNet(DeltaNetConfig),
+    Mamba(MambaConfig),
+}
+
+/// Recurrent state for all layers (Qwen3Next DeltaNet or Mamba).
 #[derive(Debug, Clone)]
 pub struct RecurrentState {
-    pub states: Vec<Option<DeltaNetState>>,
+    pub states: Vec<Option<RecurrentLayerState>>,
 }
 
 impl RecurrentState {
-    pub fn new(num_layers: usize, is_recurrent: &[bool], config: &DeltaNetConfig) -> Self {
+    pub fn new(num_layers: usize, is_recurrent: &[bool], config: &RecurrentConfig) -> Self {
         let states = (0..num_layers)
             .map(|i| {
                 if i < is_recurrent.len() && is_recurrent[i] {
-                    let conv_len = (config.conv_kernel - 1) * config.qkv_dim;
-                    let ssm_len = config.num_v_heads * config.head_v_dim * config.head_k_dim;
-                    Some(DeltaNetState {
-                        conv_state: vec![0.0; conv_len],
-                        ssm_state: vec![0.0; ssm_len],
+                    Some(match config {
+                        RecurrentConfig::DeltaNet(c) => {
+                            let conv_len = (c.conv_kernel - 1) * c.qkv_dim;
+                            let ssm_len = c.num_v_heads * c.head_v_dim * c.head_k_dim;
+                            RecurrentLayerState::DeltaNet(DeltaNetState {
+                                conv_state: vec![0.0; conv_len],
+                                ssm_state: vec![0.0; ssm_len],
+                            })
+                        }
+                        RecurrentConfig::Mamba(c) => {
+                            RecurrentLayerState::Mamba(MambaState::new(c))
+                        }
                     })
                 } else {
                     None
@@ -94,9 +128,8 @@ impl RecurrentState {
     }
 
     pub fn reset(&mut self) {
-        for ds in self.states.iter_mut().flatten() {
-            ds.conv_state.fill(0.0);
-            ds.ssm_state.fill(0.0);
+        for s in self.states.iter_mut().flatten() {
+            s.reset();
         }
     }
 }
