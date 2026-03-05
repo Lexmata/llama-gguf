@@ -301,39 +301,47 @@ fn flush_valid_utf8(buf: &mut Vec<u8>) -> String {
     text
 }
 
-/// GPT-2 byte-to-unicode mapping table.
+/// Build both directions of the GPT-2 byte ↔ unicode mapping.
 ///
 /// GPT-2 BPE maps every byte (0-255) to a printable Unicode character so that
 /// token strings are always valid Unicode. Printable ASCII and certain Latin-1
 /// bytes map to themselves; the remaining 68 bytes map to U+0100..U+0143.
-/// Decoding requires the inverse: Unicode char → original byte.
-fn build_gpt2_unicode_to_byte() -> HashMap<char, u8> {
-    let mut byte_to_unicode: Vec<(u8, char)> = Vec::with_capacity(256);
+fn build_gpt2_mappings() -> (HashMap<char, u8>, [char; 256]) {
+    let mut byte_to_unicode = ['\0'; 256];
 
-    // Bytes that map to their own Unicode code point:
-    //   ! (33) through ~ (126), ¡ (161) through ¬ (172), ® (174) through ÿ (255)
     let mut direct: Vec<u8> = Vec::new();
     direct.extend(33u8..=126);
     direct.extend(161u8..=172);
     direct.extend(174u8..=255);
 
     for &b in &direct {
-        byte_to_unicode.push((b, char::from(b)));
+        byte_to_unicode[b as usize] = char::from(b);
     }
 
-    // Remaining bytes map to U+0100 and up
     let mut n: u32 = 0;
     for b in 0u16..=255 {
         if !direct.contains(&(b as u8)) {
-            byte_to_unicode.push((b as u8, char::from_u32(256 + n).unwrap()));
+            byte_to_unicode[b as usize] = char::from_u32(256 + n).unwrap();
             n += 1;
         }
     }
 
-    byte_to_unicode
-        .into_iter()
-        .map(|(b, c)| (c, b))
-        .collect()
+    let unicode_to_byte: HashMap<char, u8> = byte_to_unicode
+        .iter()
+        .enumerate()
+        .map(|(b, &c)| (c, b as u8))
+        .collect();
+
+    (unicode_to_byte, byte_to_unicode)
+}
+
+/// A segment of text that has been split around special/control tokens.
+#[derive(Debug, Clone)]
+enum TextSegment {
+    /// Regular text to be encoded with BPE/SentencePiece
+    Text(String),
+    /// A control/special token that maps directly to a token ID
+    SpecialToken(u32),
 }
 
 /// Tokenizer loaded from GGUF metadata or HuggingFace tokenizer.json
@@ -358,6 +366,8 @@ pub struct Tokenizer {
     token_types: Vec<TokenType>,
     /// GPT-2 unicode-to-byte reverse mapping (only for GPT-2 tokenizers)
     gpt2_unicode_to_byte: Option<HashMap<char, u8>>,
+    /// GPT-2 byte-to-unicode forward mapping for encoding (only for GPT-2 tokenizers)
+    gpt2_byte_to_unicode: Option<[char; 256]>,
     /// HF normalizer pipeline component
     normalizer: Option<Normalizer>,
     /// HF pre-tokenizer pipeline component
@@ -366,6 +376,10 @@ pub struct Tokenizer {
     post_processor: Option<PostProcessor>,
     /// WordPiece continuation prefix (default "##")
     wordpiece_prefix: String,
+    /// Control token strings sorted by length (longest first) for greedy matching
+    control_token_strings: Vec<(String, u32)>,
+    /// Whether the GGUF explicitly defined a BOS token ID
+    pub has_explicit_bos: bool,
 }
 
 impl Tokenizer {
@@ -415,11 +429,29 @@ impl Tokenizer {
         // Load special tokens
         let special_tokens = Self::load_special_tokens(gguf);
 
-        let gpt2_unicode_to_byte = if uses_gpt2_bytes {
-            Some(build_gpt2_unicode_to_byte())
+        let (gpt2_unicode_to_byte, gpt2_byte_to_unicode) = if uses_gpt2_bytes {
+            let (u2b, b2u) = build_gpt2_mappings();
+            (Some(u2b), Some(b2u))
         } else {
-            None
+            (None, None)
         };
+
+        let has_explicit_bos = gguf.data.get_u32("tokenizer.ggml.bos_token_id").is_some();
+
+        let mut control_token_strings: Vec<(String, u32)> = token_types
+            .iter()
+            .enumerate()
+            .filter(|(_, tt)| **tt == TokenType::Control)
+            .filter_map(|(id, _)| {
+                let s = &id_to_token[id];
+                if !s.is_empty() {
+                    Some((s.clone(), id as u32))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        control_token_strings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         Ok(Self {
             token_to_id,
@@ -431,10 +463,13 @@ impl Tokenizer {
             vocab_size,
             token_types,
             gpt2_unicode_to_byte,
+            gpt2_byte_to_unicode,
             normalizer: None,
             pre_tokenizer: None,
             post_processor: None,
             wordpiece_prefix: "##".to_string(),
+            control_token_strings,
+            has_explicit_bos,
         })
     }
 
@@ -557,12 +592,57 @@ impl Tokenizer {
         }
     }
 
-    /// Encode text to token IDs
-    pub fn encode(&self, text: &str, add_bos: bool) -> TokenizerResult<Vec<u32>> {
-        let mut tokens = Vec::new();
+    /// Split text around control/special token strings.
+    ///
+    /// Scans `text` for any control token literal (e.g. `<|im_start|>`) and
+    /// splits it into alternating Text / SpecialToken segments. Uses greedy
+    /// longest-match so longer control tokens take priority.
+    fn split_with_special_tokens(&self, text: &str) -> Vec<TextSegment> {
+        if self.control_token_strings.is_empty() {
+            return vec![TextSegment::Text(text.to_string())];
+        }
 
+        let mut segments = Vec::new();
+        let mut remaining = text;
+
+        while !remaining.is_empty() {
+            let mut earliest_pos = remaining.len();
+            let mut matched_len = 0;
+            let mut matched_id = 0u32;
+
+            for (tok_str, tok_id) in &self.control_token_strings {
+                if let Some(pos) = remaining.find(tok_str.as_str()) {
+                    if pos < earliest_pos
+                        || (pos == earliest_pos && tok_str.len() > matched_len)
+                    {
+                        earliest_pos = pos;
+                        matched_len = tok_str.len();
+                        matched_id = *tok_id;
+                    }
+                }
+            }
+
+            if matched_len == 0 {
+                segments.push(TextSegment::Text(remaining.to_string()));
+                break;
+            }
+
+            if earliest_pos > 0 {
+                segments.push(TextSegment::Text(remaining[..earliest_pos].to_string()));
+            }
+            segments.push(TextSegment::SpecialToken(matched_id));
+            remaining = &remaining[earliest_pos + matched_len..];
+        }
+
+        segments
+    }
+
+    /// Encode a plain text segment (no special tokens) using the appropriate algorithm.
+    fn encode_text_segment(&self, text: &str) -> TokenizerResult<Vec<u32>> {
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
         if self.normalizer.is_some() || self.pre_tokenizer.is_some() {
-            // HuggingFace tokenizer pipeline
             let normalized = match &self.normalizer {
                 Some(n) => n.apply(text),
                 None => text.to_string(),
@@ -571,7 +651,7 @@ impl Tokenizer {
                 Some(pt) => pt.apply(&normalized),
                 None => vec![normalized],
             };
-
+            let mut tokens = Vec::new();
             for pre_token in &pre_tokens {
                 if pre_token.is_empty() {
                     continue;
@@ -588,37 +668,48 @@ impl Tokenizer {
                     }
                 }
             }
+            Ok(tokens)
+        } else if !self.merges.is_empty() {
+            self.encode_bpe(text)
+        } else {
+            self.encode_sentencepiece(text)
+        }
+    }
 
-            // Apply post-processor template (unless manually adding BOS)
-            if !add_bos {
-                if let Some(PostProcessor::TemplateProcessing { ref single, .. }) = self.post_processor {
-                    let mut processed = Vec::new();
-                    for elem in single {
-                        match elem {
-                            TemplateElement::SpecialToken { token_id, .. } => {
-                                processed.push(*token_id);
-                            }
-                            TemplateElement::Sequence { .. } => {
-                                processed.extend(&tokens);
-                            }
-                        }
-                    }
-                    return Ok(processed);
+    /// Encode text to token IDs
+    pub fn encode(&self, text: &str, add_bos: bool) -> TokenizerResult<Vec<u32>> {
+        let mut tokens = Vec::new();
+
+        if add_bos {
+            tokens.push(self.special_tokens.bos_token_id);
+        }
+
+        let segments = self.split_with_special_tokens(text);
+        for segment in segments {
+            match segment {
+                TextSegment::Text(t) => {
+                    tokens.extend(self.encode_text_segment(&t)?);
+                }
+                TextSegment::SpecialToken(id) => {
+                    tokens.push(id);
                 }
             }
+        }
 
-            if add_bos {
-                tokens.insert(0, self.special_tokens.bos_token_id);
-            }
-        } else {
-            // GGUF path (existing behavior)
-            if add_bos {
-                tokens.push(self.special_tokens.bos_token_id);
-            }
-            if !self.merges.is_empty() {
-                tokens.extend(self.encode_bpe(text)?);
-            } else {
-                tokens.extend(self.encode_sentencepiece(text)?);
+        if !add_bos {
+            if let Some(PostProcessor::TemplateProcessing { ref single, .. }) = self.post_processor {
+                let mut processed = Vec::new();
+                for elem in single {
+                    match elem {
+                        TemplateElement::SpecialToken { token_id, .. } => {
+                            processed.push(*token_id);
+                        }
+                        TemplateElement::Sequence { .. } => {
+                            processed.extend(&tokens);
+                        }
+                    }
+                }
+                return Ok(processed);
             }
         }
 
@@ -701,78 +792,170 @@ impl Tokenizer {
 
     /// BPE encoding algorithm
     fn encode_bpe(&self, text: &str) -> TokenizerResult<Vec<u32>> {
-        // For LLaMA-style tokenizers, we first try to match whole words/subwords
-        // then fall back to character-level
+        if self.gpt2_byte_to_unicode.is_some() {
+            return self.encode_bpe_gpt2(text);
+        }
 
         let mut result = Vec::new();
 
-        // Split text preserving whitespace (add space prefix for LLaMA)
         let text_with_prefix = if !text.starts_with(' ') && !text.is_empty() {
             format!(" {}", text)
         } else {
             text.to_string()
         };
 
-        // Process each segment
         for segment in self.split_into_segments(&text_with_prefix) {
             if segment.is_empty() {
                 continue;
             }
 
-            // Try to find the segment directly in vocabulary
             if let Some(&id) = self.token_to_id.get(&segment) {
                 result.push(id);
                 continue;
             }
 
-            // Convert to initial token sequence (characters or bytes)
             let mut tokens = self.text_to_initial_tokens(&segment)?;
-
-            // Apply BPE merges iteratively
-            loop {
-                if tokens.len() < 2 {
-                    break;
-                }
-
-                // Find the best merge (lowest priority number = highest priority)
-                let mut best_merge: Option<(usize, u32, usize)> = None; // (position, merged_id, priority)
-
-                for i in 0..tokens.len() - 1 {
-                    let pair = (tokens[i], tokens[i + 1]);
-                    if let Some(&(merged_id, priority)) = self.merges.get(&pair)
-                        && (best_merge.is_none() || priority < best_merge.unwrap().2)
-                    {
-                        best_merge = Some((i, merged_id, priority));
-                    }
-                }
-
-                // Apply the best merge if found
-                match best_merge {
-                    Some((pos, merged_id, _)) => {
-                        tokens[pos] = merged_id;
-                        tokens.remove(pos + 1);
-                    }
-                    None => break, // No more merges possible
-                }
-            }
-
+            self.apply_bpe_merges(&mut tokens);
             result.extend(tokens);
         }
 
         Ok(result)
     }
 
-    /// Split text into segments for BPE processing
+    /// GPT-2 byte-level BPE encoding.
+    ///
+    /// Converts input bytes through the GPT-2 byte→unicode mapping, splits
+    /// into pretokenized segments, and applies BPE merges on each.
+    fn encode_bpe_gpt2(&self, text: &str) -> TokenizerResult<Vec<u32>> {
+        let b2u = self.gpt2_byte_to_unicode.as_ref().unwrap();
+        let mut result = Vec::new();
+
+        for segment in Self::gpt2_pretokenize(text) {
+            if segment.is_empty() {
+                continue;
+            }
+
+            let mapped: String = segment.as_bytes().iter().map(|&b| b2u[b as usize]).collect();
+
+            if let Some(&id) = self.token_to_id.get(&mapped) {
+                result.push(id);
+                continue;
+            }
+
+            let mut tokens: Vec<u32> = Vec::with_capacity(mapped.len());
+            for ch in mapped.chars() {
+                let ch_str = ch.to_string();
+                if let Some(&id) = self.token_to_id.get(&ch_str) {
+                    tokens.push(id);
+                } else if let Some(unk_id) = self.special_tokens.unk_token_id {
+                    tokens.push(unk_id);
+                }
+            }
+
+            self.apply_bpe_merges(&mut tokens);
+            result.extend(tokens);
+        }
+
+        Ok(result)
+    }
+
+    /// Simple GPT-2 pretokenization: split text into chunks at word boundaries.
+    ///
+    /// Spaces attach to the following word. Newlines and other control
+    /// characters are their own chunks. Runs of letters, runs of digits
+    /// (up to 3), and individual punctuation are separate chunks.
+    fn gpt2_pretokenize(text: &str) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let ch = chars[i];
+
+            if ch == ' ' {
+                let mut chunk = String::new();
+                chunk.push(ch);
+                i += 1;
+                if i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    while i < chars.len()
+                        && !chars[i].is_whitespace()
+                        && (chars[i].is_alphanumeric() || chars[i] == '_')
+                    {
+                        chunk.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                chunks.push(chunk);
+            } else if ch == '\n' || ch == '\r' || ch == '\t' {
+                let mut chunk = String::new();
+                while i < chars.len()
+                    && (chars[i] == '\n' || chars[i] == '\r' || chars[i] == '\t')
+                {
+                    chunk.push(chars[i]);
+                    i += 1;
+                }
+                chunks.push(chunk);
+            } else if ch.is_alphabetic() || ch == '_' {
+                let mut chunk = String::new();
+                while i < chars.len() && (chars[i].is_alphabetic() || chars[i] == '_') {
+                    chunk.push(chars[i]);
+                    i += 1;
+                }
+                chunks.push(chunk);
+            } else if ch.is_ascii_digit() {
+                let mut chunk = String::new();
+                let mut count = 0;
+                while i < chars.len() && chars[i].is_ascii_digit() && count < 3 {
+                    chunk.push(chars[i]);
+                    i += 1;
+                    count += 1;
+                }
+                chunks.push(chunk);
+            } else {
+                chunks.push(ch.to_string());
+                i += 1;
+            }
+        }
+
+        chunks
+    }
+
+    /// Apply BPE merges iteratively until no more merges are possible.
+    fn apply_bpe_merges(&self, tokens: &mut Vec<u32>) {
+        loop {
+            if tokens.len() < 2 {
+                break;
+            }
+
+            let mut best_merge: Option<(usize, u32, usize)> = None;
+
+            for i in 0..tokens.len() - 1 {
+                let pair = (tokens[i], tokens[i + 1]);
+                if let Some(&(merged_id, priority)) = self.merges.get(&pair)
+                    && (best_merge.is_none() || priority < best_merge.unwrap().2)
+                {
+                    best_merge = Some((i, merged_id, priority));
+                }
+            }
+
+            match best_merge {
+                Some((pos, merged_id, _)) => {
+                    tokens[pos] = merged_id;
+                    tokens.remove(pos + 1);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Split text into segments for non-GPT-2 BPE processing
     fn split_into_segments(&self, text: &str) -> Vec<String> {
-        // Simple split: try to match known vocabulary entries greedily
-        // For proper implementation, this should handle regex patterns per tokenizer type
         let mut segments = Vec::new();
         let mut current = String::new();
 
         for ch in text.chars() {
             current.push(ch);
 
-            // Check if current string exists in vocab or if it's a word boundary
             if (ch.is_whitespace() || ch.is_ascii_punctuation()) && !current.is_empty() {
                 segments.push(current.clone());
                 current.clear();
@@ -786,20 +969,18 @@ impl Tokenizer {
         segments
     }
 
-    /// Convert text segment to initial token sequence
+    /// Convert text segment to initial token sequence (non-GPT-2 path)
     fn text_to_initial_tokens(&self, text: &str) -> TokenizerResult<Vec<u32>> {
         let mut tokens = Vec::new();
 
         for ch in text.chars() {
             let ch_str = ch.to_string();
 
-            // First try direct character lookup
             if let Some(&id) = self.token_to_id.get(&ch_str) {
                 tokens.push(id);
                 continue;
             }
 
-            // Try SentencePiece format (▁ prefix for space)
             if ch == ' '
                 && let Some(&id) = self.token_to_id.get("▁")
             {
@@ -807,7 +988,6 @@ impl Tokenizer {
                 continue;
             }
 
-            // Try byte fallback
             for byte in ch_str.as_bytes() {
                 let byte_token = format!("<0x{:02X}>", byte);
                 if let Some(&id) = self.token_to_id.get(&byte_token) {
@@ -1025,31 +1205,7 @@ impl Tokenizer {
         }
 
         let mut tokens = self.text_to_initial_tokens(text)?;
-
-        loop {
-            if tokens.len() < 2 {
-                break;
-            }
-
-            let mut best_merge: Option<(usize, u32, usize)> = None;
-            for i in 0..tokens.len() - 1 {
-                let pair = (tokens[i], tokens[i + 1]);
-                if let Some(&(merged_id, priority)) = self.merges.get(&pair)
-                    && (best_merge.is_none() || priority < best_merge.unwrap().2)
-                {
-                    best_merge = Some((i, merged_id, priority));
-                }
-            }
-
-            match best_merge {
-                Some((pos, merged_id, _)) => {
-                    tokens[pos] = merged_id;
-                    tokens.remove(pos + 1);
-                }
-                None => break,
-            }
-        }
-
+        self.apply_bpe_merges(&mut tokens);
         Ok(tokens)
     }
 
@@ -1532,10 +1688,11 @@ impl Tokenizer {
             .and_then(|v| v.as_str())
             .is_some_and(|t| t == "ByteLevel");
 
-        let gpt2_unicode_to_byte = if tokenizer_type == TokenizerType::BPE && uses_byte_level {
-            Some(build_gpt2_unicode_to_byte())
+        let (gpt2_unicode_to_byte, gpt2_byte_to_unicode) = if tokenizer_type == TokenizerType::BPE && uses_byte_level {
+            let (u2b, b2u) = build_gpt2_mappings();
+            (Some(u2b), Some(b2u))
         } else {
-            None
+            (None, None)
         };
 
         // Parse HF pipeline components
@@ -1545,6 +1702,21 @@ impl Tokenizer {
             .and_then(|v| if v.is_null() { None } else { Self::parse_pre_tokenizer(v) });
         let post_processor = root.get("post_processor")
             .and_then(|v| if v.is_null() { None } else { Self::parse_post_processor(v, &token_to_id) });
+
+        let mut control_token_strings: Vec<(String, u32)> = token_types
+            .iter()
+            .enumerate()
+            .filter(|(_, tt)| **tt == TokenType::Control)
+            .filter_map(|(id, _)| {
+                let s = &id_to_token[id];
+                if !s.is_empty() {
+                    Some((s.clone(), id as u32))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        control_token_strings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         Ok(Self {
             token_to_id,
@@ -1556,10 +1728,13 @@ impl Tokenizer {
             vocab_size,
             token_types,
             gpt2_unicode_to_byte,
+            gpt2_byte_to_unicode,
             normalizer,
             pre_tokenizer,
             post_processor,
             wordpiece_prefix,
+            control_token_strings,
+            has_explicit_bos: bos_token_id.is_some(),
         })
     }
 

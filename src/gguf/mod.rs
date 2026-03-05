@@ -40,4 +40,15 @@ impl GgufFile {
         }
         Some(&self.mmap[start..end])
     }
+
+    /// Get raw tensor data by index.
+    pub fn tensor_data_by_index(&self, index: usize) -> Option<&[u8]> {
+        let info = self.data.tensors.get(index)?;
+        let start = (self.data.data_offset + info.offset) as usize;
+        let end = start.checked_add(info.data_size())?;
+        if end > self.mmap.len() {
+            return None;
+        }
+        Some(&self.mmap[start..end])
+    }
 }

@@ -19,6 +19,7 @@ pub enum Architecture {
     Qwen2,
     Qwen2Moe,
     Qwen3,
+    Qwen35,
     Qwen3Moe,
     Qwen3Next,
 
@@ -72,6 +73,7 @@ impl Architecture {
             "qwen2" => Self::Qwen2,
             "qwen2moe" => Self::Qwen2Moe,
             "qwen3" => Self::Qwen3,
+            "qwen35" | "qwen3_5" | "qwen3.5" => Self::Qwen35,
             "qwen3moe" => Self::Qwen3Moe,
             "qwen3next" => Self::Qwen3Next,
             "phi" => Self::Phi,
@@ -117,6 +119,7 @@ impl Architecture {
             Self::Qwen2 => "qwen2",
             Self::Qwen2Moe => "qwen2moe",
             Self::Qwen3 => "qwen3",
+            Self::Qwen35 => "qwen35",
             Self::Qwen3Moe => "qwen3moe",
             Self::Qwen3Next => "qwen3next",
             Self::Phi => "phi",
@@ -166,6 +169,7 @@ impl Architecture {
                 | Self::Qwen
                 | Self::Qwen2
                 | Self::Qwen3
+                | Self::Qwen35
                 | Self::Qwen3Moe
                 | Self::Qwen3Next
         )
@@ -193,6 +197,7 @@ impl Architecture {
                     | Self::Qwen2
                     | Self::Qwen2Moe
                     | Self::Qwen3
+                | Self::Qwen35
                     | Self::Qwen3Moe
                     | Self::Qwen3Next
                     | Self::InternLM
@@ -203,7 +208,7 @@ impl Architecture {
 
     /// Check if this architecture uses QK normalization before RoPE
     pub fn uses_qk_norm(&self) -> bool {
-        matches!(self, Self::Qwen3 | Self::Qwen3Moe | Self::Qwen3Next)
+        matches!(self, Self::Qwen3 | Self::Qwen35 | Self::Qwen3Moe | Self::Qwen3Next)
     }
 }
 

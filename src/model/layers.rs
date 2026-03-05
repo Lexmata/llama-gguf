@@ -373,11 +373,10 @@ impl Attention {
             }
         }
 
-        // Partial RoPE: rotate only the LAST `rope_dims` dimensions per head.
-        // Per-head layout: [nope(kl - rope_dims) | rope(rope_dims)]
-        // This matches llama.cpp's Qwen3Next: Qnope = first dims, Qrope = last dims.
+        // Partial RoPE: rotate only the FIRST `rope_dims` dimensions per head.
+        // Per-head layout: [rope(rope_dims) | nope(kl - rope_dims)]
+        // This matches llama.cpp / ggml_rope which operates on the first n_rot dims.
         if self.rope_dims > 0 && self.rope_dims < kl {
-            let nope_dims = kl - self.rope_dims;
             let q_data = q_reshaped.as_f32()?.to_vec();
             let k_data = k_reshaped.as_f32()?.to_vec();
 
@@ -385,13 +384,13 @@ impl Attention {
             let mut k_rope = vec![0.0f32; self.num_kv_heads * self.rope_dims];
 
             for h in 0..self.num_heads {
-                let src = h * kl + nope_dims;
+                let src = h * kl;
                 let dst = h * self.rope_dims;
                 q_rope[dst..dst + self.rope_dims]
                     .copy_from_slice(&q_data[src..src + self.rope_dims]);
             }
             for h in 0..self.num_kv_heads {
-                let src = h * kl + nope_dims;
+                let src = h * kl;
                 let dst = h * self.rope_dims;
                 k_rope[dst..dst + self.rope_dims]
                     .copy_from_slice(&k_data[src..src + self.rope_dims]);
@@ -417,13 +416,13 @@ impl Attention {
             let k_out = k_reshaped.as_f32_mut()?;
 
             for h in 0..self.num_heads {
-                let dst = h * kl + nope_dims;
+                let dst = h * kl;
                 let src = h * self.rope_dims;
                 q_out[dst..dst + self.rope_dims]
                     .copy_from_slice(&q_rope_out[src..src + self.rope_dims]);
             }
             for h in 0..self.num_kv_heads {
-                let dst = h * kl + nope_dims;
+                let dst = h * kl;
                 let src = h * self.rope_dims;
                 k_out[dst..dst + self.rope_dims]
                     .copy_from_slice(&k_rope_out[src..src + self.rope_dims]);

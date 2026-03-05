@@ -28,6 +28,14 @@ pub struct DeltaNetConfig {
     pub qkv_dim: usize,
 }
 
+/// Beta/alpha projection: combined or separate (Qwen3.5 uses separate tensors).
+pub enum BetaAlphaProjection {
+    /// Combined beta+alpha projection (Qwen3Next DeltaNet): [hidden_size, 2 * num_v_heads]
+    Combined(Linear),
+    /// Separate beta and alpha projections (Qwen3.5): each [hidden_size, num_v_heads]
+    Separate { beta: Linear, alpha: Linear },
+}
+
 /// Gated DeltaNet layer for recurrent (non-attention) layers.
 pub struct DeltaNetLayer {
     pub config: DeltaNetConfig,
@@ -35,8 +43,8 @@ pub struct DeltaNetLayer {
     pub attn_qkv: Linear,
     /// Output gate projection [hidden_size, d_inner]
     pub attn_gate: Linear,
-    /// Beta + Alpha projection [hidden_size, 2 * num_v_heads]
-    pub ssm_ba: Linear,
+    /// Beta + Alpha projection (combined or separate)
+    pub ssm_ba: BetaAlphaProjection,
     /// 1D convolution kernel [conv_kernel, qkv_dim]
     pub ssm_conv1d_weight: Tensor,
     /// Decay multiplier per value head [num_v_heads] (negative values → state decays)
@@ -124,27 +132,43 @@ impl DeltaNetLayer {
         self.attn_gate.forward(x, &mut z_raw, backend)?;
 
         // 2. Project to beta/alpha
-        let mut ba_raw = Tensor::zeros(vec![cfg.num_v_heads * 2], DType::F32);
-        self.ssm_ba.forward(x, &mut ba_raw, backend)?;
-
         let qkv_data = qkv.as_f32()?.to_vec();
-        let ba_data = ba_raw.as_f32()?;
-
-        // Split beta and alpha from ssm_ba output
-        // ssm_ba output layout: [ba_new_dim, num_k_heads] flattened
-        // ba_new_dim = 2 * (num_v_heads / num_k_heads)
-        let kv_ratio = cfg.num_v_heads / cfg.num_k_heads.max(1);
-        let ba_per_group = 2 * kv_ratio;
 
         let mut beta = vec![0.0f32; cfg.num_v_heads];
         let mut alpha = vec![0.0f32; cfg.num_v_heads];
 
-        for kh in 0..cfg.num_k_heads {
-            let group_offset = kh * ba_per_group;
-            for r in 0..kv_ratio {
-                let vh = kh * kv_ratio + r;
-                beta[vh] = sigmoid(ba_data[group_offset + r]);
-                alpha[vh] = ba_data[group_offset + kv_ratio + r];
+        match &self.ssm_ba {
+            BetaAlphaProjection::Combined(ba_proj) => {
+                let mut ba_raw = Tensor::zeros(vec![cfg.num_v_heads * 2], DType::F32);
+                ba_proj.forward(x, &mut ba_raw, backend)?;
+                let ba_data = ba_raw.as_f32()?;
+
+                let kv_ratio = cfg.num_v_heads / cfg.num_k_heads.max(1);
+                let ba_per_group = 2 * kv_ratio;
+
+                for kh in 0..cfg.num_k_heads {
+                    let group_offset = kh * ba_per_group;
+                    for r in 0..kv_ratio {
+                        let vh = kh * kv_ratio + r;
+                        beta[vh] = sigmoid(ba_data[group_offset + r]);
+                        alpha[vh] = ba_data[group_offset + kv_ratio + r];
+                    }
+                }
+            }
+            BetaAlphaProjection::Separate {
+                beta: beta_proj,
+                alpha: alpha_proj,
+            } => {
+                let mut beta_raw = Tensor::zeros(vec![cfg.num_v_heads], DType::F32);
+                let mut alpha_raw = Tensor::zeros(vec![cfg.num_v_heads], DType::F32);
+                beta_proj.forward(x, &mut beta_raw, backend)?;
+                alpha_proj.forward(x, &mut alpha_raw, backend)?;
+                let beta_data = beta_raw.as_f32()?;
+                let alpha_data = alpha_raw.as_f32()?;
+                for h in 0..cfg.num_v_heads {
+                    beta[h] = sigmoid(beta_data[h]);
+                    alpha[h] = alpha_data[h];
+                }
             }
         }
 
@@ -187,6 +211,7 @@ impl DeltaNetLayer {
         // 7. Repeat-interleave Q and K if num_k_heads != num_v_heads
         let q_expanded: Vec<f32>;
         let k_expanded: Vec<f32>;
+        let kv_ratio = cfg.num_v_heads / cfg.num_k_heads.max(1);
         if cfg.num_k_heads != cfg.num_v_heads {
             q_expanded = repeat_interleave(q_raw, cfg.num_k_heads, cfg.head_k_dim, kv_ratio);
             k_expanded = repeat_interleave(k_raw, cfg.num_k_heads, cfg.head_k_dim, kv_ratio);

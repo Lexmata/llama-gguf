@@ -283,11 +283,14 @@ impl Model for LlamaModel {
             )?);
         }
 
-        // Layer-first ordering: process ALL tokens through each layer before
-        // moving to the next. This keeps each layer's weight matrices hot in
-        // CPU cache across all tokens, dramatically reducing memory bandwidth
-        // during prefill (each ~32MB weight set is read once from RAM instead
-        // of once per token).
+        if std::env::var("LLAMA_DEBUG").is_ok() && ctx.position == 0 {
+            let h = hiddens.last().unwrap().as_f32().unwrap();
+            let n = h.len().min(8);
+            eprintln!("[DBG] tokens: {:?}", tokens);
+            eprintln!("[DBG] embed[0..{}]: {:?}", n, &h[..n]);
+        }
+
+        // Layer-first ordering
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             for (token_offset, hidden) in hiddens.iter_mut().enumerate() {
                 let current_pos = ctx.position + token_offset;
@@ -306,6 +309,15 @@ impl Model for LlamaModel {
                     backend,
                     recurrent_state,
                 )?;
+            }
+
+            if std::env::var("LLAMA_DEBUG").is_ok() && ctx.position == 0 && (layer_idx < 4 || layer_idx == 31) {
+                let h = hiddens.last().unwrap().as_f32().unwrap();
+                let n = h.len().min(8);
+                let is_rec = layer.is_recurrent();
+                let rms: f32 = h.iter().map(|x| x * x).sum::<f32>() / h.len() as f32;
+                eprintln!("[DBG] layer {} ({}): rms={:.6} first8={:?}", layer_idx,
+                    if is_rec { "deltanet" } else { "attn" }, rms.sqrt(), &h[..n]);
             }
         }
 

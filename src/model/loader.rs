@@ -10,7 +10,7 @@ use crate::tensor::{DType, Tensor};
 
 use super::Architecture;
 use super::config::{ActivationType, ModelConfig, RopeConfig, RopeScalingType, RopeType};
-use super::deltanet::{DeltaNetConfig, DeltaNetLayer};
+use super::deltanet::{BetaAlphaProjection, DeltaNetConfig, DeltaNetLayer};
 use super::error::{ModelError, ModelResult};
 use super::layers::{
     Attention, AttentionLayer, FeedForward, FfnLayer, Linear, RMSNorm, TransformerLayer,
@@ -121,6 +121,7 @@ impl ModelLoader {
             Architecture::Qwen2
             | Architecture::Qwen2Moe
             | Architecture::Qwen3
+            | Architecture::Qwen35
             | Architecture::Qwen3Moe
             | Architecture::Qwen3Next => RopeType::NeoX,
             _ => RopeType::Normal,
@@ -468,10 +469,18 @@ impl ModelLoader {
             None,
         )?;
 
-        let ssm_ba = Linear::new(
-            self.load_tensor(&format!("{}.ssm_ba.weight", prefix))?,
-            None,
-        )?;
+        let ssm_ba = if let Some(ba_weight) =
+            self.try_load_tensor(&format!("{}.ssm_ba.weight", prefix))
+        {
+            BetaAlphaProjection::Combined(Linear::new(ba_weight, None)?)
+        } else {
+            let beta_w = self.load_tensor(&format!("{}.ssm_beta.weight", prefix))?;
+            let alpha_w = self.load_tensor(&format!("{}.ssm_alpha.weight", prefix))?;
+            BetaAlphaProjection::Separate {
+                beta: Linear::new(beta_w, None)?,
+                alpha: Linear::new(alpha_w, None)?,
+            }
+        };
 
         let ssm_conv1d_weight = self.load_tensor(&format!("{}.ssm_conv1d.weight", prefix))?;
         let ssm_a = self.load_tensor(&format!("{}.ssm_a", prefix))?;

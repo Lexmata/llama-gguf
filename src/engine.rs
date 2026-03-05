@@ -185,6 +185,13 @@ impl ChatTemplate {
             } else {
                 ChatTemplate::None
             }
+        } else if let Some(arch) = gguf.data.get_string("general.architecture") {
+            match arch.to_lowercase().as_str() {
+                "qwen2" | "qwen" | "qwen3" | "qwen35" | "qwen3moe" | "qwen3next" => {
+                    ChatTemplate::ChatML
+                }
+                _ => ChatTemplate::None,
+            }
         } else {
             ChatTemplate::None
         }
@@ -385,11 +392,13 @@ impl Engine {
         let chat_template = ChatTemplate::detect(&gguf);
         tracing::info!("Chat template: {:?}", chat_template);
 
-        // Check BOS token preference
+        // Check BOS token preference.
+        // If the GGUF explicitly says add_bos_token, use that. Otherwise only
+        // add BOS when the model actually defines a bos_token_id.
         let add_bos = gguf
             .data
             .get_bool("tokenizer.ggml.add_bos_token")
-            .unwrap_or(true);
+            .unwrap_or(tokenizer.has_explicit_bos);
 
         // Build sampler config
         let sampler_config = SamplerConfig {
@@ -773,6 +782,21 @@ impl Engine {
         &self.engine_config
     }
 
+    /// Get the underlying model (for advanced usage like perplexity computation).
+    pub fn model(&self) -> &dyn Model {
+        &*self.model
+    }
+
+    /// Get the backend.
+    pub fn backend(&self) -> &Arc<dyn Backend> {
+        &self.backend
+    }
+
+    /// Whether to add a BOS token when encoding prompts.
+    pub fn add_bos(&self) -> bool {
+        self.add_bos
+    }
+
     /// Generate text from a prompt.
     ///
     /// The prompt is automatically wrapped with the detected chat template
@@ -886,10 +910,22 @@ impl<'a> GenerationStream<'a> {
         let sampler = Sampler::new(engine.sampler_config.clone(), engine.config.vocab_size);
 
         let formatted = engine.chat_template.wrap_prompt(prompt);
+        if std::env::var("LLAMA_DEBUG").is_ok() {
+            eprintln!("[DEBUG] formatted prompt: {:?}", formatted);
+            eprintln!("[DEBUG] add_bos: {}", engine.add_bos);
+        }
         let tokens = engine
             .tokenizer
             .encode(&formatted, engine.add_bos)
             .unwrap_or_default();
+        if std::env::var("LLAMA_DEBUG").is_ok() {
+            eprintln!("[DEBUG] encoded {} tokens: {:?}", tokens.len(), &tokens[..tokens.len().min(50)]);
+            for (i, &tid) in tokens.iter().enumerate() {
+                if let Some(s) = engine.tokenizer.get_token(tid) {
+                    eprintln!("[DEBUG]   token[{}] = {} -> {:?}", i, tid, s);
+                }
+            }
+        }
 
         Self {
             engine,
@@ -936,6 +972,20 @@ impl<'a> Iterator for GenerationStream<'a> {
         };
 
         let next_token = self.sampler.sample(&logits, &self.tokens);
+
+        if std::env::var("LLAMA_DEBUG_LOGITS").is_ok() {
+            let logit_data = logits.as_f32().unwrap();
+            let mut indexed: Vec<(usize, f32)> = logit_data.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let step = self.tokens.len();
+            eprint!("[LOGIT] step={} top5:", step);
+            for (id, score) in indexed.iter().take(5) {
+                let tok_str = self.engine.tokenizer.get_token(*id as u32).unwrap_or_default();
+                eprint!(" {}({:.2})={:?}", id, score, tok_str);
+            }
+            let chosen_str = self.engine.tokenizer.get_token(next_token).unwrap_or_default();
+            eprintln!(" → chosen={}({:?})", next_token, chosen_str);
+        }
 
         // Check EOS
         if next_token == self.engine.tokenizer.special_tokens.eos_token_id {
