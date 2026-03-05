@@ -213,8 +213,8 @@ impl DeltaNetLayer {
         let k_expanded: Vec<f32>;
         let kv_ratio = cfg.num_v_heads / cfg.num_k_heads.max(1);
         if cfg.num_k_heads != cfg.num_v_heads {
-            q_expanded = repeat_interleave(q_raw, cfg.num_k_heads, cfg.head_k_dim, kv_ratio);
-            k_expanded = repeat_interleave(k_raw, cfg.num_k_heads, cfg.head_k_dim, kv_ratio);
+            q_expanded = repeat_tile(q_raw, cfg.num_k_heads, cfg.head_k_dim, kv_ratio);
+            k_expanded = repeat_tile(k_raw, cfg.num_k_heads, cfg.head_k_dim, kv_ratio);
         } else {
             q_expanded = q_raw.to_vec();
             k_expanded = k_raw.to_vec();
@@ -350,16 +350,16 @@ impl DeltaNetLayer {
     }
 }
 
-/// Repeat-interleave: expand [num_k_heads, head_dim] to [num_v_heads, head_dim]
-/// by repeating each head `repeat` times.
-fn repeat_interleave(data: &[f32], num_heads: usize, head_dim: usize, repeat: usize) -> Vec<f32> {
+/// Tile Q/K heads: expand [num_k_heads, head_dim] to [num_v_heads, head_dim]
+/// by tiling the heads (matching ggml_repeat_4d behavior).
+///
+/// For num_k_heads=16 repeated 2x → [h0..h15, h0..h15] (NOT interleaved).
+fn repeat_tile(data: &[f32], num_heads: usize, head_dim: usize, repeat: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; num_heads * repeat * head_dim];
-    for h in 0..num_heads {
-        let src = h * head_dim;
-        for r in 0..repeat {
-            let dst = (h * repeat + r) * head_dim;
-            out[dst..dst + head_dim].copy_from_slice(&data[src..src + head_dim]);
-        }
+    for r in 0..repeat {
+        let dst_base = r * num_heads * head_dim;
+        out[dst_base..dst_base + num_heads * head_dim]
+            .copy_from_slice(&data[..num_heads * head_dim]);
     }
     out
 }
@@ -422,9 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn test_repeat_interleave() {
+    fn test_repeat_tile() {
         let data = vec![1.0, 2.0, 3.0, 4.0]; // 2 heads, dim=2
-        let out = repeat_interleave(&data, 2, 2, 3); // repeat 3x → 6 heads
-        assert_eq!(out, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
+        let out = repeat_tile(&data, 2, 2, 3); // tile 3x → 6 heads
+        // Tiled: [h0, h1, h0, h1, h0, h1]
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
     }
 }
