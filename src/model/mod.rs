@@ -11,6 +11,7 @@
 mod architecture;
 pub mod cache;
 mod config;
+mod kv_quantized;
 pub mod deltanet;
 pub mod embeddings;
 mod error;
@@ -19,9 +20,11 @@ mod llama;
 mod loader;
 pub mod lora;
 pub mod moe;
+pub mod paged;
 pub mod speculative;
 
 pub use architecture::Architecture;
+pub use kv_quantized::{KVCacheFormat, QuantizedKVCache};
 pub use cache::{
     CachedPrefix, PrefixId, PrefixSharing, PromptCache, PromptCacheConfig, PromptCacheStats,
 };
@@ -37,7 +40,8 @@ pub use llama::LlamaModel;
 pub use loader::{ModelLoader, load_llama_model};
 pub use lora::{LoraAdapter, LoraAdapters, LoraConfig};
 pub use moe::{MoeConfig, MoeExpert, MoeLayer, MoeRouter, MoeStats};
-pub use speculative::{SpeculativeConfig, SpeculativeDecoder, SpeculativeStats};
+pub use paged::{BlockId, BlockTable, PageAllocator, PagedKVPool, PagedSequence, DEFAULT_BLOCK_SIZE};
+pub use speculative::{SpeculativeConfig, SpeculativeDecoder, SpeculativeMode, SpeculativeStats};
 
 use std::sync::Arc;
 
@@ -92,20 +96,13 @@ impl KVCache {
         }
     }
 
-    /// Reset the cache for a new sequence
+    /// Reset the cache for a new sequence.
+    ///
+    /// Only resets the position counter. Cache data is not zeroed because
+    /// `attention_cached` only reads positions `0..seq_len`, so stale data
+    /// beyond `seq_len` is never accessed.
     pub fn reset(&mut self) {
         self.seq_len = 0;
-        // Optionally zero out the cache data
-        for k in &mut self.k_cache {
-            if let Ok(data) = k.as_f32_mut() {
-                data.fill(0.0);
-            }
-        }
-        for v in &mut self.v_cache {
-            if let Ok(data) = v.as_f32_mut() {
-                data.fill(0.0);
-            }
-        }
     }
 
     /// Get remaining capacity
@@ -125,47 +122,36 @@ impl KVCache {
         }
     }
 
-    /// Shift cache left by `amount` positions (for sliding window)
-    /// Keeps the last (seq_len - amount) positions
+    /// Shift cache left by `amount` positions (for sliding window).
+    /// Keeps the last `(seq_len - amount)` positions.
+    ///
+    /// Uses `copy_within` for each head's contiguous run, which compiles to
+    /// a single `memmove` — dramatically faster than the element-wise loop
+    /// it replaces (especially for long sequences).
     pub fn shift_left(&mut self, amount: usize) {
         if amount == 0 || amount >= self.seq_len {
-            self.reset();
+            self.seq_len = 0;
             return;
         }
 
         let new_len = self.seq_len - amount;
+        let row_stride = self.max_seq_len * self.head_dim;
+        let copy_elems = new_len * self.head_dim;
 
         for layer_idx in 0..self.num_layers {
-            // Shift K cache
             if let Ok(k_data) = self.k_cache[layer_idx].as_f32_mut() {
                 for head in 0..self.num_kv_heads {
-                    for pos in 0..new_len {
-                        let src_offset = head * self.max_seq_len * self.head_dim
-                            + (pos + amount) * self.head_dim;
-                        let dst_offset =
-                            head * self.max_seq_len * self.head_dim + pos * self.head_dim;
-
-                        // Copy head_dim elements
-                        for d in 0..self.head_dim {
-                            k_data[dst_offset + d] = k_data[src_offset + d];
-                        }
-                    }
+                    let base = head * row_stride;
+                    let src_start = base + amount * self.head_dim;
+                    k_data.copy_within(src_start..src_start + copy_elems, base);
                 }
             }
 
-            // Shift V cache
             if let Ok(v_data) = self.v_cache[layer_idx].as_f32_mut() {
                 for head in 0..self.num_kv_heads {
-                    for pos in 0..new_len {
-                        let src_offset = head * self.max_seq_len * self.head_dim
-                            + (pos + amount) * self.head_dim;
-                        let dst_offset =
-                            head * self.max_seq_len * self.head_dim + pos * self.head_dim;
-
-                        for d in 0..self.head_dim {
-                            v_data[dst_offset + d] = v_data[src_offset + d];
-                        }
-                    }
+                    let base = head * row_stride;
+                    let src_start = base + amount * self.head_dim;
+                    v_data.copy_within(src_start..src_start + copy_elems, base);
                 }
             }
         }

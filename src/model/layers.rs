@@ -59,21 +59,18 @@ impl Linear {
         out: &mut Tensor,
         backend: &dyn Backend,
     ) -> BackendResult<()> {
-        // For quantized weights, use vec_mat_q (x @ W)
         if self.weight.dtype().is_quantized() {
             backend.vec_mat_q(x, &self.weight, out)?;
         } else {
             backend.vec_mat(x, &self.weight, out)?;
         }
 
-        // Add bias if present
         if let Some(ref bias) = self.bias {
-            let mut temp = Tensor::zeros(out.shape().to_vec(), DType::F32);
-            backend.add(out, bias, &mut temp)?;
-            // Copy temp back to out
             let out_data = out.as_f32_mut()?;
-            let temp_data = temp.as_f32()?;
-            out_data.copy_from_slice(temp_data);
+            let bias_data = bias.as_f32()?;
+            for (o, &b) in out_data.iter_mut().zip(bias_data.iter()) {
+                *o += b;
+            }
         }
 
         Ok(())
@@ -96,13 +93,13 @@ impl Linear {
     }
 
     /// Apply bias to output tensor (if bias exists)
-    pub fn apply_bias(&self, out: &mut Tensor, backend: &dyn Backend) -> BackendResult<()> {
+    pub fn apply_bias(&self, out: &mut Tensor, _backend: &dyn Backend) -> BackendResult<()> {
         if let Some(ref bias) = self.bias {
-            let mut temp = Tensor::zeros(out.shape().to_vec(), DType::F32);
-            backend.add(out, bias, &mut temp)?;
             let out_data = out.as_f32_mut()?;
-            let temp_data = temp.as_f32()?;
-            out_data.copy_from_slice(temp_data);
+            let bias_data = bias.as_f32()?;
+            for (o, &b) in out_data.iter_mut().zip(bias_data.iter()) {
+                *o += b;
+            }
         }
         Ok(())
     }
@@ -533,6 +530,9 @@ impl FeedForward {
     }
 
     /// Forward pass: out = down(silu(gate(x)) * up(x))
+    ///
+    /// Uses fused silu*mul to eliminate two intermediate tensor allocations
+    /// and reduce from 3 memory passes to 1 over the intermediate data.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -541,21 +541,17 @@ impl FeedForward {
     ) -> BackendResult<()> {
         let mut gate = Tensor::zeros(vec![self.intermediate_size], DType::F32);
         let mut up = Tensor::zeros(vec![self.intermediate_size], DType::F32);
-        let mut gate_silu = Tensor::zeros(vec![self.intermediate_size], DType::F32);
-        let mut intermediate = Tensor::zeros(vec![self.intermediate_size], DType::F32);
 
-        // Compute gate and up projections
         self.w_gate.forward(x, &mut gate, backend)?;
         self.w_up.forward(x, &mut up, backend)?;
 
-        // Apply SiLU to gate
-        backend.silu(&gate, &mut gate_silu)?;
+        {
+            let gate_data = gate.as_f32_mut()?;
+            let up_data = up.as_f32()?;
+            crate::backend::cpu::simd::silu_mul_inplace(gate_data, up_data);
+        }
 
-        // Multiply gate_silu * up
-        backend.mul(&gate_silu, &up, &mut intermediate)?;
-
-        // Down projection
-        self.w_down.forward(&intermediate, out, backend)?;
+        self.w_down.forward(&gate, out, backend)?;
 
         Ok(())
     }
@@ -630,6 +626,10 @@ impl TransformerLayer {
 
     /// Forward pass with residual connections.
     /// `recurrent_state` is used only for DeltaNet layers.
+    ///
+    /// Uses in-place residual accumulation to avoid allocating separate
+    /// tensors for `h` and the final output — saves 3 tensor allocations
+    /// per layer per token.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -644,12 +644,10 @@ impl TransformerLayer {
     ) -> ModelResult<Tensor> {
         let hidden_size = x.shape().last().copied().unwrap_or(0);
 
-        // Attention normalization
         let mut norm_out = Tensor::zeros(x.shape().to_vec(), DType::F32);
         self.attn_norm.forward(x, &mut norm_out, backend)?;
 
-        // Run attention (full or delta-net)
-        let attn_out = match &self.attn_layer {
+        let mut attn_out = match &self.attn_layer {
             AttentionLayer::FullAttention(attn) => {
                 attn.forward(&norm_out, k_cache, v_cache, pos, freq_base, freq_scale, backend)?
             }
@@ -663,20 +661,22 @@ impl TransformerLayer {
             }
         };
 
-        // Residual connection for attention
-        let mut h = Tensor::zeros(vec![hidden_size], DType::F32);
-        let x_flat = if x.ndim() == 2 {
+        // In-place residual: attn_out += x (avoids allocating h)
+        {
+            let attn_data = attn_out.as_f32_mut()?;
             let x_data = x.as_f32()?;
-            let seq_len = x.shape()[0];
-            let start = (seq_len - 1) * hidden_size;
-            Tensor::from_f32(&x_data[start..start + hidden_size], vec![hidden_size])?
-        } else {
-            x.clone()
-        };
-        backend.add(&x_flat, &attn_out, &mut h)?;
+            let x_start = if x.ndim() == 2 {
+                (x.shape()[0] - 1) * hidden_size
+            } else {
+                0
+            };
+            let x_slice = &x_data[x_start..x_start + hidden_size];
+            for (a, &xv) in attn_data.iter_mut().zip(x_slice.iter()) {
+                *a += xv;
+            }
+        }
+        let h = attn_out;
 
-        // FFN normalization: use post_attn_norm if present (Qwen3Next),
-        // otherwise use ffn_norm (standard models)
         let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
         if let Some(ref pan) = self.post_attn_norm {
             pan.forward(&h, &mut ffn_norm_out, backend)?;
@@ -684,7 +684,7 @@ impl TransformerLayer {
             self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
         }
 
-        let ffn_out = match &self.ffn_layer {
+        let mut ffn_out = match &self.ffn_layer {
             FfnLayer::Dense(ffn) => {
                 let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
                 ffn.forward(&ffn_norm_out, &mut out, backend)?;
@@ -693,10 +693,15 @@ impl TransformerLayer {
             FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
         };
 
-        // Residual connection for FFN
-        let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
-        backend.add(&h, &ffn_out, &mut out)?;
+        // In-place residual: ffn_out += h (avoids allocating final output tensor)
+        {
+            let ffn_data = ffn_out.as_f32_mut()?;
+            let h_data = h.as_f32()?;
+            for (f, &hv) in ffn_data.iter_mut().zip(h_data.iter()) {
+                *f += hv;
+            }
+        }
 
-        Ok(out)
+        Ok(ffn_out)
     }
 }

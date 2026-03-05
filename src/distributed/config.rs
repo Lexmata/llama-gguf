@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::DistributedError;
+use super::tensor_parallel_distributed::ParallelismMode;
 
 /// Configuration for a distributed inference cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,18 @@ pub struct ClusterConfig {
     /// Maximum sequence length override (0 = use model default)
     #[serde(default)]
     pub max_seq_len: usize,
+
+    /// Parallelism mode: pipeline (default), tensor_parallel, or hybrid
+    #[serde(default)]
+    pub parallelism: ParallelismMode,
+
+    /// Whether to automatically assign layers based on VRAM (default: false)
+    #[serde(default)]
+    pub auto_shard: bool,
+
+    /// Fault tolerance configuration
+    #[serde(default)]
+    pub fault_tolerance: Option<super::fault::FaultConfig>,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -74,6 +87,22 @@ impl ShardSpec {
         match (self.layer_start, self.layer_end) {
             (Some(start), Some(end)) => Some(start..end),
             _ => None,
+        }
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            model_path: String::new(),
+            shards: Vec::new(),
+            connect_timeout_secs: default_connect_timeout(),
+            request_timeout_secs: default_request_timeout(),
+            use_gpu: true,
+            max_seq_len: 0,
+            parallelism: ParallelismMode::default(),
+            auto_shard: false,
+            fault_tolerance: None,
         }
     }
 }
@@ -213,10 +242,7 @@ mod tests {
                 test_shard("a", "host1:50051"),
                 test_shard("b", "host2:50051"),
             ],
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-            use_gpu: true,
-            max_seq_len: 0,
+            ..Default::default()
         };
 
         let assignments = config.compute_layer_assignments(32).unwrap();
@@ -232,14 +258,10 @@ mod tests {
                 test_shard("b", "h2:50051"),
                 test_shard("c", "h3:50051"),
             ],
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-            use_gpu: true,
-            max_seq_len: 0,
+            ..Default::default()
         };
 
         let assignments = config.compute_layer_assignments(10).unwrap();
-        // 10 / 3 = 3 remainder 1 -> first shard gets 4, rest get 3
         assert_eq!(assignments, vec![0..4, 4..7, 7..10]);
     }
 
@@ -261,10 +283,7 @@ mod tests {
                     layer_end: Some(32),
                 },
             ],
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-            use_gpu: true,
-            max_seq_len: 0,
+            ..Default::default()
         };
 
         let assignments = config.compute_layer_assignments(32).unwrap();
@@ -283,10 +302,7 @@ mod tests {
                     layer_end: Some(10),
                 },
             ],
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-            use_gpu: true,
-            max_seq_len: 0,
+            ..Default::default()
         };
 
         let result = config.compute_layer_assignments(32);
@@ -297,11 +313,7 @@ mod tests {
     fn test_validate_empty_shards() {
         let config = ClusterConfig {
             model_path: "model.gguf".into(),
-            shards: vec![],
-            connect_timeout_secs: 10,
-            request_timeout_secs: 30,
-            use_gpu: true,
-            max_seq_len: 0,
+            ..Default::default()
         };
         assert!(config.validate().is_err());
     }

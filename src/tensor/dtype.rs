@@ -56,16 +56,16 @@ impl DType {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             // K-quants: 256 elements per block
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
-            // IQ types: 256 elements per block
+            // IQ types: 256 elements per block (except IQ4NL which uses 32)
             Self::IQ2XXS
             | Self::IQ2XS
             | Self::IQ2S
             | Self::IQ3XXS
             | Self::IQ3S
             | Self::IQ4XS
-            | Self::IQ4NL
             | Self::IQ1S
             | Self::IQ1M => 256,
+            Self::IQ4NL => 32,
             // Ternary quants: 256 elements per block
             Self::TQ1_0 | Self::TQ2_0 => 256,
         }
@@ -99,7 +99,7 @@ impl DType {
             Self::IQ3XXS => 98,
             Self::IQ3S => 110,
             Self::IQ4XS => 136,
-            Self::IQ4NL => 132,
+            Self::IQ4NL => 18,
             Self::IQ1S => 50,
             Self::IQ1M => 56,
             Self::TQ1_0 => 54,

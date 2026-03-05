@@ -205,64 +205,62 @@ impl Coordinator {
             .map(|layer| {
                 let mut tensors = Vec::new();
 
-                // Attention norm
                 tensors.push(NamedTensor {
                     name: "attn_norm.weight".into(),
                     tensor: Some(tensor_to_proto(&layer.attn_norm.weight)),
                 });
 
-                // Attention Q/K/V/O weights
-                tensors.push(NamedTensor {
-                    name: "attn_q.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.attention.wq.weight)),
-                });
-                if let Some(ref bias) = layer.attention.wq.bias {
+                if let Some(attn) = layer.attention() {
                     tensors.push(NamedTensor {
-                        name: "attn_q.bias".into(),
-                        tensor: Some(tensor_to_proto(bias)),
+                        name: "attn_q.weight".into(),
+                        tensor: Some(tensor_to_proto(&attn.wq.weight)),
                     });
+                    if let Some(ref bias) = attn.wq.bias {
+                        tensors.push(NamedTensor {
+                            name: "attn_q.bias".into(),
+                            tensor: Some(tensor_to_proto(bias)),
+                        });
+                    }
+
+                    tensors.push(NamedTensor {
+                        name: "attn_k.weight".into(),
+                        tensor: Some(tensor_to_proto(&attn.wk.weight)),
+                    });
+                    if let Some(ref bias) = attn.wk.bias {
+                        tensors.push(NamedTensor {
+                            name: "attn_k.bias".into(),
+                            tensor: Some(tensor_to_proto(bias)),
+                        });
+                    }
+
+                    tensors.push(NamedTensor {
+                        name: "attn_v.weight".into(),
+                        tensor: Some(tensor_to_proto(&attn.wv.weight)),
+                    });
+                    if let Some(ref bias) = attn.wv.bias {
+                        tensors.push(NamedTensor {
+                            name: "attn_v.bias".into(),
+                            tensor: Some(tensor_to_proto(bias)),
+                        });
+                    }
+
+                    tensors.push(NamedTensor {
+                        name: "attn_output.weight".into(),
+                        tensor: Some(tensor_to_proto(&attn.wo.weight)),
+                    });
+                    if let Some(ref bias) = attn.wo.bias {
+                        tensors.push(NamedTensor {
+                            name: "attn_output.bias".into(),
+                            tensor: Some(tensor_to_proto(bias)),
+                        });
+                    }
                 }
 
-                tensors.push(NamedTensor {
-                    name: "attn_k.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.attention.wk.weight)),
-                });
-                if let Some(ref bias) = layer.attention.wk.bias {
-                    tensors.push(NamedTensor {
-                        name: "attn_k.bias".into(),
-                        tensor: Some(tensor_to_proto(bias)),
-                    });
-                }
-
-                tensors.push(NamedTensor {
-                    name: "attn_v.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.attention.wv.weight)),
-                });
-                if let Some(ref bias) = layer.attention.wv.bias {
-                    tensors.push(NamedTensor {
-                        name: "attn_v.bias".into(),
-                        tensor: Some(tensor_to_proto(bias)),
-                    });
-                }
-
-                tensors.push(NamedTensor {
-                    name: "attn_output.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.attention.wo.weight)),
-                });
-                if let Some(ref bias) = layer.attention.wo.bias {
-                    tensors.push(NamedTensor {
-                        name: "attn_output.bias".into(),
-                        tensor: Some(tensor_to_proto(bias)),
-                    });
-                }
-
-                // FFN norm
                 tensors.push(NamedTensor {
                     name: "ffn_norm.weight".into(),
                     tensor: Some(tensor_to_proto(&layer.ffn_norm.weight)),
                 });
 
-                // FFN gate/up/down (dense only)
                 if let Some(ffn) = layer.ffn() {
                     tensors.push(NamedTensor {
                         name: "ffn_gate.weight".into(),

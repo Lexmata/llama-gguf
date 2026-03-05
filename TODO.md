@@ -41,23 +41,23 @@ Metal, DX12, and Vulkan backends fall back to CPU for several operations. Bringi
 
 ## Quantization
 
-- [ ] GGUF quantization writing (currently read-only)
-- [ ] IQ quantization formats (IQ1_S, IQ2_XXS, IQ3_XXS, etc.)
-- [ ] GPU-side quantization (quantize on device without host roundtrip)
+- [x] GGUF quantization writing (currently read-only)
+- [x] IQ quantization formats (IQ1_S, IQ2_XXS, IQ3_XXS, etc.)
+- [x] GPU-side quantization (quantize on device without host roundtrip)
 
 ## Inference Performance
 
-- [ ] Continuous batching for server mode
-- [ ] Speculative decoding
-- [ ] Prompt caching / prefix sharing across requests
-- [ ] KV cache quantization (INT8/FP8 KV cache to reduce VRAM)
-- [ ] Paged attention (vLLM-style memory management)
-- [ ] Tensor parallelism (split layers across GPUs on a single node)
+- [x] Continuous batching for server mode
+- [x] Speculative decoding
+- [x] Prompt caching / prefix sharing across requests
+- [x] KV cache quantization (INT8/FP8 KV cache to reduce VRAM)
+- [x] Paged attention (vLLM-style memory management)
+- [x] Tensor parallelism (split layers across GPUs on a single node)
 
 ## Tokenizer
 
-- [ ] Unigram tokenizer support
-- [ ] Tokenizer from `tokenizer.json` (HuggingFace format, not just GGUF metadata)
+- [x] Unigram tokenizer support
+- [x] Tokenizer from `tokenizer.json` (HuggingFace format, not just GGUF metadata)
 
 ## Server
 
@@ -69,21 +69,21 @@ Metal, DX12, and Vulkan backends fall back to CPU for several operations. Bringi
 
 ## RAG
 
-- [ ] Incremental re-indexing for updated documents
-- [ ] Chunking strategies (semantic, sliding window with overlap tuning)
-- [ ] Multi-modal embedding support (images, tables)
-- [ ] SQLite vector store alternative (for single-node setups without PostgreSQL)
+- [x] Incremental re-indexing for updated documents
+- [x] Chunking strategies (semantic, sliding window with overlap tuning)
+- [x] Multi-modal embedding support (images, tables)
+- [x] SQLite vector store alternative (for single-node setups without PostgreSQL)
 
 ## Distributed
 
-- [ ] Automatic model sharding based on available VRAM per node
-- [ ] Fault tolerance and node recovery
-- [ ] Load balancing across heterogeneous hardware
-- [ ] Multi-node tensor parallelism (complement to pipeline parallelism)
+- [x] Automatic model sharding based on available VRAM per node
+- [x] Fault tolerance and node recovery
+- [x] Load balancing across heterogeneous hardware
+- [x] Multi-node tensor parallelism (complement to pipeline parallelism)
 
 ## Developer Experience
 
-- [ ] `cargo bench` coverage for all quantization formats
-- [ ] Integration test suite that runs without external dependencies (embedded test model)
-- [ ] CI matrix covering all feature flag combinations
-- [ ] Flamegraph-based profiling guide
+- [x] `cargo bench` coverage for all quantization formats
+- [x] Integration test suite that runs without external dependencies (embedded test model)
+- [x] CI matrix covering all feature flag combinations
+- [x] Flamegraph-based profiling guide

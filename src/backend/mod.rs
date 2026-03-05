@@ -8,6 +8,7 @@ pub mod cpu;
 pub mod cuda;
 pub mod dx12;
 mod error;
+pub mod tensor_parallel;
 pub mod metal;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;

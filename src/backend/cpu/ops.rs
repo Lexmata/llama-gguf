@@ -1470,6 +1470,12 @@ pub fn attention(
 /// Only the first `kv_len` positions are valid.  This avoids allocating +
 /// copying a contiguous `[num_kv_heads, kv_len, head_dim]` tensor on every
 /// token, which previously caused O(n²) total memory traffic during prefill.
+///
+/// Optimizations:
+/// - SIMD dot products (AVX2/AVX-512/NEON) for Q·K^T and V accumulation
+/// - SIMD softmax with vectorized normalization pass
+/// - SIMD AXPY for weighted V accumulation
+/// - Rayon parallelism across attention heads
 pub fn attention_cached(
     q: &Tensor,
     k_cache: &Tensor,
@@ -1489,7 +1495,7 @@ pub fn attention_cached(
     let num_heads = q_shape[0];
     let head_dim = q_shape[2];
     let num_kv_heads = k_shape[0];
-    let max_seq_len = k_shape[1]; // stride between heads
+    let max_seq_len = k_shape[1];
 
     let num_queries_per_kv = num_heads / num_kv_heads;
 
@@ -1498,55 +1504,34 @@ pub fn attention_cached(
     let v_data = v_cache.as_f32()?;
     let out_data = out.as_f32_mut()?;
 
-    for head in 0..num_heads {
-        let kv_head = head / num_queries_per_kv;
+    let head_stride = max_seq_len * head_dim;
 
-        // q offset: [head, 0, 0] — single query position
-        let q_offset = head * head_dim; // shape is [num_heads, 1, head_dim]
-        let q_vec = &q_data[q_offset..q_offset + head_dim];
+    out_data[..num_heads * head_dim]
+        .par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(head, out_vec)| {
+            let kv_head = head / num_queries_per_kv;
+            let q_vec = &q_data[head * head_dim..(head + 1) * head_dim];
+            let k_base = kv_head * head_stride;
+            let v_base = kv_head * head_stride;
 
-        // --- Q · K^T (strided read from cache) ---
-        let mut scores = vec![0.0f32; kv_len];
-        for (kv_pos, score) in scores.iter_mut().enumerate() {
-            // k_cache stride: head * max_seq_len * head_dim + pos * head_dim
-            let k_offset = kv_head * max_seq_len * head_dim + kv_pos * head_dim;
-            let k_vec = &k_data[k_offset..k_offset + head_dim];
+            let mut scores = vec![0.0f32; kv_len];
 
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_vec[d] * k_vec[d];
+            for (kv_pos, score) in scores.iter_mut().enumerate() {
+                let k_vec = &k_data[k_base + kv_pos * head_dim..k_base + kv_pos * head_dim + head_dim];
+                *score = super::simd::dot_f32(q_vec, k_vec) * scale;
             }
-            *score = dot * scale;
-        }
 
-        // --- Softmax ---
-        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for s in &mut scores {
-            *s = (*s - max_score).exp();
-            sum += *s;
-        }
-        let inv_sum = 1.0 / sum;
-        for s in &mut scores {
-            *s *= inv_sum;
-        }
+            super::simd::softmax_inplace(&mut scores);
 
-        // --- Weighted sum of V (strided read from cache) ---
-        let out_offset = head * head_dim; // [num_heads, 1, head_dim]
-        let out_vec = &mut out_data[out_offset..out_offset + head_dim];
-        out_vec.fill(0.0);
-
-        for (kv_pos, &score_val) in scores.iter().enumerate() {
-            if score_val > 0.0 {
-                let v_offset = kv_head * max_seq_len * head_dim + kv_pos * head_dim;
-                let v_vec = &v_data[v_offset..v_offset + head_dim];
-
-                for d in 0..head_dim {
-                    out_vec[d] += score_val * v_vec[d];
+            out_vec.fill(0.0);
+            for (kv_pos, &score_val) in scores.iter().enumerate() {
+                if score_val > 1e-8 {
+                    let v_vec = &v_data[v_base + kv_pos * head_dim..v_base + kv_pos * head_dim + head_dim];
+                    super::simd::axpy_f32(score_val, v_vec, out_vec);
                 }
             }
-        }
-    }
+        });
 
     Ok(())
 }

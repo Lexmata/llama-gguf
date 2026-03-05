@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use unicode_normalization::UnicodeNormalization;
+
 use crate::gguf::{GgufFile, MetadataValue};
 
 /// Tokenizer type
@@ -45,6 +47,185 @@ pub enum TokenType {
     Byte,
     /// Unknown token
     Unknown,
+}
+
+/// Text normalizer applied before tokenization (from HuggingFace tokenizer.json)
+#[derive(Debug, Clone)]
+pub enum Normalizer {
+    NFC,
+    NFKC,
+    NFD,
+    NFKD,
+    Lowercase,
+    Strip { left: bool, right: bool },
+    Prepend(String),
+    Replace { pattern: String, content: String },
+    StripAccents,
+    Sequence(Vec<Normalizer>),
+}
+
+impl Normalizer {
+    fn apply(&self, text: &str) -> String {
+        match self {
+            Self::NFC => text.nfc().collect(),
+            Self::NFKC => text.nfkc().collect(),
+            Self::NFD => text.nfd().collect(),
+            Self::NFKD => text.nfkd().collect(),
+            Self::Lowercase => text.to_lowercase(),
+            Self::Strip { left, right } => {
+                let s = if *left { text.trim_start() } else { text };
+                if *right { s.trim_end().to_string() } else { s.to_string() }
+            }
+            Self::Prepend(prefix) => format!("{}{}", prefix, text),
+            Self::Replace { pattern, content } => text.replace(pattern.as_str(), content.as_str()),
+            Self::StripAccents => {
+                text.nfkd()
+                    .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+                    .collect()
+            }
+            Self::Sequence(normalizers) => {
+                let mut result = text.to_string();
+                for n in normalizers {
+                    result = n.apply(&result);
+                }
+                result
+            }
+        }
+    }
+}
+
+/// Pre-tokenizer splits text into segments before model encoding
+#[derive(Debug, Clone)]
+pub enum PreTokenizer {
+    /// GPT-2 style byte-level splitting
+    ByteLevel { add_prefix_space: bool },
+    /// Split on whitespace boundaries
+    Whitespace,
+    /// SentencePiece metaspace handling
+    Metaspace { replacement: char, add_prefix_space: bool },
+    /// Split around punctuation characters
+    Punctuation,
+    /// Split digits
+    Digits { individual_digits: bool },
+    /// Chain multiple pre-tokenizers
+    Sequence(Vec<PreTokenizer>),
+}
+
+impl PreTokenizer {
+    fn apply(&self, text: &str) -> Vec<String> {
+        match self {
+            Self::ByteLevel { add_prefix_space } => {
+                let text = if *add_prefix_space && !text.starts_with(' ') {
+                    format!(" {}", text)
+                } else {
+                    text.to_string()
+                };
+                let mut tokens = Vec::new();
+                let mut current = String::new();
+                for ch in text.chars() {
+                    if ch == ' ' && !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    current.push(ch);
+                }
+                if !current.is_empty() {
+                    tokens.push(current);
+                }
+                tokens
+            }
+            Self::Whitespace => {
+                text.split_whitespace().map(|s| s.to_string()).collect()
+            }
+            Self::Metaspace { replacement, add_prefix_space } => {
+                let text = if *add_prefix_space && !text.starts_with(' ') {
+                    format!(" {}", text)
+                } else {
+                    text.to_string()
+                };
+                text.split(' ')
+                    .enumerate()
+                    .filter(|(_, s)| !s.is_empty() || true)
+                    .map(|(i, s)| {
+                        if i == 0 && s.is_empty() {
+                            replacement.to_string()
+                        } else if i > 0 {
+                            format!("{}{}", replacement, s)
+                        } else {
+                            s.to_string()
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            Self::Punctuation => {
+                let mut result = Vec::new();
+                let mut current = String::new();
+                for ch in text.chars() {
+                    if ch.is_ascii_punctuation() {
+                        if !current.is_empty() {
+                            result.push(std::mem::take(&mut current));
+                        }
+                        result.push(ch.to_string());
+                    } else {
+                        current.push(ch);
+                    }
+                }
+                if !current.is_empty() {
+                    result.push(current);
+                }
+                result
+            }
+            Self::Digits { individual_digits } => {
+                if !*individual_digits {
+                    return vec![text.to_string()];
+                }
+                let mut result = Vec::new();
+                let mut current = String::new();
+                for ch in text.chars() {
+                    if ch.is_ascii_digit() {
+                        if !current.is_empty() {
+                            result.push(std::mem::take(&mut current));
+                        }
+                        result.push(ch.to_string());
+                    } else {
+                        current.push(ch);
+                    }
+                }
+                if !current.is_empty() {
+                    result.push(current);
+                }
+                result
+            }
+            Self::Sequence(pre_tokenizers) => {
+                let mut segments = vec![text.to_string()];
+                for pt in pre_tokenizers {
+                    let mut next = Vec::new();
+                    for seg in &segments {
+                        next.extend(pt.apply(seg));
+                    }
+                    segments = next;
+                }
+                segments
+            }
+        }
+    }
+}
+
+/// Element in a template processing sequence
+#[derive(Debug, Clone)]
+pub enum TemplateElement {
+    SpecialToken { id: String, token_id: u32 },
+    Sequence { type_id: u32 },
+}
+
+/// Post-processor adds special tokens after encoding
+#[derive(Debug, Clone)]
+pub enum PostProcessor {
+    TemplateProcessing {
+        single: Vec<TemplateElement>,
+        pair: Vec<TemplateElement>,
+    },
+    ByteLevel { trim_offsets: bool },
 }
 
 /// Special token IDs
@@ -155,15 +336,15 @@ fn build_gpt2_unicode_to_byte() -> HashMap<char, u8> {
         .collect()
 }
 
-/// Tokenizer loaded from GGUF metadata
+/// Tokenizer loaded from GGUF metadata or HuggingFace tokenizer.json
 #[derive(Debug)]
 pub struct Tokenizer {
     /// Token vocabulary (token string -> token id)
     token_to_id: HashMap<String, u32>,
     /// Reverse vocabulary (token id -> token string)
     id_to_token: Vec<String>,
-    /// Token scores for SentencePiece
-    _scores: Vec<f32>,
+    /// Token scores (log probabilities for Unigram models)
+    scores: Vec<f32>,
     /// Merge pairs for BPE with priority (lower = merge first)
     /// Maps (token1_id, token2_id) -> (merged_token_id, priority)
     merges: HashMap<(u32, u32), (u32, usize)>,
@@ -177,6 +358,14 @@ pub struct Tokenizer {
     token_types: Vec<TokenType>,
     /// GPT-2 unicode-to-byte reverse mapping (only for GPT-2 tokenizers)
     gpt2_unicode_to_byte: Option<HashMap<char, u8>>,
+    /// HF normalizer pipeline component
+    normalizer: Option<Normalizer>,
+    /// HF pre-tokenizer pipeline component
+    pre_tokenizer: Option<PreTokenizer>,
+    /// HF post-processor pipeline component
+    post_processor: Option<PostProcessor>,
+    /// WordPiece continuation prefix (default "##")
+    wordpiece_prefix: String,
 }
 
 impl Tokenizer {
@@ -235,13 +424,17 @@ impl Tokenizer {
         Ok(Self {
             token_to_id,
             id_to_token,
-            _scores: scores,
+            scores,
             merges,
             special_tokens,
             tokenizer_type,
             vocab_size,
             token_types,
             gpt2_unicode_to_byte,
+            normalizer: None,
+            pre_tokenizer: None,
+            post_processor: None,
+            wordpiece_prefix: "##".to_string(),
         })
     }
 
@@ -368,16 +561,65 @@ impl Tokenizer {
     pub fn encode(&self, text: &str, add_bos: bool) -> TokenizerResult<Vec<u32>> {
         let mut tokens = Vec::new();
 
-        if add_bos {
-            tokens.push(self.special_tokens.bos_token_id);
-        }
+        if self.normalizer.is_some() || self.pre_tokenizer.is_some() {
+            // HuggingFace tokenizer pipeline
+            let normalized = match &self.normalizer {
+                Some(n) => n.apply(text),
+                None => text.to_string(),
+            };
+            let pre_tokens = match &self.pre_tokenizer {
+                Some(pt) => pt.apply(&normalized),
+                None => vec![normalized],
+            };
 
-        // Use BPE encoding if merges are available, otherwise use SentencePiece greedy
-        if !self.merges.is_empty() {
-            tokens.extend(self.encode_bpe(text)?);
+            for pre_token in &pre_tokens {
+                if pre_token.is_empty() {
+                    continue;
+                }
+                match self.tokenizer_type {
+                    TokenizerType::SentencePiece => {
+                        tokens.extend(self.encode_unigram(pre_token)?);
+                    }
+                    TokenizerType::WordPiece => {
+                        tokens.extend(self.encode_wordpiece(pre_token)?);
+                    }
+                    _ => {
+                        tokens.extend(self.encode_bpe_pretokenized(pre_token)?);
+                    }
+                }
+            }
+
+            // Apply post-processor template (unless manually adding BOS)
+            if !add_bos {
+                if let Some(PostProcessor::TemplateProcessing { ref single, .. }) = self.post_processor {
+                    let mut processed = Vec::new();
+                    for elem in single {
+                        match elem {
+                            TemplateElement::SpecialToken { token_id, .. } => {
+                                processed.push(*token_id);
+                            }
+                            TemplateElement::Sequence { .. } => {
+                                processed.extend(&tokens);
+                            }
+                        }
+                    }
+                    return Ok(processed);
+                }
+            }
+
+            if add_bos {
+                tokens.insert(0, self.special_tokens.bos_token_id);
+            }
         } else {
-            // SentencePiece uses greedy longest-match algorithm
-            tokens.extend(self.encode_sentencepiece(text)?);
+            // GGUF path (existing behavior)
+            if add_bos {
+                tokens.push(self.special_tokens.bos_token_id);
+            }
+            if !self.merges.is_empty() {
+                tokens.extend(self.encode_bpe(text)?);
+            } else {
+                tokens.extend(self.encode_sentencepiece(text)?);
+            }
         }
 
         Ok(tokens)
@@ -604,6 +846,213 @@ impl Tokenizer {
         Ok(tokens)
     }
 
+    /// Unigram encoding using Viterbi algorithm (for HuggingFace Unigram models)
+    fn encode_unigram(&self, text: &str) -> TokenizerResult<Vec<u32>> {
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let char_boundaries: Vec<usize> = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        let n = char_boundaries.len() - 1;
+
+        const NEG_INF: f64 = -1e18;
+        let mut best_score = vec![NEG_INF; n + 1];
+        let mut best_path: Vec<Option<(u32, usize)>> = vec![None; n + 1];
+        best_score[0] = 0.0;
+
+        let max_token_chars = 128;
+
+        for end in 1..=n {
+            let end_byte = char_boundaries[end];
+            let min_start = end.saturating_sub(max_token_chars);
+
+            for start in (min_start..end).rev() {
+                if best_score[start] <= NEG_INF {
+                    continue;
+                }
+                let start_byte = char_boundaries[start];
+                let substr = &text[start_byte..end_byte];
+
+                if let Some(&id) = self.token_to_id.get(substr) {
+                    let score = *self.scores.get(id as usize).unwrap_or(&0.0) as f64;
+                    let candidate = best_score[start] + score;
+                    if candidate > best_score[end] {
+                        best_score[end] = candidate;
+                        best_path[end] = Some((id, start));
+                    }
+                }
+            }
+
+            // Single-char byte fallback if no token found
+            if best_path[end].is_none() && best_score[end - 1] > NEG_INF {
+                let start_byte = char_boundaries[end - 1];
+                let end_byte_val = char_boundaries[end];
+                let ch_str = &text[start_byte..end_byte_val];
+
+                if let Some(&id) = self.token_to_id.get(ch_str) {
+                    let score = *self.scores.get(id as usize).unwrap_or(&-10.0) as f64;
+                    best_score[end] = best_score[end - 1] + score;
+                    best_path[end] = Some((id, end - 1));
+                } else {
+                    // Try byte-level fallback tokens
+                    for byte in ch_str.as_bytes() {
+                        let byte_token = format!("<0x{:02X}>", byte);
+                        if let Some(&id) = self.token_to_id.get(&byte_token) {
+                            let score = *self.scores.get(id as usize).unwrap_or(&-10.0) as f64;
+                            let candidate = best_score[end - 1] + score;
+                            if candidate > best_score[end] {
+                                best_score[end] = candidate;
+                                best_path[end] = Some((id, end - 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if best_score[n] <= NEG_INF {
+            return self.encode_unigram_fallback(text);
+        }
+
+        let mut result = Vec::new();
+        let mut pos = n;
+        while pos > 0 {
+            if let Some((token_id, start)) = best_path[pos] {
+                result.push(token_id);
+                pos = start;
+            } else {
+                break;
+            }
+        }
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Fallback for Unigram when Viterbi cannot find a complete path
+    fn encode_unigram_fallback(&self, text: &str) -> TokenizerResult<Vec<u32>> {
+        let mut result = Vec::new();
+        for ch in text.chars() {
+            let ch_str = ch.to_string();
+            if let Some(&id) = self.token_to_id.get(&ch_str) {
+                result.push(id);
+            } else {
+                for byte in ch_str.as_bytes() {
+                    let byte_token = format!("<0x{:02X}>", byte);
+                    if let Some(&id) = self.token_to_id.get(&byte_token) {
+                        result.push(id);
+                    } else if let Some(unk_id) = self.special_tokens.unk_token_id {
+                        result.push(unk_id);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// WordPiece encoding using greedy longest-match with continuation prefix
+    fn encode_wordpiece(&self, text: &str) -> TokenizerResult<Vec<u32>> {
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut result = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+
+        // WordPiece operates on whitespace-split words
+        let words: Vec<String> = text.split_whitespace().map(|s| s.to_string()).collect();
+        let words = if words.is_empty() {
+            vec![text.to_string()]
+        } else {
+            words
+        };
+
+        for word in &words {
+            let word_chars: Vec<char> = word.chars().collect();
+            if word_chars.len() > 200 {
+                if let Some(unk_id) = self.special_tokens.unk_token_id {
+                    result.push(unk_id);
+                }
+                continue;
+            }
+
+            let mut start = 0;
+            let mut is_first_subword = true;
+
+            while start < word_chars.len() {
+                let mut end = word_chars.len();
+                let mut found = false;
+
+                while start < end {
+                    let substr: String = word_chars[start..end].iter().collect();
+                    let candidate = if is_first_subword {
+                        substr.clone()
+                    } else {
+                        format!("{}{}", self.wordpiece_prefix, substr)
+                    };
+
+                    if let Some(&id) = self.token_to_id.get(&candidate) {
+                        result.push(id);
+                        found = true;
+                        break;
+                    }
+                    end -= 1;
+                }
+
+                if !found {
+                    if let Some(unk_id) = self.special_tokens.unk_token_id {
+                        result.push(unk_id);
+                    }
+                    break;
+                }
+
+                start = end;
+                is_first_subword = false;
+            }
+        }
+
+        let _ = chars; // suppress unused warning from pre-existing binding
+        Ok(result)
+    }
+
+    /// BPE encoding for a pre-tokenized segment (no further splitting)
+    fn encode_bpe_pretokenized(&self, text: &str) -> TokenizerResult<Vec<u32>> {
+        if let Some(&id) = self.token_to_id.get(text) {
+            return Ok(vec![id]);
+        }
+
+        let mut tokens = self.text_to_initial_tokens(text)?;
+
+        loop {
+            if tokens.len() < 2 {
+                break;
+            }
+
+            let mut best_merge: Option<(usize, u32, usize)> = None;
+            for i in 0..tokens.len() - 1 {
+                let pair = (tokens[i], tokens[i + 1]);
+                if let Some(&(merged_id, priority)) = self.merges.get(&pair)
+                    && (best_merge.is_none() || priority < best_merge.unwrap().2)
+                {
+                    best_merge = Some((i, merged_id, priority));
+                }
+            }
+
+            match best_merge {
+                Some((pos, merged_id, _)) => {
+                    tokens[pos] = merged_id;
+                    tokens.remove(pos + 1);
+                }
+                None => break,
+            }
+        }
+
+        Ok(tokens)
+    }
+
     /// Decode token IDs to text
     pub fn decode(&self, tokens: &[u32]) -> TokenizerResult<String> {
         if let Some(ref u2b) = self.gpt2_unicode_to_byte {
@@ -808,13 +1257,11 @@ impl Tokenizer {
         let root: serde_json::Value = serde_json::from_str(json)
             .map_err(|e| TokenizerError::EncodingError(format!("Invalid tokenizer.json: {}", e)))?;
 
-        // Extract the model section
         let model = root
             .get("model")
             .ok_or_else(|| TokenizerError::MissingData("model section in tokenizer.json".into()))?;
 
         let model_type = model.get("type").and_then(|v| v.as_str()).unwrap_or("BPE");
-
         let tokenizer_type = match model_type {
             "BPE" => TokenizerType::BPE,
             "Unigram" => TokenizerType::SentencePiece,
@@ -822,50 +1269,136 @@ impl Tokenizer {
             _ => TokenizerType::Unknown,
         };
 
-        // Parse vocabulary from model.vocab
-        // HF BPE vocab is an object: { "token": id, ... }
-        let vocab_obj = model
-            .get("vocab")
-            .ok_or_else(|| TokenizerError::MissingData("model.vocab in tokenizer.json".into()))?;
-
-        let vocab_map = vocab_obj
-            .as_object()
-            .ok_or_else(|| TokenizerError::MissingData("model.vocab should be an object".into()))?;
-
-        let vocab_size = vocab_map.len();
-        let mut token_to_id = HashMap::with_capacity(vocab_size);
-        let mut id_to_token = vec![String::new(); vocab_size];
-
-        for (token, id_val) in vocab_map {
-            let id = id_val.as_u64().ok_or_else(|| {
-                TokenizerError::MissingData(format!("Invalid vocab ID for '{}'", token))
-            })? as u32;
-            token_to_id.insert(token.clone(), id);
-            if (id as usize) < id_to_token.len() {
-                id_to_token[id as usize] = token.clone();
-            }
-        }
-
-        // Parse BPE merges from model.merges
+        let mut token_to_id = HashMap::new();
+        let mut id_to_token = Vec::new();
+        let mut scores = Vec::new();
         let mut merges = HashMap::new();
-        if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
-            for (priority, merge_val) in merges_arr.iter().enumerate() {
-                if let Some(merge_str) = merge_val.as_str() {
-                    let parts: Vec<&str> = merge_str.split(' ').collect();
-                    if parts.len() == 2
-                        && let (Some(&id1), Some(&id2)) =
-                            (token_to_id.get(parts[0]), token_to_id.get(parts[1]))
-                    {
-                        let merged = format!("{}{}", parts[0], parts[1]);
-                        if let Some(&merged_id) = token_to_id.get(&merged) {
-                            merges.insert((id1, id2), (merged_id, priority));
+        let mut wordpiece_prefix = "##".to_string();
+        let mut model_unk_token: Option<String> = None;
+
+        match tokenizer_type {
+            TokenizerType::SentencePiece => {
+                // Unigram: vocab is [[token, score], ...]
+                let vocab_arr = model
+                    .get("vocab")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        TokenizerError::MissingData("Unigram vocab array".into())
+                    })?;
+
+                id_to_token = Vec::with_capacity(vocab_arr.len());
+                scores = Vec::with_capacity(vocab_arr.len());
+
+                for (id, entry) in vocab_arr.iter().enumerate() {
+                    let arr = entry.as_array().ok_or_else(|| {
+                        TokenizerError::MissingData(format!(
+                            "Unigram vocab entry {} not an array",
+                            id
+                        ))
+                    })?;
+                    let token = arr
+                        .first()
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            TokenizerError::MissingData(format!(
+                                "Unigram vocab entry {} missing token",
+                                id
+                            ))
+                        })?;
+                    let score = arr
+                        .get(1)
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32;
+
+                    token_to_id.insert(token.to_string(), id as u32);
+                    id_to_token.push(token.to_string());
+                    scores.push(score);
+                }
+
+                if let Some(unk_id) = model.get("unk_id").and_then(|v| v.as_u64()) {
+                    model_unk_token = id_to_token.get(unk_id as usize).cloned();
+                }
+            }
+            TokenizerType::WordPiece => {
+                // WordPiece: vocab is { token: id, ... }
+                let vocab_obj = model
+                    .get("vocab")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| {
+                        TokenizerError::MissingData("WordPiece vocab object".into())
+                    })?;
+
+                let vocab_size = vocab_obj.len();
+                id_to_token = vec![String::new(); vocab_size];
+
+                for (token, id_val) in vocab_obj {
+                    let id = id_val.as_u64().ok_or_else(|| {
+                        TokenizerError::MissingData(format!("Invalid vocab ID for '{}'", token))
+                    })? as u32;
+                    token_to_id.insert(token.clone(), id);
+                    if (id as usize) < id_to_token.len() {
+                        id_to_token[id as usize] = token.clone();
+                    }
+                }
+
+                if let Some(prefix) = model
+                    .get("continuing_subword_prefix")
+                    .and_then(|v| v.as_str())
+                {
+                    wordpiece_prefix = prefix.to_string();
+                }
+                if let Some(unk) = model.get("unk_token").and_then(|v| v.as_str()) {
+                    model_unk_token = Some(unk.to_string());
+                }
+
+                scores = vec![0.0; id_to_token.len()];
+            }
+            _ => {
+                // BPE: vocab is { token: id, ... }
+                let vocab_obj = model
+                    .get("vocab")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| {
+                        TokenizerError::MissingData("BPE vocab object".into())
+                    })?;
+
+                let vocab_size = vocab_obj.len();
+                id_to_token = vec![String::new(); vocab_size];
+
+                for (token, id_val) in vocab_obj {
+                    let id = id_val.as_u64().ok_or_else(|| {
+                        TokenizerError::MissingData(format!("Invalid vocab ID for '{}'", token))
+                    })? as u32;
+                    token_to_id.insert(token.clone(), id);
+                    if (id as usize) < id_to_token.len() {
+                        id_to_token[id as usize] = token.clone();
+                    }
+                }
+
+                if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
+                    for (priority, merge_val) in merges_arr.iter().enumerate() {
+                        if let Some(merge_str) = merge_val.as_str() {
+                            let parts: Vec<&str> = merge_str.split(' ').collect();
+                            if parts.len() == 2
+                                && let (Some(&id1), Some(&id2)) =
+                                    (token_to_id.get(parts[0]), token_to_id.get(parts[1]))
+                            {
+                                let merged = format!("{}{}", parts[0], parts[1]);
+                                if let Some(&merged_id) = token_to_id.get(&merged) {
+                                    merges.insert((id1, id2), (merged_id, priority));
+                                }
+                            }
                         }
                     }
                 }
+
+                scores = vec![0.0; id_to_token.len()];
             }
         }
 
-        // Parse special tokens from added_tokens
+        let vocab_size = id_to_token.len();
+
+        // Parse added_tokens and detect special token roles
         let mut bos_token_id: Option<u32> = None;
         let mut eos_token_id: Option<u32> = None;
         let mut pad_token_id: Option<u32> = None;
@@ -886,43 +1419,49 @@ impl Tokenizer {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                if special && let Some(id) = id {
-                    // Detect special token roles by common names
-                    let content_lower = content.to_lowercase();
-                    if content_lower.contains("bos")
-                        || content == "<s>"
-                        || content == "<|begin_of_text|>"
-                        || content == "<|startoftext|>"
-                    {
-                        bos_token_id = Some(id);
-                    }
-                    if content_lower.contains("eos")
-                        || content == "</s>"
-                        || content == "<|end_of_text|>"
-                        || content == "<|endoftext|>"
-                        || content == "<|eot_id|>"
-                    {
-                        eos_token_id = Some(id);
-                    }
-                    if content_lower.contains("pad") || content == "<pad>" {
-                        pad_token_id = Some(id);
-                    }
-                    if content_lower.contains("unk") || content == "<unk>" {
-                        unk_token_id = Some(id);
-                    }
-
-                    // Make sure the special token is in the vocab
+                if let Some(id) = id {
                     token_to_id.insert(content.to_string(), id);
                     if (id as usize) < id_to_token.len() {
                         id_to_token[id as usize] = content.to_string();
+                    }
+
+                    if special {
+                        let content_lower = content.to_lowercase();
+                        if content_lower.contains("bos")
+                            || content == "<s>"
+                            || content == "<|begin_of_text|>"
+                            || content == "<|startoftext|>"
+                        {
+                            bos_token_id = Some(id);
+                        }
+                        if content_lower.contains("eos")
+                            || content == "</s>"
+                            || content == "<|end_of_text|>"
+                            || content == "<|endoftext|>"
+                            || content == "<|eot_id|>"
+                        {
+                            eos_token_id = Some(id);
+                        }
+                        if content_lower.contains("pad") || content == "<pad>" {
+                            pad_token_id = Some(id);
+                        }
+                        if content_lower.contains("unk") || content == "<unk>" {
+                            unk_token_id = Some(id);
+                        }
                     }
                 }
             }
         }
 
-        // Also check post_processor for special token IDs
+        // Resolve unk from model section if not found in added_tokens
+        if unk_token_id.is_none() {
+            if let Some(ref unk_str) = model_unk_token {
+                unk_token_id = token_to_id.get(unk_str).copied();
+            }
+        }
+
+        // Check post_processor for special token IDs
         if let Some(post_proc) = root.get("post_processor") {
-            // TemplateProcessing format
             if let Some(special_tokens_map) = post_proc.get("special_tokens") {
                 if let Some(bos_obj) = special_tokens_map
                     .get("<s>")
@@ -950,7 +1489,7 @@ impl Tokenizer {
             unk_token_id,
         };
 
-        // Build token types (all normal for HF tokenizer, mark specials as Control)
+        // Build token types
         let mut token_types = vec![TokenType::Normal; vocab_size];
         for &id in [special_tokens.bos_token_id, special_tokens.eos_token_id].iter() {
             if (id as usize) < token_types.len() {
@@ -967,8 +1506,6 @@ impl Tokenizer {
         {
             token_types[unk_id as usize] = TokenType::Control;
         }
-
-        // Mark byte tokens
         for (token, &id) in &token_to_id {
             if token.starts_with("<0x")
                 && token.ends_with('>')
@@ -979,26 +1516,263 @@ impl Tokenizer {
             }
         }
 
-        let scores = vec![0.0; vocab_size];
+        // Detect GPT-2 byte-level BPE
+        let uses_byte_level = root
+            .get("pre_tokenizer")
+            .and_then(|v| v.get("type").or_else(|| {
+                // Handle Sequence pre-tokenizer containing ByteLevel
+                v.get("pretokenizers").and_then(|arr| {
+                    arr.as_array().and_then(|a| {
+                        a.iter().find_map(|pt| {
+                            pt.get("type").filter(|t| t.as_str() == Some("ByteLevel"))
+                        })
+                    })
+                })
+            }))
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "ByteLevel");
 
-        // HF BPE tokenizers are GPT-2 byte-level
-        let gpt2_unicode_to_byte = if tokenizer_type == TokenizerType::BPE {
+        let gpt2_unicode_to_byte = if tokenizer_type == TokenizerType::BPE && uses_byte_level {
             Some(build_gpt2_unicode_to_byte())
         } else {
             None
         };
 
+        // Parse HF pipeline components
+        let normalizer = root.get("normalizer")
+            .and_then(|v| if v.is_null() { None } else { Self::parse_normalizer(v) });
+        let pre_tokenizer = root.get("pre_tokenizer")
+            .and_then(|v| if v.is_null() { None } else { Self::parse_pre_tokenizer(v) });
+        let post_processor = root.get("post_processor")
+            .and_then(|v| if v.is_null() { None } else { Self::parse_post_processor(v, &token_to_id) });
+
         Ok(Self {
             token_to_id,
             id_to_token,
-            _scores: scores,
+            scores,
             merges,
             special_tokens,
             tokenizer_type,
             vocab_size,
             token_types,
             gpt2_unicode_to_byte,
+            normalizer,
+            pre_tokenizer,
+            post_processor,
+            wordpiece_prefix,
         })
+    }
+
+    fn parse_normalizer(value: &serde_json::Value) -> Option<Normalizer> {
+        let type_str = value.get("type")?.as_str()?;
+        match type_str {
+            "NFC" => Some(Normalizer::NFC),
+            "NFKC" => Some(Normalizer::NFKC),
+            "NFD" => Some(Normalizer::NFD),
+            "NFKD" => Some(Normalizer::NFKD),
+            "Lowercase" => Some(Normalizer::Lowercase),
+            "Strip" => {
+                let left = value.get("strip_left").and_then(|v| v.as_bool()).unwrap_or(true);
+                let right = value.get("strip_right").and_then(|v| v.as_bool()).unwrap_or(true);
+                Some(Normalizer::Strip { left, right })
+            }
+            "Prepend" => {
+                let prepend = value.get("prepend").and_then(|v| v.as_str()).unwrap_or("▁");
+                Some(Normalizer::Prepend(prepend.to_string()))
+            }
+            "Replace" => {
+                let pattern = value
+                    .get("pattern")
+                    .and_then(|v| v.get("String").and_then(|s| s.as_str()))
+                    .unwrap_or("");
+                let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                Some(Normalizer::Replace {
+                    pattern: pattern.to_string(),
+                    content: content.to_string(),
+                })
+            }
+            "StripAccents" => Some(Normalizer::StripAccents),
+            "Sequence" => {
+                let normalizers = value.get("normalizers")?.as_array()?;
+                let parsed: Vec<Normalizer> = normalizers
+                    .iter()
+                    .filter_map(|v| Self::parse_normalizer(v))
+                    .collect();
+                if parsed.is_empty() {
+                    None
+                } else {
+                    Some(Normalizer::Sequence(parsed))
+                }
+            }
+            "BertNormalizer" => {
+                let mut seq = Vec::new();
+                if value
+                    .get("lowercase")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+                {
+                    seq.push(Normalizer::Lowercase);
+                }
+                if value
+                    .get("strip_accents")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    seq.push(Normalizer::StripAccents);
+                }
+                match seq.len() {
+                    0 => None,
+                    1 => Some(seq.remove(0)),
+                    _ => Some(Normalizer::Sequence(seq)),
+                }
+            }
+            "Precompiled" => Some(Normalizer::NFC),
+            _ => None,
+        }
+    }
+
+    fn parse_pre_tokenizer(value: &serde_json::Value) -> Option<PreTokenizer> {
+        let type_str = value.get("type")?.as_str()?;
+        match type_str {
+            "ByteLevel" => {
+                let add_prefix_space = value
+                    .get("add_prefix_space")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                Some(PreTokenizer::ByteLevel { add_prefix_space })
+            }
+            "Whitespace" | "WhitespaceSplit" => Some(PreTokenizer::Whitespace),
+            "Metaspace" => {
+                let replacement = value
+                    .get("replacement")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('▁');
+                let add_prefix_space = value
+                    .get("add_prefix_space")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                Some(PreTokenizer::Metaspace {
+                    replacement,
+                    add_prefix_space,
+                })
+            }
+            "Punctuation" | "BertPreTokenizer" => Some(PreTokenizer::Punctuation),
+            "Digits" => {
+                let individual_digits = value
+                    .get("individual_digits")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Some(PreTokenizer::Digits { individual_digits })
+            }
+            "Sequence" => {
+                let pretokenizers = value.get("pretokenizers")?.as_array()?;
+                let parsed: Vec<PreTokenizer> = pretokenizers
+                    .iter()
+                    .filter_map(|v| Self::parse_pre_tokenizer(v))
+                    .collect();
+                if parsed.is_empty() {
+                    None
+                } else {
+                    Some(PreTokenizer::Sequence(parsed))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_post_processor(
+        value: &serde_json::Value,
+        token_to_id: &HashMap<String, u32>,
+    ) -> Option<PostProcessor> {
+        let type_str = value.get("type")?.as_str()?;
+        match type_str {
+            "TemplateProcessing" => {
+                let parse_template = |arr: &[serde_json::Value]| -> Vec<TemplateElement> {
+                    arr.iter()
+                        .filter_map(|item| {
+                            if let Some(special) = item.get("SpecialToken") {
+                                let id_str = special.get("id")?.as_str()?;
+                                let token_id = token_to_id.get(id_str).copied()?;
+                                Some(TemplateElement::SpecialToken {
+                                    id: id_str.to_string(),
+                                    token_id,
+                                })
+                            } else if item.get("Sequence").is_some() {
+                                let type_id = item
+                                    .get("Sequence")
+                                    .and_then(|s| s.get("id"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0) as u32;
+                                Some(TemplateElement::Sequence { type_id })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                };
+
+                let single = value
+                    .get("single")
+                    .and_then(|v| v.as_array())
+                    .map(|a| parse_template(a))
+                    .unwrap_or_default();
+                let pair = value
+                    .get("pair")
+                    .and_then(|v| v.as_array())
+                    .map(|a| parse_template(a))
+                    .unwrap_or_default();
+
+                Some(PostProcessor::TemplateProcessing { single, pair })
+            }
+            "ByteLevel" => {
+                let trim_offsets = value
+                    .get("trim_offsets")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                Some(PostProcessor::ByteLevel { trim_offsets })
+            }
+            "BertProcessing" => {
+                let mut single = Vec::new();
+                let mut pair = Vec::new();
+
+                if let Some(cls) = value.get("cls").and_then(|v| v.as_array()) {
+                    if let (Some(token), Some(id)) = (
+                        cls.first().and_then(|v| v.as_str()),
+                        cls.get(1).and_then(|v| v.as_u64()),
+                    ) {
+                        let elem = TemplateElement::SpecialToken {
+                            id: token.to_string(),
+                            token_id: id as u32,
+                        };
+                        single.push(elem.clone());
+                        pair.push(elem);
+                    }
+                }
+
+                single.push(TemplateElement::Sequence { type_id: 0 });
+                pair.push(TemplateElement::Sequence { type_id: 0 });
+
+                if let Some(sep) = value.get("sep").and_then(|v| v.as_array()) {
+                    if let (Some(token), Some(id)) = (
+                        sep.first().and_then(|v| v.as_str()),
+                        sep.get(1).and_then(|v| v.as_u64()),
+                    ) {
+                        let elem = TemplateElement::SpecialToken {
+                            id: token.to_string(),
+                            token_id: id as u32,
+                        };
+                        single.push(elem.clone());
+                        pair.push(elem.clone());
+                        pair.push(TemplateElement::Sequence { type_id: 1 });
+                        pair.push(elem);
+                    }
+                }
+
+                Some(PostProcessor::TemplateProcessing { single, pair })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1056,5 +1830,323 @@ mod tests {
         let bytes: Vec<u8> = "ðŁĺĬ".chars().map(|c| table[&c]).collect();
         let decoded = String::from_utf8(bytes).unwrap();
         assert_eq!(decoded, "😊");
+    }
+
+    #[test]
+    fn test_normalizer_nfc() {
+        let norm = Normalizer::NFC;
+        // U+00E9 (é precomposed) vs U+0065 + U+0301 (e + combining acute)
+        let decomposed = "e\u{0301}";
+        let result = norm.apply(decomposed);
+        assert_eq!(result, "\u{00E9}");
+    }
+
+    #[test]
+    fn test_normalizer_lowercase() {
+        let norm = Normalizer::Lowercase;
+        assert_eq!(norm.apply("HELLO World"), "hello world");
+    }
+
+    #[test]
+    fn test_normalizer_strip_accents() {
+        let norm = Normalizer::StripAccents;
+        assert_eq!(norm.apply("café"), "cafe");
+        assert_eq!(norm.apply("naïve"), "naive");
+    }
+
+    #[test]
+    fn test_normalizer_sequence() {
+        let norm = Normalizer::Sequence(vec![
+            Normalizer::NFKC,
+            Normalizer::Lowercase,
+        ]);
+        assert_eq!(norm.apply("HÉLLO"), "héllo");
+    }
+
+    #[test]
+    fn test_normalizer_replace() {
+        let norm = Normalizer::Replace {
+            pattern: " ".to_string(),
+            content: "▁".to_string(),
+        };
+        assert_eq!(norm.apply("hello world"), "hello▁world");
+    }
+
+    #[test]
+    fn test_pre_tokenizer_whitespace() {
+        let pt = PreTokenizer::Whitespace;
+        assert_eq!(pt.apply("Hello world  test"), vec!["Hello", "world", "test"]);
+    }
+
+    #[test]
+    fn test_pre_tokenizer_byte_level() {
+        let pt = PreTokenizer::ByteLevel { add_prefix_space: true };
+        let result = pt.apply("Hello world");
+        assert_eq!(result, vec![" Hello", " world"]);
+
+        let pt_no_space = PreTokenizer::ByteLevel { add_prefix_space: false };
+        let result = pt_no_space.apply("Hello world");
+        assert_eq!(result, vec!["Hello", " world"]);
+    }
+
+    #[test]
+    fn test_pre_tokenizer_punctuation() {
+        let pt = PreTokenizer::Punctuation;
+        let result = pt.apply("Hello, world!");
+        assert_eq!(result, vec!["Hello", ",", " world", "!"]);
+    }
+
+    #[test]
+    fn test_pre_tokenizer_digits() {
+        let pt = PreTokenizer::Digits { individual_digits: true };
+        let result = pt.apply("abc123def");
+        assert_eq!(result, vec!["abc", "1", "2", "3", "def"]);
+    }
+
+    #[test]
+    fn test_pre_tokenizer_sequence() {
+        let pt = PreTokenizer::Sequence(vec![
+            PreTokenizer::Whitespace,
+            PreTokenizer::Punctuation,
+        ]);
+        let result = pt.apply("Hello, world!");
+        assert_eq!(result, vec!["Hello", ",", "world", "!"]);
+    }
+
+    #[test]
+    fn test_unigram_from_hf_json() {
+        let json = r#"{
+            "model": {
+                "type": "Unigram",
+                "unk_id": 0,
+                "vocab": [
+                    ["<unk>", 0.0],
+                    ["▁", -1.0],
+                    ["▁the", -2.0],
+                    ["▁a", -2.5],
+                    ["h", -3.0],
+                    ["e", -3.0],
+                    ["l", -3.0],
+                    ["o", -3.0],
+                    ["he", -2.0],
+                    ["llo", -2.5]
+                ]
+            },
+            "pre_tokenizer": {
+                "type": "Metaspace",
+                "replacement": "▁",
+                "add_prefix_space": true
+            },
+            "added_tokens": [
+                {"id": 0, "content": "<unk>", "special": true}
+            ]
+        }"#;
+
+        let tok = Tokenizer::from_hf_json_str(json).unwrap();
+        assert_eq!(tok.tokenizer_type, TokenizerType::SentencePiece);
+        assert_eq!(tok.vocab_size, 10);
+        assert!(tok.scores.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_wordpiece_from_hf_json() {
+        let json = r###"{
+            "model": {
+                "type": "WordPiece",
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "vocab": {
+                    "[UNK]": 0,
+                    "[CLS]": 1,
+                    "[SEP]": 2,
+                    "hello": 3,
+                    "world": 4,
+                    "he": 5,
+                    "##llo": 6,
+                    "wo": 7,
+                    "##rld": 8
+                }
+            },
+            "normalizer": {
+                "type": "BertNormalizer",
+                "lowercase": true,
+                "strip_accents": false
+            },
+            "pre_tokenizer": {
+                "type": "BertPreTokenizer"
+            },
+            "added_tokens": [
+                {"id": 0, "content": "[UNK]", "special": true},
+                {"id": 1, "content": "[CLS]", "special": true},
+                {"id": 2, "content": "[SEP]", "special": true}
+            ]
+        }"###;
+
+        let tok = Tokenizer::from_hf_json_str(json).unwrap();
+        assert_eq!(tok.tokenizer_type, TokenizerType::WordPiece);
+        assert_eq!(tok.wordpiece_prefix, "##");
+
+        // "hello" should encode to [3] (direct match)
+        let tokens = tok.encode("hello", false).unwrap();
+        assert_eq!(tokens, vec![3]);
+
+        // "hello world" should encode to [3, 4] (both direct matches after whitespace split)
+        let tokens = tok.encode("hello world", false).unwrap();
+        assert_eq!(tokens, vec![3, 4]);
+    }
+
+    #[test]
+    fn test_wordpiece_subword_splitting() {
+        let json = r###"{
+            "model": {
+                "type": "WordPiece",
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "vocab": {
+                    "[UNK]": 0,
+                    "un": 1,
+                    "##know": 2,
+                    "##n": 3,
+                    "unknown": 4,
+                    "the": 5,
+                    "##s": 6
+                }
+            },
+            "pre_tokenizer": { "type": "Whitespace" },
+            "added_tokens": [
+                {"id": 0, "content": "[UNK]", "special": true}
+            ]
+        }"###;
+
+        let tok = Tokenizer::from_hf_json_str(json).unwrap();
+
+        // "unknown" is a direct vocabulary match
+        let tokens = tok.encode("unknown", false).unwrap();
+        assert_eq!(tokens, vec![4]);
+
+        // "the" should encode to [5]
+        let tokens = tok.encode("the", false).unwrap();
+        assert_eq!(tokens, vec![5]);
+
+        // "thes" should split to "the" + "##s"
+        let tokens = tok.encode("thes", false).unwrap();
+        assert_eq!(tokens, vec![5, 6]);
+    }
+
+    #[test]
+    fn test_unigram_viterbi_encoding() {
+        let json = r#"{
+            "model": {
+                "type": "Unigram",
+                "unk_id": 0,
+                "vocab": [
+                    ["<unk>", 0.0],
+                    ["a", -1.0],
+                    ["b", -1.0],
+                    ["c", -1.0],
+                    ["ab", -0.5],
+                    ["bc", -0.5],
+                    ["abc", -0.1]
+                ]
+            },
+            "pre_tokenizer": { "type": "Whitespace" },
+            "added_tokens": [
+                {"id": 0, "content": "<unk>", "special": true}
+            ]
+        }"#;
+
+        let tok = Tokenizer::from_hf_json_str(json).unwrap();
+
+        // "abc" should prefer the single token [abc] (score -0.1) over
+        // [a,bc] (score -1.5) or [ab,c] (score -1.5) or [a,b,c] (score -3.0)
+        let tokens = tok.encode("abc", false).unwrap();
+        assert_eq!(tokens, vec![6]); // id 6 = "abc"
+    }
+
+    #[test]
+    fn test_bpe_with_pipeline() {
+        let json = r#"{
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "h": 0,
+                    "e": 1,
+                    "l": 2,
+                    "o": 3,
+                    "he": 4,
+                    "ll": 5,
+                    "hello": 6,
+                    " ": 7
+                },
+                "merges": [
+                    "h e",
+                    "l l",
+                    "he ll",
+                    "hell o"
+                ]
+            },
+            "pre_tokenizer": {
+                "type": "ByteLevel",
+                "add_prefix_space": false
+            },
+            "added_tokens": []
+        }"#;
+
+        let tok = Tokenizer::from_hf_json_str(json).unwrap();
+        assert_eq!(tok.tokenizer_type, TokenizerType::BPE);
+        assert!(tok.pre_tokenizer.is_some());
+
+        // Should encode "hello" -> merge h+e=he, l+l=ll, he+ll=hell, hell+o=hello -> [6]
+        let tokens = tok.encode("hello", false).unwrap();
+        assert_eq!(tokens, vec![6]);
+    }
+
+    #[test]
+    fn test_parse_normalizer_types() {
+        let nfc: serde_json::Value = serde_json::from_str(r#"{"type": "NFC"}"#).unwrap();
+        let result = Tokenizer::parse_normalizer(&nfc);
+        assert!(matches!(result, Some(Normalizer::NFC)));
+
+        let bert: serde_json::Value = serde_json::from_str(
+            r#"{"type": "BertNormalizer", "lowercase": true, "strip_accents": true}"#,
+        )
+        .unwrap();
+        let result = Tokenizer::parse_normalizer(&bert);
+        assert!(matches!(result, Some(Normalizer::Sequence(_))));
+
+        let seq: serde_json::Value = serde_json::from_str(
+            r#"{"type": "Sequence", "normalizers": [{"type": "NFC"}, {"type": "Lowercase"}]}"#,
+        )
+        .unwrap();
+        let result = Tokenizer::parse_normalizer(&seq);
+        assert!(matches!(result, Some(Normalizer::Sequence(_))));
+    }
+
+    #[test]
+    fn test_parse_pre_tokenizer_types() {
+        let bl: serde_json::Value =
+            serde_json::from_str(r#"{"type": "ByteLevel", "add_prefix_space": false}"#).unwrap();
+        let result = Tokenizer::parse_pre_tokenizer(&bl);
+        assert!(matches!(
+            result,
+            Some(PreTokenizer::ByteLevel { add_prefix_space: false })
+        ));
+
+        let meta: serde_json::Value = serde_json::from_str(
+            r#"{"type": "Metaspace", "replacement": "▁", "add_prefix_space": true}"#,
+        )
+        .unwrap();
+        let result = Tokenizer::parse_pre_tokenizer(&meta);
+        assert!(matches!(
+            result,
+            Some(PreTokenizer::Metaspace { add_prefix_space: true, .. })
+        ));
+
+        let seq: serde_json::Value = serde_json::from_str(
+            r#"{"type": "Sequence", "pretokenizers": [{"type": "Whitespace"}, {"type": "Punctuation"}]}"#,
+        )
+        .unwrap();
+        let result = Tokenizer::parse_pre_tokenizer(&seq);
+        assert!(matches!(result, Some(PreTokenizer::Sequence(_))));
     }
 }

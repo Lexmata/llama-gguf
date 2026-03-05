@@ -1630,115 +1630,53 @@ fn run_quantize(
     qtype: &str,
     threads: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use llama_gguf::tensor::DType;
+    use llama_gguf::gguf::{quantize_model, GgmlType, QuantizeOptions};
 
-    // Parse target quantization type
-    let target_dtype = match qtype.to_lowercase().as_str() {
-        "q4_0" => DType::Q4_0,
-        "q4_1" => DType::Q4_1,
-        "q5_0" => DType::Q5_0,
-        "q5_1" => DType::Q5_1,
-        "q8_0" => DType::Q8_0,
-        "q2_k" | "q2k" => DType::Q2K,
-        "q3_k" | "q3k" => DType::Q3K,
-        "q4_k" | "q4k" => DType::Q4K,
-        "q5_k" | "q5k" => DType::Q5K,
-        "q6_k" | "q6k" => DType::Q6K,
-        _ => {
-            return Err(format!(
-                "Unknown quantization type: {}. Supported: q4_0, q4_1, q5_0, q5_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k",
-                qtype
-            )
-            .into());
-        }
+    let target_type = match qtype.to_lowercase().as_str() {
+        "q4_0" => GgmlType::Q4_0,
+        "q4_1" => GgmlType::Q4_1,
+        "q5_0" => GgmlType::Q5_0,
+        "q5_1" => GgmlType::Q5_1,
+        "q8_0" => GgmlType::Q8_0,
+        "q2_k" | "q2k" => GgmlType::Q2K,
+        "q3_k" | "q3k" => GgmlType::Q3K,
+        "q4_k" | "q4k" => GgmlType::Q4K,
+        "q5_k" | "q5k" => GgmlType::Q5K,
+        "q6_k" | "q6k" => GgmlType::Q6K,
+        _ => return Err(format!("Unknown quantization type: {}", qtype).into()),
     };
 
-    // Set thread count if specified
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .ok();
-    }
+    let options = QuantizeOptions {
+        target_type,
+        threads: threads.unwrap_or(4),
+        ..Default::default()
+    };
 
-    eprintln!("╭─────────────────────────────────────────────────────────────────╮");
-    eprintln!("│                     Model Quantization                          │");
-    eprintln!("╰─────────────────────────────────────────────────────────────────╯");
+    eprintln!("Quantizing {} -> {} ({})", input_path, output_path, qtype);
+
+    let progress = Some(Box::new(|current: usize, total: usize, name: &str| {
+        eprintln!("[{}/{}] {}", current + 1, total, name);
+    }) as Box<dyn Fn(usize, usize, &str) + Send>);
+
+    let stats = quantize_model(input_path, output_path, &options, progress)?;
+
     eprintln!();
-    eprintln!("Input: {}", input_path);
-    eprintln!("Output: {}", output_path);
-    eprintln!("Target type: {:?}", target_dtype);
-    eprintln!();
-
-    // Load input model
-    eprintln!("Loading input model...");
-    let gguf = GgufFile::open(input_path)?;
-
-    eprintln!("Model has {} tensors", gguf.data.tensors.len());
-
-    // Count tensors by type
-    let mut dtype_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for tensor in &gguf.data.tensors {
-        let dtype_str = format!("{:?}", tensor.dtype);
-        *dtype_counts.entry(dtype_str).or_insert(0) += 1;
-    }
-
-    eprintln!("Tensor types:");
-    let mut sorted_types: Vec<_> = dtype_counts.iter().collect();
-    sorted_types.sort_by(|a, b| b.1.cmp(a.1));
-    for (dtype, count) in sorted_types {
-        eprintln!("  {}: {}", dtype, count);
-    }
-
-    // Note: Full quantization would require:
-    // 1. Reading each tensor
-    // 2. Converting to F32 if needed
-    // 3. Quantizing to target format
-    // 4. Writing new GGUF file
-    //
-    // This is a complex operation that requires a GGUF writer (not yet implemented)
-    eprintln!();
-    eprintln!("Note: Full quantization requires GGUF writer (not yet implemented).");
-    eprintln!("This command currently only analyzes the model for quantization.");
-    eprintln!();
-
-    // Calculate estimated sizes
-    let mut current_size = 0usize;
-    let mut estimated_size = 0usize;
-
-    for tensor in &gguf.data.tensors {
-        let n_elements: usize = tensor.dims.iter().map(|&d| d as usize).product();
-
-        // Current size
-        let current_dtype = DType::from(tensor.dtype);
-        current_size += current_dtype.size_for_elements(n_elements);
-
-        // Estimated size after quantization
-        // Only quantize weight tensors (not embeddings, norms, etc.)
-        let should_quantize = tensor.name.contains("weight")
-            && !tensor.name.contains("norm")
-            && !tensor.name.contains("embed");
-
-        if should_quantize && !current_dtype.is_quantized() {
-            estimated_size += target_dtype.size_for_elements(n_elements);
-        } else {
-            estimated_size += current_dtype.size_for_elements(n_elements);
-        }
-    }
-
-    eprintln!("Size analysis:");
+    eprintln!("Quantization complete:");
     eprintln!(
-        "  Current model size: {:.2} MB",
-        current_size as f64 / 1024.0 / 1024.0
+        "  Tensors quantized: {}/{}",
+        stats.tensors_quantized, stats.tensors_total
     );
     eprintln!(
-        "  Estimated quantized size: {:.2} MB",
-        estimated_size as f64 / 1024.0 / 1024.0
+        "  Original size: {:.2} MB",
+        stats.bytes_original as f64 / 1048576.0
     );
     eprintln!(
-        "  Estimated reduction: {:.1}%",
-        (1.0 - estimated_size as f64 / current_size as f64) * 100.0
+        "  Quantized size: {:.2} MB",
+        stats.bytes_quantized as f64 / 1048576.0
+    );
+    eprintln!(
+        "  Reduction: {:.1}%",
+        (1.0 - stats.bytes_quantized as f64 / stats.bytes_original as f64) * 100.0
     );
 
     Ok(())

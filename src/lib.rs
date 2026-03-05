@@ -29,6 +29,8 @@ pub mod backend;
 pub mod client;
 pub mod config;
 pub mod engine;
+#[cfg(feature = "server")]
+pub mod engine_batched;
 pub mod gguf;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
@@ -48,7 +50,13 @@ pub mod tokenizer;
 pub use config::{Config, ConfigError};
 pub use engine::{ChatEngine, ChatTemplate, Engine, EngineConfig, EngineError};
 pub use backend::{default_backend, Backend, BackendError};
-pub use gguf::{GgufBuilder, GgufData, GgufFile, GgufReader, GgufWriter, TensorToWrite};
+pub use backend::tensor_parallel::{
+    ShardingPlan, SingleDeviceTP, TPConfig, TensorParallel, merge_shards, shard_weight,
+};
+pub use gguf::{
+    GgufBuilder, GgufData, GgufFile, GgufReader, GgufWriter, TensorToWrite,
+    QuantizeOptions, QuantizeStats, quantize_model,
+};
 pub use model::{
     Architecture, InferenceContext, KVCache, LlamaModel, Model, ModelConfig, ModelError,
     ModelLoader, load_llama_model,
@@ -59,12 +67,16 @@ pub use model::{
     // MoE
     MoeConfig, MoeExpert, MoeLayer, MoeRouter, MoeStats,
     // Speculative decoding
-    SpeculativeConfig, SpeculativeDecoder, SpeculativeStats,
+    SpeculativeConfig, SpeculativeDecoder, SpeculativeMode, SpeculativeStats,
     // Embeddings
     EmbeddingConfig, EmbeddingError, EmbeddingExtractor, PoolingStrategy, TruncationStrategy,
     cosine_similarity, dot_product, euclidean_distance, find_nearest,
     // Prompt cache
     CachedPrefix, PrefixId, PrefixSharing, PromptCache, PromptCacheConfig, PromptCacheStats,
+    // KV cache quantization
+    KVCacheFormat, QuantizedKVCache,
+    // Paged attention
+    BlockId, BlockTable, PageAllocator, PagedKVPool, PagedSequence, DEFAULT_BLOCK_SIZE,
 };
 pub use sampling::{
     Grammar, GrammarSampler, GbnfGrammar, JsonGrammar, RegexGrammar,
@@ -89,6 +101,20 @@ pub use rag::{
     EmbeddingGenerator,
     // Metadata filtering
     MetadataFilter,
+};
+
+#[cfg(feature = "rag-sqlite")]
+pub use rag::{
+    SqliteStore, SqliteConfig, SqliteDocument, SqliteNewDocument, SqliteMetadataFilter,
+    SqliteDistanceMetric,
+};
+
+#[cfg(all(feature = "rag-sqlite", not(feature = "rag")))]
+pub use rag::{RagError, RagResult};
+
+#[cfg(feature = "server")]
+pub use engine_batched::{
+    BatchFinishReason, BatchRequest, BatchToken, BatchedEngine, BatchedEngineConfig,
 };
 
 #[cfg(feature = "distributed")]

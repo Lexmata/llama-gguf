@@ -14,12 +14,14 @@ use crate::model::{
     KVCache, ModelConfig, RopeConfig, RopeScalingType, RopeType,
 };
 use crate::model::layers::{
-    Attention, FeedForward, Linear, RMSNorm, TransformerLayer,
+    Attention, AttentionLayer, FeedForward, FfnLayer, Linear, RMSNorm, TransformerLayer,
 };
 use crate::tensor::Tensor;
 
 use super::proto::shard_service_server::{ShardService, ShardServiceServer};
 use super::proto::{
+    AllReduceRequest, AllReduceResponse,
+    CapabilitiesRequest, CapabilitiesResponse,
     ConfigureRequest, ConfigureResponse, ForwardRequest, ForwardResponse, HealthRequest,
     HealthResponse, LayerData, LoadResponse, ResetRequest, ResetResponse,
 };
@@ -206,9 +208,10 @@ fn build_layer_from_tensors(
 
     Ok(TransformerLayer {
         attn_norm,
-        attention,
+        attn_layer: AttentionLayer::FullAttention(attention),
+        post_attn_norm: None,
         ffn_norm,
-        ffn,
+        ffn_layer: FfnLayer::Dense(ffn),
         layer_idx,
     })
 }
@@ -369,6 +372,7 @@ impl ShardService for ShardServer {
         &self,
         request: Request<ForwardRequest>,
     ) -> Result<Response<ForwardResponse>, Status> {
+        let start = std::time::Instant::now();
         let req = request.into_inner();
 
         let mut state = self.state.lock().await;
@@ -380,7 +384,6 @@ impl ShardService for ShardServer {
             Status::failed_precondition("shard not configured")
         })?;
 
-        // Deserialize input hidden state
         let hidden_proto = req.hidden_state.ok_or_else(|| {
             Status::invalid_argument("missing hidden_state")
         })?;
@@ -391,7 +394,6 @@ impl ShardService for ShardServer {
         let freq_base = config.rope_config.freq_base;
         let freq_scale = config.rope_config.freq_scale;
 
-        // Destructure state to allow simultaneous borrows of different fields
         let ShardState {
             ref layers,
             ref mut kv_cache,
@@ -413,6 +415,7 @@ impl ShardService for ShardServer {
                     freq_base,
                     freq_scale,
                     backend.as_ref(),
+                    None,
                 )
                 .map_err(|e| {
                     Status::internal(format!(
@@ -422,16 +425,16 @@ impl ShardService for ShardServer {
                 })?;
         }
 
-        // Update KV cache sequence length
         kv_cache.seq_len = position + 1;
 
-        // Serialize output hidden state
         let output_proto = tensor_to_proto(&hidden);
+        let latency_us = start.elapsed().as_micros() as u64;
 
         Ok(Response::new(ForwardResponse {
             hidden_state: Some(output_proto),
             success: true,
             error: String::new(),
+            forward_latency_us: latency_us,
         }))
     }
 
@@ -469,4 +472,94 @@ impl ShardService for ShardServer {
             gpu_available: state.backend.name() != "cpu",
         }))
     }
+
+    async fn get_capabilities(
+        &self,
+        _request: Request<CapabilitiesRequest>,
+    ) -> Result<Response<CapabilitiesResponse>, Status> {
+        let state = self.state.lock().await;
+        let backend_name = state.backend.name().to_string();
+        let _gpu_available = backend_name != "cpu";
+
+        #[allow(unused_mut)]
+        let mut total_vram: u64 = 0;
+        #[allow(unused_mut)]
+        let mut free_vram: u64 = 0;
+        #[allow(unused_mut)]
+        let mut gpu_name = String::new();
+        #[allow(unused_mut)]
+        let mut num_devices: u32 = 0;
+
+        #[cfg(feature = "cuda")]
+        if gpu_available {
+            if let Ok(cuda) = crate::backend::cuda::CudaBackend::new() {
+                total_vram = cuda.total_memory() as u64;
+                free_vram = cuda.free_memory() as u64;
+                gpu_name = cuda.device_name().to_string();
+                num_devices = 1;
+            }
+        }
+
+        let sys_info = sys_memory_info();
+
+        Ok(Response::new(CapabilitiesResponse {
+            total_vram_bytes: total_vram,
+            free_vram_bytes: free_vram,
+            gpu_name,
+            backend_name,
+            num_gpu_devices: num_devices,
+            total_ram_bytes: sys_info.0,
+            free_ram_bytes: sys_info.1,
+        }))
+    }
+
+    async fn all_reduce(
+        &self,
+        request: Request<AllReduceRequest>,
+    ) -> Result<Response<AllReduceResponse>, Status> {
+        let req = request.into_inner();
+
+        let tensor_proto = req.tensor.ok_or_else(|| {
+            Status::invalid_argument("missing tensor in AllReduceRequest")
+        })?;
+
+        let tensor = tensor_from_proto(&tensor_proto)
+            .map_err(|e| Status::internal(format!("tensor deserialization failed: {}", e)))?;
+
+        let output_proto = tensor_to_proto(&tensor);
+
+        Ok(Response::new(AllReduceResponse {
+            tensor: Some(output_proto),
+            success: true,
+            error: String::new(),
+        }))
+    }
+}
+
+/// Get system RAM info (total, free) in bytes.
+fn sys_memory_info() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            let mut total = 0u64;
+            let mut available = 0u64;
+            for line in content.lines() {
+                if line.starts_with("MemTotal:") {
+                    total = parse_meminfo_kb(line) * 1024;
+                } else if line.starts_with("MemAvailable:") {
+                    available = parse_meminfo_kb(line) * 1024;
+                }
+            }
+            return (total, available);
+        }
+    }
+    (0, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_kb(line: &str) -> u64 {
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }

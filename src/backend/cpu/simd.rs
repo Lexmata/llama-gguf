@@ -350,6 +350,101 @@ unsafe fn scale_f32_neon(a: &[f32], scalar: f32, out: &mut [f32]) {
     }
 }
 
+/// Fused multiply-add accumulate: y[i] += alpha * x[i] (SIMD accelerated)
+///
+/// This is the BLAS-like AXPY operation, critical for attention weighted V accumulation.
+pub fn axpy_f32(alpha: f32, x: &[f32], y: &mut [f32]) {
+    debug_assert_eq!(x.len(), y.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512() {
+            unsafe {
+                axpy_f32_avx512(alpha, x, y);
+            }
+            return;
+        }
+        if has_avx2() {
+            unsafe {
+                axpy_f32_avx2(alpha, x, y);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            axpy_f32_neon(alpha, x, y);
+        }
+        return;
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    for i in 0..x.len() {
+        y[i] += alpha * x[i];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn axpy_f32_avx2(alpha: f32, x: &[f32], y: &mut [f32]) {
+    let n = x.len();
+    let chunks = n / 8;
+    let valpha = _mm256_set1_ps(alpha);
+
+    for i in 0..chunks {
+        let offset = i * 8;
+        let vx = _mm256_loadu_ps(x.as_ptr().add(offset));
+        let vy = _mm256_loadu_ps(y.as_ptr().add(offset));
+        let result = _mm256_fmadd_ps(valpha, vx, vy);
+        _mm256_storeu_ps(y.as_mut_ptr().add(offset), result);
+    }
+
+    for i in (chunks * 8)..n {
+        y[i] += alpha * x[i];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn axpy_f32_avx512(alpha: f32, x: &[f32], y: &mut [f32]) {
+    let n = x.len();
+    let chunks = n / 16;
+    let valpha = _mm512_set1_ps(alpha);
+
+    for i in 0..chunks {
+        let offset = i * 16;
+        let vx = _mm512_loadu_ps(x.as_ptr().add(offset));
+        let vy = _mm512_loadu_ps(y.as_ptr().add(offset));
+        let result = _mm512_fmadd_ps(valpha, vx, vy);
+        _mm512_storeu_ps(y.as_mut_ptr().add(offset), result);
+    }
+
+    for i in (chunks * 16)..n {
+        y[i] += alpha * x[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn axpy_f32_neon(alpha: f32, x: &[f32], y: &mut [f32]) {
+    let n = x.len();
+    let chunks = n / 4;
+    let valpha = vdupq_n_f32(alpha);
+
+    for i in 0..chunks {
+        let offset = i * 4;
+        let vx = vld1q_f32(x.as_ptr().add(offset));
+        let vy = vld1q_f32(y.as_ptr().add(offset));
+        let result = vfmaq_f32(vy, valpha, vx);
+        vst1q_f32(y.as_mut_ptr().add(offset), result);
+    }
+
+    for i in (chunks * 4)..n {
+        y[i] += alpha * x[i];
+    }
+}
+
 /// Sum all elements in a slice
 pub fn sum_f32(a: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -490,6 +585,90 @@ unsafe fn max_f32_neon(a: &[f32]) -> f32 {
     }
 
     result
+}
+
+// =============================================================================
+// Fused SiLU * Multiply
+// =============================================================================
+
+/// Fused SiLU activation and element-wise multiply: gate[i] = silu(gate[i]) * up[i]
+///
+/// Computes `gate[i] = gate[i] * sigmoid(gate[i]) * up[i]` in a single pass.
+/// This eliminates two intermediate tensor allocations in the FFN hot path.
+pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe {
+                silu_mul_inplace_avx2(gate, up);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            silu_mul_inplace_neon(gate, up);
+        }
+        return;
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    for i in 0..gate.len() {
+        let x = gate[i];
+        gate[i] = x / (1.0 + (-x).exp()) * up[i];
+    }
+}
+
+/// AVX2: fused silu * mul — SIMD for the multiply, scalar for sigmoid (no native exp)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn silu_mul_inplace_avx2(gate: &mut [f32], up: &[f32]) {
+    let n = gate.len();
+    let chunks = n / 8;
+
+    for i in 0..chunks {
+        let offset = i * 8;
+        let g = gate.as_mut_ptr().add(offset);
+        for j in 0..8 {
+            let x = *g.add(j);
+            *g.add(j) = x / (1.0 + (-x).exp());
+        }
+        let vg = _mm256_loadu_ps(g);
+        let vu = _mm256_loadu_ps(up.as_ptr().add(offset));
+        _mm256_storeu_ps(g, _mm256_mul_ps(vg, vu));
+    }
+
+    for i in (chunks * 8)..n {
+        let x = gate[i];
+        gate[i] = x / (1.0 + (-x).exp()) * up[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn silu_mul_inplace_neon(gate: &mut [f32], up: &[f32]) {
+    let n = gate.len();
+    let chunks = n / 4;
+
+    for i in 0..chunks {
+        let offset = i * 4;
+        let g = gate.as_mut_ptr().add(offset);
+        for j in 0..4 {
+            let x = *g.add(j);
+            *g.add(j) = x / (1.0 + (-x).exp());
+        }
+        let vg = vld1q_f32(g);
+        let vu = vld1q_f32(up.as_ptr().add(offset));
+        vst1q_f32(g, vmulq_f32(vg, vu));
+    }
+
+    for i in (chunks * 4)..n {
+        let x = gate[i];
+        gate[i] = x / (1.0 + (-x).exp()) * up[i];
+    }
 }
 
 // =============================================================================
@@ -1049,6 +1228,46 @@ mod tests {
 
         for i in 0..8 {
             assert!((out[i] - a[i] * 2.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_silu_mul_inplace() {
+        let mut gate = vec![1.0, -1.0, 2.0, 0.0, 0.5, -0.5, 3.0, -2.0];
+        let up = vec![2.0, 3.0, 1.0, 5.0, 4.0, 2.0, 0.5, 1.0];
+        let original_gate = gate.clone();
+
+        silu_mul_inplace(&mut gate, &up);
+
+        for i in 0..gate.len() {
+            let x = original_gate[i];
+            let expected = x / (1.0 + (-x).exp()) * up[i];
+            assert!(
+                (gate[i] - expected).abs() < 1e-5,
+                "mismatch at {}: {} vs {}",
+                i,
+                gate[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_axpy() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut y = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+
+        axpy_f32(2.0, &x, &mut y);
+
+        let expected = vec![12.0, 24.0, 36.0, 48.0, 60.0, 72.0, 84.0, 96.0];
+        for i in 0..8 {
+            assert!(
+                (y[i] - expected[i]).abs() < 1e-6,
+                "mismatch at {}: {} vs {}",
+                i,
+                y[i],
+                expected[i]
+            );
         }
     }
 

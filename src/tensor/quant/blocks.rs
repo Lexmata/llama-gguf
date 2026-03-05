@@ -167,6 +167,128 @@ impl BlockQ8K {
     pub const TYPE_SIZE: usize = 292;
 }
 
+// IQ (importance-weighted) quantization blocks
+
+/// IQ1_S: 1-bit importance quantization, 256 elements, 50 bytes
+/// Super block with 8 sub-blocks of 32 elements each
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ1S {
+    pub d: f16,           // super block scale
+    pub qs: [u8; 32],     // 8 groups of 4 bytes: indices into grid
+    pub qh: [u16; 8],     // high bits + signs
+}
+impl BlockIQ1S {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 50; // 2 + 32 + 16 = 50
+}
+
+/// IQ1_M: 1-bit importance quantization (mixture), 256 elements, 56 bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ1M {
+    pub qs: [u8; 32],      // 8 groups of 4 bytes: indices into grid
+    pub qh: [u8; 16],      // high bits
+    pub scales: [u8; 8],   // per-sub-block scales (packed)
+}
+impl BlockIQ1M {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 56; // 32 + 16 + 8 = 56
+}
+
+/// IQ2_XXS: 2-bit importance quantization (extra extra small), 256 elements, 66 bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ2XXS {
+    pub d: f16,            // super block scale
+    pub qs: [u16; 32],     // 8 groups: each has 4 u16 grid indices
+}
+impl BlockIQ2XXS {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 66; // 2 + 64 = 66
+}
+
+/// IQ2_XS: 2-bit importance quantization (extra small), 256 elements, 74 bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ2XS {
+    pub d: f16,            // super block scale
+    pub qs: [u16; 32],     // 8 groups of 4 u16 grid indices
+    pub scales: [u8; 8],   // per-sub-block scales (4-bit packed)
+}
+impl BlockIQ2XS {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 74; // 2 + 64 + 8 = 74
+}
+
+/// IQ2_S: 2-bit importance quantization (small), 256 elements, 82 bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ2S {
+    pub d: f16,            // super block scale
+    pub qs: [u8; 64],      // quantized values
+    pub qh: [u8; 8],       // high bits
+    pub scales: [u8; 8],   // per-sub-block scales
+}
+impl BlockIQ2S {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 82; // 2 + 64 + 8 + 8 = 82
+}
+
+/// IQ3_XXS: 3-bit importance quantization (extra extra small), 256 elements, 98 bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ3XXS {
+    pub d: f16,            // super block scale
+    pub qs: [u8; 96],      // 3-bit quantized values (256 * 3 / 8 = 96) + high bits packed in
+}
+impl BlockIQ3XXS {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 98; // 2 + 96 = 98
+}
+
+/// IQ3_S: 3-bit importance quantization (small), 256 elements, 110 bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ3S {
+    pub d: f16,            // super block scale
+    pub qs: [u8; 64],      // 2-bit values
+    pub qh: [u8; 32],      // high bits
+    pub signs: [u8; 8],    // sign bits
+    pub scales: [u8; 4],   // per-sub-block scales
+}
+impl BlockIQ3S {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 110; // 2 + 64 + 32 + 8 + 4 = 110
+}
+
+/// IQ4_XS: 4-bit importance quantization (extra small), 256 elements, 136 bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ4XS {
+    pub d: f16,            // super block scale
+    pub scales_h: u16,     // high bits of per-sub-block scales
+    pub scales_l: [u8; 4], // low bits of per-sub-block scales (256/64 = 4)
+    pub qs: [u8; 128],     // 4-bit quantized values (256/2 = 128)
+}
+impl BlockIQ4XS {
+    pub const BLOCK_SIZE: usize = 256;
+    pub const TYPE_SIZE: usize = 136; // 2 + 2 + 4 + 128 = 136
+}
+
+/// IQ4_NL: 4-bit non-linear quantization, 32 elements, 18 bytes
+/// Uses a non-linear lookup table for dequantization
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BlockIQ4NL {
+    pub d: f16,            // scale
+    pub qs: [u8; 16],      // 4-bit quantized values (32/2 = 16)
+}
+impl BlockIQ4NL {
+    pub const BLOCK_SIZE: usize = 32;
+    pub const TYPE_SIZE: usize = 18; // 2 + 16 = 18
+}
+
 // Compile-time size assertions
 const _: () = {
     assert!(std::mem::size_of::<BlockQ4_0>() == BlockQ4_0::TYPE_SIZE);
@@ -181,4 +303,13 @@ const _: () = {
     assert!(std::mem::size_of::<BlockQ5K>() == BlockQ5K::TYPE_SIZE);
     assert!(std::mem::size_of::<BlockQ6K>() == BlockQ6K::TYPE_SIZE);
     assert!(std::mem::size_of::<BlockQ8K>() == BlockQ8K::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ1S>() == BlockIQ1S::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ1M>() == BlockIQ1M::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ2XXS>() == BlockIQ2XXS::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ2XS>() == BlockIQ2XS::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ2S>() == BlockIQ2S::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ3XXS>() == BlockIQ3XXS::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ3S>() == BlockIQ3S::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ4XS>() == BlockIQ4XS::TYPE_SIZE);
+    assert!(std::mem::size_of::<BlockIQ4NL>() == BlockIQ4NL::TYPE_SIZE);
 };

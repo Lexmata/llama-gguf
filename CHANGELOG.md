@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-03-05
+
+### Added
+
+- IQ quantization formats: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, TQ1_0, TQ2_0
+- GGUF quantization writing — CLI `quantize` subcommand and public `GgufWriter::quantize_tensor` API
+- GPU-side quantization kernels for Q8_0, Q4_K, Q6_K on CUDA, Vulkan, Metal, and DX12
+- RAG incremental re-indexing with content hashing and change detection
+- RAG chunking strategies: recursive character, Markdown, sliding window, sentence, paragraph splitters
+- RAG multi-modal embedding support with content type detection (text, image, table, code)
+- SQLite vector store alternative with built-in KNN and pure-Rust HNSW index for single-node setups
+- Distributed automatic model sharding based on available VRAM per node
+- Distributed fault tolerance with health checks, failure detection, and node recovery
+- Distributed load balancing across heterogeneous hardware with latency-based rebalancing
+- Multi-node tensor parallelism with AllReduce collective communication
+- HuggingFace `tokenizer.json` compatibility — BPE, Unigram (Viterbi), and WordPiece model types
+- Tokenizer pipeline components: normalizers (NFC, NFKC, Lowercase, Strip, etc.), pre-tokenizers (Whitespace, ByteLevel, Metaspace, etc.), post-processors (TemplateProcessing, BertProcessing)
+- `cargo bench` coverage for all quantization formats (legacy, K-quant, IQ)
+- Integration test suite with embedded GGUF test model (no external dependencies)
+- CI matrix covering all feature flag combinations
+- Flamegraph-based profiling guide (`docs/PROFILING.md`)
+- SIMD AXPY primitive (`axpy_f32`) with AVX2, AVX-512, and NEON backends
+- SIMD fused SiLU*multiply kernel (`silu_mul_inplace`) for FFN hot path
+
+### Changed
+
+- KV cache `attention_cached` rewritten with SIMD dot products, SIMD softmax, SIMD AXPY, and rayon parallel heads
+- KV cache `shift_left` uses `copy_within` (single `memmove` per head) instead of element-wise copy
+- KV cache `reset` no longer zeroes cache data — only resets the position counter
+- `FeedForward::forward` fuses SiLU and multiply into a single pass, eliminating 2 intermediate tensors per layer
+- `Linear::forward` bias addition is now in-place, eliminating temp tensor allocation and copy
+- `TransformerLayer::forward` residual connections are in-place, eliminating 3 tensor allocations per layer
+- CI workflow uses environment variables for matrix inputs to address command injection warnings
+
 ## [0.11.0] - 2026-03-04
 
 ### Added
@@ -168,6 +202,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - RoPE type support (Normal and NeoX) for multi-model compatibility
 - Benchmark suite with criterion
 
+[0.12.0]: https://github.com/Lexmata/llama-gguf/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Lexmata/llama-gguf/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/Lexmata/llama-gguf/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Lexmata/llama-gguf/compare/v0.8.0...v0.9.0

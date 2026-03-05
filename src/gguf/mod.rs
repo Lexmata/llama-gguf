@@ -2,6 +2,7 @@
 
 mod constants;
 mod error;
+mod quantize;
 mod reader;
 mod types;
 mod writer;
@@ -10,6 +11,7 @@ pub use constants::{GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GgmlType, GgufMetadataVa
 pub use error::GgufError;
 pub use reader::GgufReader;
 pub use types::{GgufData, GgufHeader, MetadataArray, MetadataValue, TensorInfo};
+pub use quantize::{QuantizeOptions, QuantizeStats, quantize_model};
 pub use writer::{GgufBuilder, GgufWriter, TensorToWrite};
 
 /// High-level GGUF file handle with memory-mapped tensor data

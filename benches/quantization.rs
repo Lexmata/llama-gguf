@@ -2,10 +2,26 @@
 //!
 //! Run with: cargo bench
 
+use bytemuck::Zeroable;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use llama_gguf::Backend;
 use llama_gguf::backend::cpu::CpuBackend;
 use llama_gguf::tensor::{DType, Tensor};
+use llama_gguf::tensor::quant::{
+    // Legacy blocks and dequant
+    BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1,
+    dequantize_q4_0, dequantize_q4_1, dequantize_q5_0, dequantize_q5_1,
+    dequantize_q8_0, dequantize_q8_1,
+    // K-quant blocks and dequant
+    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8K,
+    dequantize_q2_k, dequantize_q3_k, dequantize_q4_k, dequantize_q5_k,
+    dequantize_q6_k, dequantize_q8_k,
+    // IQ blocks and dequant
+    BlockIQ1S, BlockIQ1M, BlockIQ2XXS, BlockIQ2XS, BlockIQ2S,
+    BlockIQ3XXS, BlockIQ3S, BlockIQ4XS, BlockIQ4NL,
+    dequantize_iq4_nl, dequantize_iq4_xs, dequantize_iq2_xxs, dequantize_iq2_xs,
+    dequantize_iq2_s, dequantize_iq3_xxs, dequantize_iq3_s, dequantize_iq1_s, dequantize_iq1_m,
+};
 
 /// Benchmark tensor creation and basic operations
 fn tensor_creation(c: &mut Criterion) {
@@ -161,8 +177,6 @@ fn silu_benchmark(c: &mut Criterion) {
 
 /// Benchmark dequantization
 fn dequant_benchmark(c: &mut Criterion) {
-    use llama_gguf::tensor::quant::{BlockQ4_0, BlockQ8_0, dequantize_q4_0, dequantize_q8_0};
-
     let mut group = c.benchmark_group("dequantize");
 
     // Number of blocks
@@ -279,6 +293,253 @@ fn elementwise_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark legacy dequantization (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1 - 32 elements per block)
+fn dequant_legacy_benchmark(c: &mut Criterion) {
+    const N_BLOCKS: usize = 1024;
+    let mut group = c.benchmark_group("dequant_legacy");
+    group.throughput(Throughput::Elements((N_BLOCKS * 32) as u64));
+
+    let blocks_q4_0: Vec<BlockQ4_0> = (0..N_BLOCKS).map(|_| BlockQ4_0::zeroed()).collect();
+    let blocks_q4_1: Vec<BlockQ4_1> = (0..N_BLOCKS).map(|_| BlockQ4_1::zeroed()).collect();
+    let blocks_q5_0: Vec<BlockQ5_0> = (0..N_BLOCKS).map(|_| BlockQ5_0::zeroed()).collect();
+    let blocks_q5_1: Vec<BlockQ5_1> = (0..N_BLOCKS).map(|_| BlockQ5_1::zeroed()).collect();
+    let blocks_q8_0: Vec<BlockQ8_0> = (0..N_BLOCKS).map(|_| BlockQ8_0::zeroed()).collect();
+    let blocks_q8_1: Vec<BlockQ8_1> = (0..N_BLOCKS).map(|_| BlockQ8_1::zeroed()).collect();
+
+    group.bench_function("q4_0", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 32];
+            for block in blocks_q4_0.iter() {
+                dequantize_q4_0(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q4_1", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 32];
+            for block in blocks_q4_1.iter() {
+                dequantize_q4_1(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q5_0", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 32];
+            for block in blocks_q5_0.iter() {
+                dequantize_q5_0(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q5_1", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 32];
+            for block in blocks_q5_1.iter() {
+                dequantize_q5_1(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q8_0", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 32];
+            for block in blocks_q8_0.iter() {
+                dequantize_q8_0(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q8_1", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 32];
+            for block in blocks_q8_1.iter() {
+                dequantize_q8_1(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark K-quant dequantization (Q2K, Q3K, Q4K, Q5K, Q6K, Q8K - 256 elements per block)
+fn dequant_kquant_benchmark(c: &mut Criterion) {
+    const N_BLOCKS: usize = 1024;
+    let mut group = c.benchmark_group("dequant_kquant");
+    group.throughput(Throughput::Elements((N_BLOCKS * 256) as u64));
+
+    let blocks_q2k: Vec<BlockQ2K> = (0..N_BLOCKS).map(|_| BlockQ2K::zeroed()).collect();
+    let blocks_q3k: Vec<BlockQ3K> = (0..N_BLOCKS).map(|_| BlockQ3K::zeroed()).collect();
+    let blocks_q4k: Vec<BlockQ4K> = (0..N_BLOCKS).map(|_| BlockQ4K::zeroed()).collect();
+    let blocks_q5k: Vec<BlockQ5K> = (0..N_BLOCKS).map(|_| BlockQ5K::zeroed()).collect();
+    let blocks_q6k: Vec<BlockQ6K> = (0..N_BLOCKS).map(|_| BlockQ6K::zeroed()).collect();
+    let blocks_q8k: Vec<BlockQ8K> = (0..N_BLOCKS).map(|_| BlockQ8K::zeroed()).collect();
+
+    group.bench_function("q2_k", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_q2k.iter() {
+                dequantize_q2_k(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q3_k", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_q3k.iter() {
+                dequantize_q3_k(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q4_k", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_q4k.iter() {
+                dequantize_q4_k(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q5_k", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_q5k.iter() {
+                dequantize_q5_k(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q6_k", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_q6k.iter() {
+                dequantize_q6_k(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("q8_k", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_q8k.iter() {
+                dequantize_q8_k(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark IQ dequantization (IQ4_NL=32, rest=256 elements per block)
+fn dequant_iq_benchmark(c: &mut Criterion) {
+    const N_BLOCKS: usize = 1024;
+    let mut group = c.benchmark_group("dequant_iq");
+
+    // IQ4_NL: 32 elements per block
+    let blocks_iq4_nl: Vec<BlockIQ4NL> = (0..N_BLOCKS).map(|_| BlockIQ4NL::zeroed()).collect();
+    group.throughput(Throughput::Elements((N_BLOCKS * 32) as u64));
+    group.bench_function("iq4_nl", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 32];
+            for block in blocks_iq4_nl.iter() {
+                dequantize_iq4_nl(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+
+    // IQ formats with 256 elements per block
+    group.throughput(Throughput::Elements((N_BLOCKS * 256) as u64));
+    let blocks_iq4_xs: Vec<BlockIQ4XS> = (0..N_BLOCKS).map(|_| BlockIQ4XS::zeroed()).collect();
+    let blocks_iq2_xxs: Vec<BlockIQ2XXS> = (0..N_BLOCKS).map(|_| BlockIQ2XXS::zeroed()).collect();
+    let blocks_iq2_xs: Vec<BlockIQ2XS> = (0..N_BLOCKS).map(|_| BlockIQ2XS::zeroed()).collect();
+    let blocks_iq2_s: Vec<BlockIQ2S> = (0..N_BLOCKS).map(|_| BlockIQ2S::zeroed()).collect();
+    let blocks_iq3_xxs: Vec<BlockIQ3XXS> = (0..N_BLOCKS).map(|_| BlockIQ3XXS::zeroed()).collect();
+    let blocks_iq3_s: Vec<BlockIQ3S> = (0..N_BLOCKS).map(|_| BlockIQ3S::zeroed()).collect();
+    let blocks_iq1_s: Vec<BlockIQ1S> = (0..N_BLOCKS).map(|_| BlockIQ1S::zeroed()).collect();
+    let blocks_iq1_m: Vec<BlockIQ1M> = (0..N_BLOCKS).map(|_| BlockIQ1M::zeroed()).collect();
+
+    group.bench_function("iq4_xs", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq4_xs.iter() {
+                dequantize_iq4_xs(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("iq2_xxs", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq2_xxs.iter() {
+                dequantize_iq2_xxs(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("iq2_xs", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq2_xs.iter() {
+                dequantize_iq2_xs(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("iq2_s", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq2_s.iter() {
+                dequantize_iq2_s(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("iq3_xxs", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq3_xxs.iter() {
+                dequantize_iq3_xxs(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("iq3_s", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq3_s.iter() {
+                dequantize_iq3_s(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("iq1_s", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq1_s.iter() {
+                dequantize_iq1_s(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+    group.bench_function("iq1_m", |b| {
+        b.iter(|| {
+            let mut output = [0.0f32; 256];
+            for block in blocks_iq1_m.iter() {
+                dequantize_iq1_m(block, &mut output);
+                black_box(&output);
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     tensor_creation,
@@ -288,6 +549,9 @@ criterion_group!(
     rms_norm_benchmark,
     silu_benchmark,
     dequant_benchmark,
+    dequant_legacy_benchmark,
+    dequant_kquant_benchmark,
+    dequant_iq_benchmark,
     dot_product_benchmark,
     elementwise_benchmark,
 );

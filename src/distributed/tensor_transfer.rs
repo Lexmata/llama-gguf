@@ -40,6 +40,9 @@ pub fn dtype_to_u32(dtype: DType) -> u32 {
         DType::IQ4XS => 26,
         DType::IQ4NL => 27,
         DType::IQ1S => 28,
+        DType::IQ1M => 29,
+        DType::TQ1_0 => 30,
+        DType::TQ2_0 => 31,
     }
 }
 
@@ -75,6 +78,9 @@ pub fn u32_to_dtype(val: u32) -> Result<DType, DistributedError> {
         26 => Ok(DType::IQ4XS),
         27 => Ok(DType::IQ4NL),
         28 => Ok(DType::IQ1S),
+        29 => Ok(DType::IQ1M),
+        30 => Ok(DType::TQ1_0),
+        31 => Ok(DType::TQ2_0),
         other => Err(DistributedError::TensorTransfer(
             format!("unknown dtype discriminant: {}", other),
         )),

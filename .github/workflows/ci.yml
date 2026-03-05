@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main, develop, "feature/**"]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,14 +68,73 @@ jobs:
         run: xcrun --sdk macosx metal --version
 
       - name: Build
-        run: cargo build --features ${{ matrix.features }}
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo build --features "$FEATURES"
 
       - name: Test
-        run: cargo test --features ${{ matrix.features }}
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --features "$FEATURES"
 
       - name: Metal integration tests
         if: contains(matrix.features, 'metal')
         run: cargo test --features metal --test metal_integration
+
+  feature-matrix:
+    name: Features (${{ matrix.name }})
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: minimal
+            cargo_args: --no-default-features
+            cache_key: ubuntu-minimal
+          - name: cpu-only
+            cargo_args: --no-default-features --features cpu
+            cache_key: ubuntu-cpu
+          - name: onnx
+            cargo_args: --no-default-features --features "cpu,onnx"
+            cache_key: ubuntu-onnx
+          - name: server
+            cargo_args: --no-default-features --features "cpu,server"
+            cache_key: ubuntu-server
+          - name: rag
+            cargo_args: --features rag
+            cache_key: ubuntu-rag
+          - name: rag-sqlite
+            cargo_args: --features rag-sqlite
+            cache_key: ubuntu-rag-sqlite
+          - name: rag-both
+            cargo_args: --features "rag,rag-sqlite"
+            cache_key: ubuntu-rag-both
+          - name: distributed
+            cargo_args: --features distributed
+            cache_key: ubuntu-distributed
+          - name: all-portable
+            cargo_args: --features "cpu,huggingface,cli,client,onnx,server,rag,rag-sqlite,distributed"
+            cache_key: ubuntu-all
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.cache_key }}
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build
+        env:
+          CARGO_ARGS: ${{ matrix.cargo_args }}
+        run: cargo build $CARGO_ARGS
+
+      - name: Test
+        env:
+          CARGO_ARGS: ${{ matrix.cargo_args }}
+        run: cargo test $CARGO_ARGS
 
   vulkan:
     name: Vulkan (Linux)
@@ -130,3 +189,20 @@ jobs:
 
       - name: DX12 integration tests
         run: cargo test --features dx12 --test dx12_integration -- --test-threads=1
+
+  bench:
+    name: Benchmarks (compile check)
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-bench
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Build benchmarks
+        run: cargo bench --no-run

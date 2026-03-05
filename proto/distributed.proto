@@ -7,14 +7,9 @@ package distributed;
 // and orchestrate pipeline-parallel inference.
 service ShardService {
     // Stream model layer weights from coordinator to shard.
-    // The coordinator reads the GGUF file and sends each assigned layer's
-    // tensors as a stream of LayerData messages.
     rpc LoadLayers(stream LayerData) returns (LoadResponse);
 
     // Run a forward pass through this shard's assigned layers.
-    // Receives the hidden state from the previous pipeline stage,
-    // processes it through local transformer layers (updating KV cache),
-    // and returns the output hidden state for the next stage.
     rpc Forward(ForwardRequest) returns (ForwardResponse);
 
     // Reset the KV cache on this shard (new sequence).
@@ -26,6 +21,12 @@ service ShardService {
     // Send model configuration so the shard can initialize its backend
     // and KV cache before receiving layers.
     rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+
+    // Query shard hardware capabilities (VRAM, GPU info) for auto-sharding.
+    rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+
+    // Tensor-parallel all-reduce: sum partial results across TP group.
+    rpc AllReduce(AllReduceRequest) returns (AllReduceResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +88,8 @@ message ForwardResponse {
     TensorData hidden_state = 1;
     bool success = 2;
     string error = 3;
+    // Self-reported forward pass latency in microseconds (for load balancing)
+    uint64 forward_latency_us = 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,4 +153,56 @@ message ConfigureResponse {
     bool success = 1;
     string message = 2;
     string backend_name = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities (for automatic VRAM-based sharding)
+// ---------------------------------------------------------------------------
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+    // Total GPU VRAM in bytes (0 if CPU-only)
+    uint64 total_vram_bytes = 1;
+    // Free GPU VRAM in bytes
+    uint64 free_vram_bytes = 2;
+    // GPU device name (e.g. "NVIDIA RTX 4090")
+    string gpu_name = 3;
+    // Backend name (e.g. "cuda", "metal", "cpu")
+    string backend_name = 4;
+    // Number of GPU devices available
+    uint32 num_gpu_devices = 5;
+    // Total system RAM in bytes
+    uint64 total_ram_bytes = 6;
+    // Free system RAM in bytes
+    uint64 free_ram_bytes = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Tensor-parallel all-reduce
+// ---------------------------------------------------------------------------
+
+enum AllReduceOp {
+    SUM = 0;
+    MEAN = 1;
+}
+
+message AllReduceRequest {
+    // Partial tensor to reduce
+    TensorData tensor = 1;
+    // Reduction operation
+    AllReduceOp operation = 2;
+    // Group ID for multi-group TP
+    uint32 group_id = 3;
+    // Rank of the sender within the TP group
+    uint32 sender_rank = 4;
+    // Total world size of the TP group
+    uint32 world_size = 5;
+}
+
+message AllReduceResponse {
+    // Reduced tensor (available after all ranks have contributed)
+    TensorData tensor = 1;
+    bool success = 2;
+    string error = 3;
 }

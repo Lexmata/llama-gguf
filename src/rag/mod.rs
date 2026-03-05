@@ -74,6 +74,26 @@ mod embedding;
 #[cfg(feature = "rag")]
 mod knowledge_base;
 
+#[cfg(feature = "rag-sqlite")]
+mod sqlite_store;
+#[cfg(feature = "rag-sqlite")]
+pub use sqlite_store::*;
+
+#[cfg(any(feature = "rag", feature = "rag-sqlite"))]
+mod chunking;
+#[cfg(any(feature = "rag", feature = "rag-sqlite"))]
+pub use chunking::*;
+
+#[cfg(any(feature = "rag", feature = "rag-sqlite"))]
+mod sync;
+#[cfg(any(feature = "rag", feature = "rag-sqlite"))]
+pub use sync::*;
+
+#[cfg(any(feature = "rag", feature = "rag-sqlite"))]
+mod multimodal;
+#[cfg(any(feature = "rag", feature = "rag-sqlite"))]
+pub use multimodal::*;
+
 #[cfg(feature = "rag")]
 pub use store::*;
 #[cfg(feature = "rag")]

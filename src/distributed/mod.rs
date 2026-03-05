@@ -24,11 +24,15 @@
 //! llama-gguf run model.gguf --distributed cluster.toml -p "Hello"
 //! ```
 
+pub mod auto_shard;
 pub mod config;
 pub mod coordinator;
+pub mod fault;
+pub mod load_balancer;
 pub mod model;
 pub mod pipeline;
 pub mod shard;
+pub mod tensor_parallel_distributed;
 pub mod tensor_transfer;
 
 #[allow(clippy::all)]
@@ -36,11 +40,15 @@ pub mod proto {
     tonic::include_proto!("distributed");
 }
 
+pub use auto_shard::{ShardCapabilities, ModelMemoryEstimate, auto_shard, probe_all_shards, compute_vram_assignments, estimate_model_memory};
 pub use config::{ClusterConfig, ShardSpec};
 pub use coordinator::Coordinator;
+pub use fault::{FaultConfig, HealthMonitor, RecoveryManager, ShardStatus, ShardHealthState, ClusterHealth};
+pub use load_balancer::{LoadBalancer, LoadBalanceConfig, ShardMetrics, RebalanceDecision};
 pub use model::DistributedModel;
 pub use pipeline::PipelineExecutor;
 pub use shard::ShardServer;
+pub use tensor_parallel_distributed::{ParallelismMode, TPGroup, TPGroupMember, DistributedTP, compute_tp_groups};
 
 /// Errors that can occur during distributed inference.
 #[derive(thiserror::Error, Debug)]
