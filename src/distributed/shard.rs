@@ -212,6 +212,7 @@ fn build_layer_from_tensors(
         post_attn_norm: None,
         ffn_norm,
         ffn_layer: FfnLayer::Dense(ffn),
+        post_ffn_norm: None,
         layer_idx,
     })
 }

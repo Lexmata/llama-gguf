@@ -2,6 +2,7 @@
 //!
 //! This module implements the LLaMA transformer architecture, supporting:
 //! - LLaMA 1, 2, 3 variants
+//! - Gemma2 (final logit softcapping)
 //! - Grouped Query Attention (GQA)
 //! - RoPE position embeddings
 //! - Quantized weights
@@ -240,6 +241,15 @@ impl LlamaModel {
         let mut logits = Tensor::zeros(vec![self.config.vocab_size], DType::F32);
         self.output.forward(&normed, &mut logits, backend)?;
 
+        // Final logit softcapping (Gemma2): logits = cap * tanh(logits / cap)
+        if self.config.final_logit_softcap > 0.0 {
+            let cap = self.config.final_logit_softcap;
+            let data = logits.as_f32_mut()?;
+            for v in data.iter_mut() {
+                *v = cap * (*v / cap).tanh();
+            }
+        }
+
         Ok(logits)
     }
 }
@@ -249,6 +259,7 @@ impl Model for LlamaModel {
         self.create_context(backend)
     }
 
+    /// Forward pass. Supports LLaMA 1/2/3, Gemma2 (final logit softcapping when `final_logit_softcap` > 0).
     fn forward(&self, tokens: &[u32], ctx: &mut InferenceContext) -> ModelResult<Tensor> {
         let backend = ctx.backend.as_ref();
         let num_tokens = tokens.len();

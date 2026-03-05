@@ -244,7 +244,9 @@ impl OnnxModelLoader {
             post_attn_norm: None,
             ffn_norm,
             ffn_layer: FfnLayer::Dense(ffn),
+            post_ffn_norm: None,
             layer_idx,
+            use_parallel_residual: false,
         })
     }
 

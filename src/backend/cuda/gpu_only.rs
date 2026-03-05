@@ -794,6 +794,11 @@ impl GpuOnlyInference {
             FfnLayer::Dense(_) => {
                 self.dense_ffn_gpu_forward(&prefix)?;
             }
+            FfnLayer::NoGate(_) => {
+                return Err(BackendError::OperationFailed(
+                    "NoGate FFN not yet supported on CUDA GPU".into(),
+                ));
+            }
             FfnLayer::Moe(_) => {
                 self.moe_gpu_forward(layer_idx)?;
             }

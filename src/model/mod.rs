@@ -17,6 +17,7 @@ pub mod embeddings;
 mod error;
 pub mod layers;
 mod llama;
+pub mod bert;
 mod loader;
 pub mod lora;
 pub mod moe;
@@ -35,6 +36,7 @@ pub use embeddings::{
 };
 pub use error::{ModelError, ModelResult};
 pub use deltanet::{DeltaNetConfig, DeltaNetLayer, DeltaNetState, RecurrentState};
+pub use bert::{BertLayer, BertModel};
 pub use layers::{AttentionLayer, FfnLayer, TransformerLayer};
 pub use llama::LlamaModel;
 pub use loader::{ModelLoader, load_llama_model};

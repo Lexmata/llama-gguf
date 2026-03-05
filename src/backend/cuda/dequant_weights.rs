@@ -357,6 +357,20 @@ pub fn upload_model_weights(
             )?;
         }
 
+        // NoGate FFN weights (fnn_up, ffn_down only)
+        if let Some(ffn) = layer.no_gate_ffn() {
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.ffn_up.weight", i),
+                &ffn.w_up.weight,
+            )?;
+            upload_weight(
+                &mut store,
+                &format!("blk.{}.ffn_down.weight", i),
+                &ffn.w_down.weight,
+            )?;
+        }
+
         // MoE router + shared expert weights
         if let Some(moe) = layer.moe() {
             store.upload(

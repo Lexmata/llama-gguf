@@ -109,6 +109,20 @@ pub struct ModelConfig {
     pub ssm_dt_rank: usize,
     /// SSM convolution kernel size
     pub ssm_conv_kernel: usize,
+    /// Attention logit soft-capping value (Gemma2: 50.0, 0.0 = disabled)
+    pub attn_logit_softcap: f32,
+    /// Final logit soft-capping value (Gemma2: 30.0, 0.0 = disabled)
+    pub final_logit_softcap: f32,
+    /// Sliding window attention size (0 = disabled)
+    pub sliding_window: usize,
+    /// Whether this architecture uses combined QKV tensor
+    pub has_combined_qkv: bool,
+    /// Whether this architecture uses LayerNorm instead of RMSNorm
+    pub uses_layer_norm: bool,
+    /// Whether this architecture uses GELU activation
+    pub uses_gelu: bool,
+    /// Whether this architecture has a gate projection in FFN
+    pub has_ffn_gate: bool,
 }
 
 impl Default for ModelConfig {
@@ -139,6 +153,13 @@ impl Default for ModelConfig {
             ssm_n_group: 0,
             ssm_dt_rank: 0,
             ssm_conv_kernel: 0,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            sliding_window: 0,
+            has_combined_qkv: false,
+            uses_layer_norm: false,
+            uses_gelu: false,
+            has_ffn_gate: true,
         }
     }
 }
@@ -189,6 +210,13 @@ impl ModelConfig {
             ssm_n_group: 0,
             ssm_dt_rank: 0,
             ssm_conv_kernel: 0,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            sliding_window: 0,
+            has_combined_qkv: false,
+            uses_layer_norm: false,
+            uses_gelu: false,
+            has_ffn_gate: true,
         }
     }
 
@@ -197,6 +225,13 @@ impl ModelConfig {
         let mut config = Self::llama_7b();
         config.max_seq_len = 4096;
         config.rope_config.original_max_position_embeddings = 4096;
+        config.attn_logit_softcap = 0.0;
+        config.final_logit_softcap = 0.0;
+        config.sliding_window = 0;
+        config.has_combined_qkv = false;
+        config.uses_layer_norm = false;
+        config.uses_gelu = false;
+        config.has_ffn_gate = true;
         config
     }
 
@@ -235,6 +270,13 @@ impl ModelConfig {
             ssm_n_group: 0,
             ssm_dt_rank: 0,
             ssm_conv_kernel: 0,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            sliding_window: 0,
+            has_combined_qkv: false,
+            uses_layer_norm: false,
+            uses_gelu: false,
+            has_ffn_gate: true,
         }
     }
 

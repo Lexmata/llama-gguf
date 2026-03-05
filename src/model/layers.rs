@@ -143,6 +143,81 @@ impl RMSNorm {
     }
 }
 
+/// Layer Normalization (used by GPT-2, BLOOM, Falcon, etc.)
+#[derive(Debug)]
+pub struct LayerNorm {
+    /// Learned scale parameter [hidden_size]
+    pub weight: Tensor,
+    /// Learned bias parameter [hidden_size]
+    pub bias: Tensor,
+    /// Epsilon for numerical stability
+    pub eps: f32,
+    /// Hidden dimension
+    pub hidden_size: usize,
+}
+
+impl LayerNorm {
+    /// Create a new layer normalization layer
+    pub fn new(weight: Tensor, bias: Tensor, eps: f32) -> ModelResult<Self> {
+        if weight.ndim() != 1 {
+            return Err(ModelError::ConfigError("LayerNorm weight must be 1D".into()));
+        }
+        let hidden_size = weight.shape()[0];
+        Ok(Self { weight, bias, eps, hidden_size })
+    }
+
+    /// Forward pass: out = (x - mean(x)) / sqrt(var(x) + eps) * weight + bias
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        _backend: &dyn Backend,
+    ) -> BackendResult<()> {
+        let x_data = x.as_f32()?;
+        let out_data = out.as_f32_mut()?;
+        let w_data = self.weight.as_f32()?;
+        let b_data = self.bias.as_f32()?;
+        let n = self.hidden_size;
+
+        let mean: f32 = x_data[..n].iter().sum::<f32>() / n as f32;
+        let var: f32 = x_data[..n].iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+        let std_inv = 1.0 / (var + self.eps).sqrt();
+
+        for i in 0..n {
+            out_data[i] = (x_data[i] - mean) * std_inv * w_data[i] + b_data[i];
+        }
+        Ok(())
+    }
+}
+
+/// Unified normalization layer (RMSNorm or LayerNorm)
+#[derive(Debug)]
+pub enum NormLayer {
+    RMS(RMSNorm),
+    Layer(LayerNorm),
+}
+
+impl NormLayer {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        backend: &dyn Backend,
+    ) -> BackendResult<()> {
+        match self {
+            Self::RMS(norm) => norm.forward(x, out, backend),
+            Self::Layer(norm) => norm.forward(x, out, backend),
+        }
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        match self {
+            Self::RMS(n) => n.hidden_size,
+            Self::Layer(n) => n.hidden_size,
+        }
+    }
+}
+
 /// Self-attention layer with Grouped Query Attention support
 #[derive(Debug)]
 pub struct Attention {
@@ -557,12 +632,68 @@ impl FeedForward {
     }
 }
 
-/// FFN variant: either dense FFN or Mixture of Experts
+/// Feed-forward network WITHOUT gate projection (GPT-2, BLOOM, GPT-NeoX, etc.)
+/// FFN: out = down(act(up(x)))
+#[derive(Debug)]
+pub struct NoGateFeedForward {
+    /// Up projection [intermediate_size, hidden_size]
+    pub w_up: Linear,
+    /// Down projection [hidden_size, intermediate_size]
+    pub w_down: Linear,
+    /// Hidden dimension
+    pub hidden_size: usize,
+    /// Intermediate dimension
+    pub intermediate_size: usize,
+    /// Use GELU activation instead of SiLU
+    pub use_gelu: bool,
+}
+
+impl NoGateFeedForward {
+    pub fn new(w_up: Linear, w_down: Linear, use_gelu: bool) -> Self {
+        let hidden_size = w_down.out_features;
+        let intermediate_size = w_up.out_features;
+        Self { w_up, w_down, hidden_size, intermediate_size, use_gelu }
+    }
+
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        backend: &dyn Backend,
+    ) -> BackendResult<()> {
+        let mut up = Tensor::zeros(vec![self.intermediate_size], DType::F32);
+        self.w_up.forward(x, &mut up, backend)?;
+
+        {
+            let data = up.as_f32_mut()?;
+            if self.use_gelu {
+                for v in data.iter_mut() {
+                    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                    let x = *v;
+                    *v = 0.5 * x
+                        * (1.0 + (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh());
+                }
+            } else {
+                // SiLU: x * sigmoid(x)
+                for v in data.iter_mut() {
+                    *v = *v / (1.0 + (-*v).exp());
+                }
+            }
+        }
+
+        self.w_down.forward(&up, out, backend)?;
+        Ok(())
+    }
+}
+
+/// FFN variant: either dense FFN, non-gated FFN, or Mixture of Experts
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum FfnLayer {
-    /// Standard dense feed-forward network
+    /// Standard gated feed-forward network (LLaMA, Mistral, etc.)
     Dense(FeedForward),
+    /// Non-gated feed-forward network (GPT-2, BLOOM, GPT-NeoX, etc.)
+    NoGate(NoGateFeedForward),
     /// Mixture of Experts
     Moe(super::moe::MoeLayer),
 }
@@ -588,10 +719,15 @@ pub struct TransformerLayer {
     pub post_attn_norm: Option<RMSNorm>,
     /// FFN normalization
     pub ffn_norm: RMSNorm,
-    /// Feed-forward network (dense or MoE)
+    /// Feed-forward network (dense, non-gated, or MoE)
     pub ffn_layer: FfnLayer,
+    /// Optional post-FFN normalization (Gemma2, Cohere2)
+    pub post_ffn_norm: Option<RMSNorm>,
     /// Layer index
     pub layer_idx: usize,
+    /// Whether to use parallel residual (GPT-NeoX, GPT-J, StableLM):
+    /// h = x + attn(norm(x)) + ffn(norm(x))
+    pub use_parallel_residual: bool,
 }
 
 impl TransformerLayer {
@@ -603,19 +739,27 @@ impl TransformerLayer {
         }
     }
 
-    /// Get the dense FFN layer if this is not an MoE layer
+    /// Get the dense FFN layer if this is not an MoE or NoGate layer
     pub fn ffn(&self) -> Option<&FeedForward> {
         match &self.ffn_layer {
             FfnLayer::Dense(ffn) => Some(ffn),
-            FfnLayer::Moe(_) => None,
+            FfnLayer::NoGate(_) | FfnLayer::Moe(_) => None,
         }
     }
 
-    /// Get the MoE layer if this is not a dense FFN layer
+    /// Get the MoE layer if this is not a dense or NoGate FFN layer
     pub fn moe(&self) -> Option<&super::moe::MoeLayer> {
         match &self.ffn_layer {
-            FfnLayer::Dense(_) => None,
+            FfnLayer::Dense(_) | FfnLayer::NoGate(_) => None,
             FfnLayer::Moe(moe) => Some(moe),
+        }
+    }
+
+    /// Get the NoGate FFN layer if this is not a dense or MoE layer
+    pub fn no_gate_ffn(&self) -> Option<&NoGateFeedForward> {
+        match &self.ffn_layer {
+            FfnLayer::Dense(_) | FfnLayer::Moe(_) => None,
+            FfnLayer::NoGate(ffn) => Some(ffn),
         }
     }
 
@@ -647,7 +791,7 @@ impl TransformerLayer {
         let mut norm_out = Tensor::zeros(x.shape().to_vec(), DType::F32);
         self.attn_norm.forward(x, &mut norm_out, backend)?;
 
-        let mut attn_out = match &self.attn_layer {
+        let attn_out = match &self.attn_layer {
             AttentionLayer::FullAttention(attn) => {
                 attn.forward(&norm_out, k_cache, v_cache, pos, freq_base, freq_scale, backend)?
             }
@@ -661,47 +805,94 @@ impl TransformerLayer {
             }
         };
 
-        // In-place residual: attn_out += x (avoids allocating h)
-        {
-            let attn_data = attn_out.as_f32_mut()?;
-            let x_data = x.as_f32()?;
-            let x_start = if x.ndim() == 2 {
-                (x.shape()[0] - 1) * hidden_size
-            } else {
-                0
-            };
-            let x_slice = &x_data[x_start..x_start + hidden_size];
-            for (a, &xv) in attn_data.iter_mut().zip(x_slice.iter()) {
-                *a += xv;
-            }
-        }
-        let h = attn_out;
-
-        let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
-        if let Some(ref pan) = self.post_attn_norm {
-            pan.forward(&h, &mut ffn_norm_out, backend)?;
+        let x_data = x.as_f32()?;
+        let x_start = if x.ndim() == 2 {
+            (x.shape()[0] - 1) * hidden_size
         } else {
-            self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
-        }
-
-        let mut ffn_out = match &self.ffn_layer {
-            FfnLayer::Dense(ffn) => {
-                let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
-                ffn.forward(&ffn_norm_out, &mut out, backend)?;
-                out
-            }
-            FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+            0
         };
 
-        // In-place residual: ffn_out += h (avoids allocating final output tensor)
-        {
-            let ffn_data = ffn_out.as_f32_mut()?;
-            let h_data = h.as_f32()?;
-            for (f, &hv) in ffn_data.iter_mut().zip(h_data.iter()) {
-                *f += hv;
-            }
-        }
+        if self.use_parallel_residual {
+            // Parallel residual (GPT-NeoX, GPT-J, StableLM):
+            // output = x + attn(norm(x)) + ffn(norm(x))
+            // Both branches use the same norm_out (computed from x)
+            let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
+            self.ffn_norm.forward(x, &mut ffn_norm_out, backend)?;
 
-        Ok(ffn_out)
+            let mut ffn_out = match &self.ffn_layer {
+                FfnLayer::Dense(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::NoGate(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+            };
+
+            // output = x + attn_out + ffn_out
+            {
+                let out_data = ffn_out.as_f32_mut()?;
+                let attn_data = attn_out.as_f32()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for i in 0..hidden_size {
+                    out_data[i] += attn_data[i] + x_slice[i];
+                }
+            }
+            Ok(ffn_out)
+        } else {
+            // Serial residual (LLaMA, Mistral, Qwen, Gemma, etc.):
+            // h = x + attn(norm(x))
+            // output = h + ffn(norm(h))
+            let mut h = attn_out;
+            {
+                let h_data = h.as_f32_mut()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for (a, &xv) in h_data.iter_mut().zip(x_slice.iter()) {
+                    *a += xv;
+                }
+            }
+
+            let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
+            if let Some(ref pan) = self.post_attn_norm {
+                pan.forward(&h, &mut ffn_norm_out, backend)?;
+            } else {
+                self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
+            }
+
+            let mut ffn_out = match &self.ffn_layer {
+                FfnLayer::Dense(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::NoGate(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+            };
+
+            if let Some(ref norm) = self.post_ffn_norm {
+                let mut normed = Tensor::zeros(vec![hidden_size], DType::F32);
+                norm.forward(&ffn_out, &mut normed, backend)?;
+                ffn_out = normed;
+            }
+
+            // In-place residual: ffn_out += h
+            {
+                let ffn_data = ffn_out.as_f32_mut()?;
+                let h_data = h.as_f32()?;
+                for (f, &hv) in ffn_data.iter_mut().zip(h_data.iter()) {
+                    *f += hv;
+                }
+            }
+
+            Ok(ffn_out)
+        }
     }
 }

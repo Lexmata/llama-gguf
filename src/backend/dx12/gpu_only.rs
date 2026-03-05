@@ -466,6 +466,11 @@ impl Dx12GpuInference {
 
         match &self.layers[layer_idx].ffn_layer {
             FfnLayer::Dense(_) => self.dense_ffn_forward(layer_idx)?,
+            FfnLayer::NoGate(_) => {
+                return Err(BackendError::OperationFailed(
+                    "NoGate FFN not yet supported on DX12 GPU".into(),
+                ));
+            }
             FfnLayer::Moe(_) => self.moe_forward(layer_idx)?,
         }
 
@@ -1006,6 +1011,10 @@ fn upload_layer_weights(
     match &layer.ffn_layer {
         FfnLayer::Dense(ffn) => {
             store.upload_auto(ctx, &format!("blk.{}.ffn_gate.weight", i), &ffn.w_gate.weight)?;
+            store.upload_auto(ctx, &format!("blk.{}.ffn_up.weight", i), &ffn.w_up.weight)?;
+            store.upload_auto(ctx, &format!("blk.{}.ffn_down.weight", i), &ffn.w_down.weight)?;
+        }
+        FfnLayer::NoGate(ffn) => {
             store.upload_auto(ctx, &format!("blk.{}.ffn_up.weight", i), &ffn.w_up.weight)?;
             store.upload_auto(ctx, &format!("blk.{}.ffn_down.weight", i), &ffn.w_down.weight)?;
         }

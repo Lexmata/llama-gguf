@@ -363,22 +363,31 @@ impl Engine {
             model_config.max_seq_len,
         );
 
-        let concrete_model = loader.build_model()?;
+        let arch = loader.architecture();
 
-        // Select backend and model implementation.
-        //
-        // When CUDA is available we try to create a GpuModelWrapper first.
-        // This runs the entire forward pass on GPU with pre-allocated scratch
-        // buffers, eliminating ~770 host↔device transfers per token that the
-        // standard Backend-trait path incurs.  If GPU-only init fails we
-        // fall back to the regular CudaBackend (per-op transfers) or CPU.
-        let (backend, model): (Arc<dyn Backend>, Box<dyn Model>) = if config.use_gpu {
-            Self::select_gpu_model(concrete_model, &model_config, &config)
-        } else {
+        let (backend, model): (Arc<dyn Backend>, Box<dyn Model>) = if arch.is_encoder_only() {
+            tracing::info!("Detected encoder-only architecture: {:?}", arch);
+            let bert_model = loader.build_bert_model()?;
             (
                 Arc::new(crate::backend::cpu::CpuBackend::new()),
-                Box::new(concrete_model),
+                Box::new(bert_model),
             )
+        } else {
+            let concrete_model = loader.build_model()?;
+
+            // When CUDA is available we try to create a GpuModelWrapper first.
+            // This runs the entire forward pass on GPU with pre-allocated scratch
+            // buffers, eliminating ~770 host↔device transfers per token that the
+            // standard Backend-trait path incurs.  If GPU-only init fails we
+            // fall back to the regular CudaBackend (per-op transfers) or CPU.
+            if config.use_gpu {
+                Self::select_gpu_model(concrete_model, &model_config, &config)
+            } else {
+                (
+                    Arc::new(crate::backend::cpu::CpuBackend::new()),
+                    Box::new(concrete_model),
+                )
+            }
         };
 
         // Detect chat template

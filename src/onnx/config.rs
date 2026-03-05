@@ -186,6 +186,13 @@ impl HfConfig {
             ssm_n_group: 0,
             ssm_dt_rank: 0,
             ssm_conv_kernel: 0,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
+            sliding_window: 0,
+            has_combined_qkv: false,
+            uses_layer_norm: false,
+            uses_gelu: false,
+            has_ffn_gate: true,
         })
     }
 }
