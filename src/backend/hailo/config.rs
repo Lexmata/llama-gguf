@@ -44,7 +44,7 @@ fn dirs_or_fallback() -> PathBuf {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HefManifest {
     pub model_config_hash: u64,
     pub hidden_size: usize,

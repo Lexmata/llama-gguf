@@ -8,13 +8,9 @@ use crate::model::layers::{AttentionLayer, FfnLayer, NormLayer};
 use crate::model::{Architecture, ModelConfig};
 use crate::tensor::{DType, Tensor};
 
+use super::compiler::resolve_hef_path;
 use super::config::HailoConfig;
 use super::context::{HailoContext, HefHandle};
-
-fn resolve_hef_path(config: &HailoConfig, layer_idx: usize, kind: &str) -> std::path::PathBuf {
-    let dir = config.hef_dir.as_ref().unwrap_or(&config.cache_dir);
-    dir.join(format!("layer_{:02}_{}.hef", layer_idx, kind))
-}
 
 pub struct HailoGpuInference {
     ctx: HailoContext,
