@@ -822,7 +822,7 @@ fn main() {
             #[cfg(not(feature = "rag"))]
             let rag_url: Option<String> = None;
 
-            if let Err(e) = run_server(&model_path, &host, port, rag_url) {
+            if let Err(e) = run_server(&model_path, &host, port, cfg.generation.max_context_len, rag_url) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -1065,6 +1065,7 @@ fn run_server(
     model_path: &str,
     host: &str,
     port: u16,
+    max_context_len: usize,
     rag_database_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -1075,6 +1076,7 @@ fn run_server(
             model_path: model_path.to_string(),
             max_concurrent: 1,
             max_queue_depth: 64,
+            max_context_len,
             #[cfg(feature = "rag")]
             rag_database_url,
         })

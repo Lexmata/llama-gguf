@@ -147,6 +147,10 @@ pub struct GenerationSection {
 
     /// Random seed for reproducible generation.
     pub seed: Option<u64>,
+
+    /// Override the model's native max context length (0 = use model default).
+    /// Reduces KV cache memory for large-context models on constrained hardware.
+    pub max_context_len: usize,
 }
 
 impl Default for GenerationSection {
@@ -158,6 +162,7 @@ impl Default for GenerationSection {
             repeat_penalty: 1.1,
             max_tokens: 512,
             seed: None,
+            max_context_len: 0,
         }
     }
 }

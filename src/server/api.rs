@@ -24,6 +24,9 @@ pub struct ServerConfig {
     pub max_concurrent: usize,
     /// Maximum queued requests before rejecting with 429 (default: 64)
     pub max_queue_depth: usize,
+    /// Override the model's native max context length (0 = use model default).
+    /// Reduces KV cache VRAM usage for large-context models on constrained GPUs.
+    pub max_context_len: usize,
     #[cfg(feature = "rag")]
     pub rag_database_url: Option<String>,
 }
@@ -39,7 +42,22 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     let chat_template = ChatTemplate::detect(&gguf);
     eprintln!("Chat template: {:?}", chat_template);
 
-    let loader = ModelLoader::load(&config.model_path)?;
+    let mut loader = ModelLoader::load(&config.model_path)?;
+
+    let ctx_override = if config.max_context_len > 0 {
+        Some(config.max_context_len)
+    } else {
+        std::env::var("CARDOZO_CONTEXT_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    };
+    if let Some(ctx_len) = ctx_override {
+        let native = loader.config().max_seq_len;
+        let clamped = ctx_len.min(native);
+        loader.config_mut().max_seq_len = clamped;
+        eprintln!("Context size: {} (native: {})", clamped, native);
+    }
+
     let model_config = loader.config().clone();
     eprintln!(
         "Model config: {} layers, {} heads, {} dim",

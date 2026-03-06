@@ -305,6 +305,11 @@ impl ModelLoader {
         &self.config
     }
 
+    /// Get mutable reference to model configuration (e.g., to clamp context length).
+    pub fn config_mut(&mut self) -> &mut ModelConfig {
+        &mut self.config
+    }
+
     /// Get the detected architecture
     pub fn architecture(&self) -> Architecture {
         self.architecture
