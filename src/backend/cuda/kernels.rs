@@ -942,14 +942,14 @@ __global__ void deltanet_recurrent(
     if (vh >= num_v_heads) return;
     if (threadIdx.x != 0) return;
 
-    int kh = vh / kv_ratio;
-    int r = vh % kv_ratio;
+    // Beta/alpha uses interleaved group layout for the packed ba_raw buffer
+    int ba_kh = vh / kv_ratio;
+    int ba_r = vh % kv_ratio;
 
-    // Beta and alpha from ba_raw
     int ba_per_group = 2 * kv_ratio;
-    int group_offset = kh * ba_per_group;
-    float beta_raw = ba_raw[group_offset + r];
-    float alpha_raw = ba_raw[group_offset + kv_ratio + r];
+    int group_offset = ba_kh * ba_per_group;
+    float beta_raw = ba_raw[group_offset + ba_r];
+    float alpha_raw = ba_raw[group_offset + kv_ratio + ba_r];
 
     float beta = 1.0f / (1.0f + expf(-beta_raw));
 
@@ -962,9 +962,11 @@ __global__ void deltanet_recurrent(
 
     // Q, K, V offsets into conv_out
     // Layout: [Q: num_k_heads*head_k_dim | K: num_k_heads*head_k_dim | V: d_inner]
+    // Q and K are tiled (ggml_repeat pattern): v-head maps to k-head via modulo
     int q_dim = num_k_heads * head_k_dim;
-    int q_offset = kh * head_k_dim;          // Q for this v-head's k-head
-    int k_offset = q_dim + kh * head_k_dim;  // K for this v-head's k-head
+    int qk_head = vh % num_k_heads;
+    int q_offset = qk_head * head_k_dim;
+    int k_offset = q_dim + qk_head * head_k_dim;
     int v_offset = q_dim + q_dim + vh * head_v_dim;
 
     // L2 normalize Q (per k-head)
