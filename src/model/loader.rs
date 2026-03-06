@@ -663,20 +663,54 @@ impl ModelLoader {
         {
             FfnLayer::Identity
         } else if !self.config.has_ffn_gate {
-            // No-gate FFN (GPT-2, BLOOM, GPT-NeoX, etc.)
-            let w_up = Linear::new(
-                self.load_tensor(&format!("{}.ffn_up.weight", prefix))?,
-                self.try_load_tensor(&format!("{}.ffn_up.bias", prefix)),
-            )?;
-            let w_down = Linear::new(
-                self.load_tensor(&format!("{}.ffn_down.weight", prefix))?,
-                self.try_load_tensor(&format!("{}.ffn_down.bias", prefix)),
-            )?;
-            FfnLayer::NoGate(NoGateFeedForward::new(
-                w_up,
-                w_down,
-                self.config.uses_gelu,
-            ))
+            let up_tensor = self.load_tensor(&format!("{}.ffn_up.weight", prefix))?;
+            let up_out_dim = up_tensor.shape()[up_tensor.ndim() - 1];
+            let intermediate = self.config.intermediate_size;
+
+            if up_out_dim == 2 * intermediate {
+                // Fused gate+up projection (Phi-3, Phi-4): split into separate gate and up
+                let hidden = self.config.hidden_size;
+                let up_f32 = if up_tensor.dtype() == DType::F32 {
+                    up_tensor.as_f32()?.to_vec()
+                } else {
+                    let backend = crate::backend::default_backend();
+                    let mut deq = Tensor::zeros(vec![up_tensor.numel()], DType::F32);
+                    backend
+                        .dequantize(&up_tensor, &mut deq)
+                        .map_err(|e| ModelError::ConfigError(format!("Dequant ffn_up: {}", e)))?;
+                    deq.as_f32()?.to_vec()
+                };
+
+                let gate_data = &up_f32[..hidden * intermediate];
+                let up_data = &up_f32[hidden * intermediate..];
+                let w_gate = Linear::new(
+                    Tensor::from_f32(gate_data, vec![hidden, intermediate])?,
+                    None,
+                )?;
+                let w_up = Linear::new(
+                    Tensor::from_f32(up_data, vec![hidden, intermediate])?,
+                    None,
+                )?;
+                let w_down = Linear::new(
+                    self.load_tensor(&format!("{}.ffn_down.weight", prefix))?,
+                    None,
+                )?;
+                FfnLayer::Dense(FeedForward::new(w_gate, w_up, w_down))
+            } else {
+                let w_up = Linear::new(
+                    up_tensor,
+                    self.try_load_tensor(&format!("{}.ffn_up.bias", prefix)),
+                )?;
+                let w_down = Linear::new(
+                    self.load_tensor(&format!("{}.ffn_down.weight", prefix))?,
+                    self.try_load_tensor(&format!("{}.ffn_down.bias", prefix)),
+                )?;
+                FfnLayer::NoGate(NoGateFeedForward::new(
+                    w_up,
+                    w_down,
+                    self.config.uses_gelu,
+                ))
+            }
         } else {
             let w_gate = Linear::new(
                 self.load_tensor(&format!("{}.ffn_gate.weight", prefix))?,

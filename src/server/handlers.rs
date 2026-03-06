@@ -475,7 +475,7 @@ pub async fn reload_model_from_path(
     state: &AppState,
     model_path: &str,
 ) -> Result<(String, usize), Box<dyn std::error::Error + Send + Sync>> {
-    use crate::engine::{ChatTemplate, Engine};
+    use crate::engine::ChatTemplate;
     use crate::gguf::GgufFile;
     use crate::model::ModelLoader;
 
@@ -486,15 +486,7 @@ pub async fn reload_model_from_path(
     let model_config = loader.config().clone();
     let model = loader.build_model()?;
 
-    let use_gpu = std::env::var("LLAMA_GPU")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-
-    let backend: Arc<dyn crate::Backend> = if use_gpu {
-        Engine::select_gpu_backend(&model)
-    } else {
-        Arc::new(crate::backend::cpu::CpuBackend::new())
-    };
+    let (gpu_model, backend) = super::api::select_model_and_backend(model, &model_config);
 
     let name = std::path::Path::new(model_path)
         .file_stem()
@@ -504,7 +496,7 @@ pub async fn reload_model_from_path(
     let ctx_size = model_config.max_seq_len;
 
     // Swap atomically
-    *state.model.write().await = Arc::new(model);
+    *state.model.write().await = gpu_model;
     *state.tokenizer.write().await = Arc::new(tokenizer);
     *state.config.write().await = model_config;
     *state.model_name.write().await = name.clone();

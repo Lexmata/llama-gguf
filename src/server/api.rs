@@ -8,10 +8,11 @@ use axum::routing::{get, post};
 use tokio::sync::{RwLock, Semaphore};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::engine::{ChatTemplate, Engine};
+use crate::engine::ChatTemplate;
 use crate::gguf::GgufFile;
-use crate::model::ModelLoader;
+use crate::model::{ModelConfig, ModelLoader};
 use crate::tokenizer::Tokenizer;
+use crate::{Backend, Model};
 
 use super::handlers::{self, AppState, RequestQueue};
 
@@ -67,15 +68,8 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     let model = loader.build_model()?;
     eprintln!("Model loaded successfully");
 
-    let use_gpu = std::env::var("LLAMA_GPU")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-
-    let backend: Arc<dyn crate::Backend> = if use_gpu {
-        Engine::select_gpu_backend(&model)
-    } else {
-        Arc::new(crate::backend::cpu::CpuBackend::new())
-    };
+    let (gpu_model, backend) = select_model_and_backend(model, &model_config);
+    let model = gpu_model;
 
     let model_name = std::path::Path::new(&config.model_path)
         .file_stem()
@@ -95,7 +89,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     };
 
     let app_state = Arc::new(AppState {
-        model: RwLock::new(Arc::new(model)),
+        model: RwLock::new(model),
         tokenizer: RwLock::new(Arc::new(tokenizer)),
         config: RwLock::new(model_config),
         model_name: RwLock::new(model_name),
@@ -236,4 +230,165 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Select the model implementation and backend based on `LLAMA_GPU` env var.
+///
+/// When GPU is available and enabled, creates a [`GpuModelWrapper`] that runs
+/// the entire forward pass on device (attention, DeltaNet, MoE, FFN) with
+/// pre-allocated scratch buffers. The returned backend is a no-op `CpuBackend`
+/// because all compute lives inside the model wrapper.
+///
+/// When GPU is disabled (or unavailable), the raw `LlamaModel` is used with
+/// a `CpuBackend` that performs every operation on the host.
+pub(crate) fn select_model_and_backend(
+    model: crate::model::LlamaModel,
+    config: &ModelConfig,
+) -> (Arc<dyn Model>, Arc<dyn Backend>) {
+    let use_gpu = std::env::var("LLAMA_GPU")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    if !use_gpu {
+        eprintln!("GPU disabled (LLAMA_GPU not set or 0)");
+        return (
+            Arc::new(model),
+            Arc::new(crate::backend::cpu::CpuBackend::new()),
+        );
+    }
+
+    let architecture = model.architecture();
+    let max_seq_len = config.max_seq_len;
+
+    #[cfg(feature = "cuda")]
+    {
+        if cudarc::driver::CudaDevice::new(0).is_ok() {
+            match crate::backend::cuda::gpu_only::GpuOnlyInference::from_model(
+                model,
+                max_seq_len,
+            ) {
+                Ok(gpu) => {
+                    eprintln!(
+                        "Using full GPU inference (attention + DeltaNet + MoE all on CUDA)"
+                    );
+                    let wrapper = crate::backend::GpuModelWrapper::new(
+                        gpu,
+                        config.clone(),
+                        architecture,
+                    );
+                    return (
+                        Arc::new(wrapper),
+                        Arc::new(crate::backend::cpu::CpuBackend::new()),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("FATAL: CUDA GPU inference init failed: {}", e);
+                    eprintln!("Model was consumed during init. Restart without LLAMA_GPU=1.");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!("LLAMA_GPU=1 but no CUDA device found");
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    {
+        if crate::backend::vulkan::VulkanBackend::new().is_ok() {
+            match crate::backend::vulkan::gpu_only::VulkanGpuInference::from_model(
+                model,
+                max_seq_len,
+            ) {
+                Ok(gpu) => {
+                    eprintln!("Using full GPU inference on Vulkan");
+                    let wrapper = crate::backend::GpuModelWrapper::new(
+                        gpu,
+                        config.clone(),
+                        architecture,
+                    );
+                    return (
+                        Arc::new(wrapper),
+                        Arc::new(crate::backend::cpu::CpuBackend::new()),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("FATAL: Vulkan GPU inference init failed: {}", e);
+                    eprintln!("Model was consumed during init. Restart without LLAMA_GPU=1.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        if crate::backend::metal::MetalBackend::new().is_ok() {
+            match crate::backend::metal::gpu_only::MetalGpuInference::from_model(
+                model,
+                max_seq_len,
+            ) {
+                Ok(gpu) => {
+                    eprintln!("Using full GPU inference on Metal");
+                    let wrapper = crate::backend::GpuModelWrapper::new(
+                        gpu,
+                        config.clone(),
+                        architecture,
+                    );
+                    return (
+                        Arc::new(wrapper),
+                        Arc::new(crate::backend::cpu::CpuBackend::new()),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("FATAL: Metal GPU inference init failed: {}", e);
+                    eprintln!("Model was consumed during init. Restart without LLAMA_GPU=1.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "dx12", target_os = "windows"))]
+    {
+        if crate::backend::dx12::Dx12Backend::new().is_ok() {
+            match crate::backend::dx12::gpu_only::Dx12GpuInference::from_model(
+                model,
+                max_seq_len,
+            ) {
+                Ok(gpu) => {
+                    eprintln!("Using full GPU inference on DX12");
+                    let wrapper = crate::backend::GpuModelWrapper::new(
+                        gpu,
+                        config.clone(),
+                        architecture,
+                    );
+                    return (
+                        Arc::new(wrapper),
+                        Arc::new(crate::backend::cpu::CpuBackend::new()),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("FATAL: DX12 GPU inference init failed: {}", e);
+                    eprintln!("Model was consumed during init. Restart without LLAMA_GPU=1.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        feature = "cuda",
+        feature = "vulkan",
+        all(feature = "metal", target_os = "macos"),
+        all(feature = "dx12", target_os = "windows")
+    )))]
+    {
+        eprintln!("LLAMA_GPU=1 but no GPU backend compiled. Build with --features cuda/vulkan/metal/dx12");
+    }
+
+    eprintln!("Falling back to CPU");
+    (
+        Arc::new(model),
+        Arc::new(crate::backend::cpu::CpuBackend::new()),
+    )
 }
