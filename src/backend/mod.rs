@@ -12,6 +12,8 @@ pub mod tensor_parallel;
 pub mod metal;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
+#[cfg(feature = "hailo")]
+pub mod hailo;
 
 pub use error::BackendError;
 

@@ -1,0 +1,1 @@
+// Stub for Hailo compiler.

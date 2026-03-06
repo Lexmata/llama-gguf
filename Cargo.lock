@@ -886,6 +886,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hailort-sys"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c2c2d4452e8af5ab426727d891c21d88b1408bea46bf17d4b69702145eff4b8"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1362,6 +1371,7 @@ dependencies = [
  "futures",
  "glob",
  "gpu-allocator",
+ "hailort-sys",
  "half",
  "indicatif",
  "memmap2",
