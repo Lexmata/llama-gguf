@@ -39,6 +39,7 @@ Each backend implements the `Backend` trait from `backend/mod.rs`:
 | `metal/` | `metal` | macOS | Production - Apple Silicon and AMD GPUs |
 | `dx12/` | `dx12` | Windows | Production - DirectX 12 compatible GPUs |
 | `vulkan/` | `vulkan` | All | Experimental - Vulkan SDK required |
+| `hailo/` | `hailo` | Linux | Experimental - Hailo AI accelerators (Hailo-8L, Hailo-8, Hailo-10H) |
 
 ### CUDA GPU-Only Inference
 
@@ -51,6 +52,34 @@ The CUDA backend's primary inference engine is `backend/cuda/gpu_only.rs` (`GpuO
 - **Attention** uses a hybrid CPU roundtrip for correctness with Qwen3Next-specific features (QK norm, partial RoPE, attention gating)
 
 Other GPU backends (Metal, DX12, Vulkan) use the generic `TransformerLayer::forward()` path from `model/layers.rs`, which dispatches to each backend's `Backend` trait implementation and falls back to CPU for unimplemented operations.
+
+### Hailo Backend (Hybrid CPU+NPU)
+
+The Hailo backend (`backend/hailo/`) offloads transformer subgraphs to Hailo AI accelerators while keeping CPU-bound operations local:
+
+| File | Purpose |
+|------|---------|
+| `hailo/config.rs` | `HailoConfig`, `HailoQuantization`, `HefManifest` |
+| `hailo/context.rs` | `HailoContext` — device management, HEF loading, vstream I/O |
+| `hailo/gpu_only.rs` | `HailoGpuInference` — hybrid forward pass orchestrator |
+| `hailo/compiler.rs` | ONNX export and DFC auto-compilation to HEF |
+| `hailo/mod.rs` | Module root and `Backend` trait stub (all ops unsupported) |
+
+**Execution model** — two HEFs per layer:
+- **Attention HEF**: `attn_norm → Q/K/V projections` (runs on Hailo NPU)
+- **FFN HEF**: `ffn_norm → gate→SiLU→up→mul→down` (runs on Hailo NPU)
+- **CPU**: embedding, RoPE, KV cache, attention scoring, O projection, residual, final norm, logits
+
+**CLI usage**:
+```bash
+cargo run --release --features hailo -- run model.gguf --hailo --hef-dir /path/to/hefs -p "Hello"
+cargo run --release --features hailo -- hailo-info
+```
+
+**HEF auto-compile** (requires Hailo DFC Python package):
+```bash
+cargo run --release --features hailo -- run model.gguf --hailo --auto-compile
+```
 
 ### RAG Architecture
 
