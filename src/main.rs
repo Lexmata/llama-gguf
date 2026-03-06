@@ -73,6 +73,14 @@ enum Commands {
         #[arg(long)]
         gpu: bool,
 
+        /// Use Hailo AI accelerator for inference
+        #[arg(long)]
+        hailo: bool,
+
+        /// Directory containing pre-compiled HEF files for Hailo
+        #[arg(long)]
+        hef_dir: Option<String>,
+
         /// Path to external tokenizer (tokenizer.json or .gguf file)
         #[arg(long)]
         tokenizer: Option<String>,
@@ -115,6 +123,18 @@ enum Commands {
         /// Random seed (optional)
         #[arg(long)]
         seed: Option<u64>,
+
+        /// Use GPU acceleration (CUDA)
+        #[arg(long)]
+        gpu: bool,
+
+        /// Use Hailo AI accelerator for inference
+        #[arg(long)]
+        hailo: bool,
+
+        /// Directory containing pre-compiled HEF files for Hailo
+        #[arg(long)]
+        hef_dir: Option<String>,
 
         /// Path to external tokenizer (tokenizer.json or .gguf file)
         #[arg(long)]
@@ -280,6 +300,10 @@ enum Commands {
         #[arg(short, long)]
         config: String,
     },
+
+    /// Show Hailo device information
+    #[cfg(feature = "hailo")]
+    HailoInfo,
 }
 
 /// RAG subcommands
@@ -627,23 +651,34 @@ fn main() {
             repeat_penalty,
             seed,
             gpu,
+            hailo: _hailo,
+            hef_dir: _hef_dir,
             tokenizer,
         } => {
-            // CLI args override config file values; clap defaults are used when
-            // the user didn't explicitly pass an argument (we detect this by
-            // checking if the value matches clap's default and the config differs).
-            let ec = cfg.to_engine_config(Some(&model));
+            let mut config = cfg.to_engine_config(Some(&model));
+            config.max_tokens = cli_or_config(n_predict, 128, config.max_tokens);
+            config.temperature = cli_or_config_f32(temperature, 0.8, config.temperature);
+            config.top_k = cli_or_config(top_k, 40, config.top_k);
+            config.top_p = cli_or_config_f32(top_p, 0.95, config.top_p);
+            config.repeat_penalty = cli_or_config_f32(repeat_penalty, 1.1, config.repeat_penalty);
+            config.seed = seed.or(config.seed);
+            config.use_gpu = gpu || config.use_gpu;
+            config.tokenizer_path = tokenizer;
+            #[cfg(feature = "hailo")]
+            {
+                if _hailo {
+                    let mut hc = llama_gguf::backend::hailo::HailoConfig::default();
+                    if let Some(ref dir) = _hef_dir {
+                        hc.hef_dir = Some(std::path::PathBuf::from(dir));
+                    }
+                    config.hailo_config = Some(hc);
+                    config.use_gpu = true;
+                }
+            }
             if let Err(e) = run_inference(
                 &resolve_model_path(&model, &cfg),
                 prompt.as_deref(),
-                cli_or_config(n_predict, 128, ec.max_tokens),
-                cli_or_config_f32(temperature, 0.8, ec.temperature),
-                cli_or_config(top_k, 40, ec.top_k),
-                cli_or_config_f32(top_p, 0.95, ec.top_p),
-                cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
-                seed.or(ec.seed),
-                gpu || ec.use_gpu,
-                tokenizer,
+                config,
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -659,6 +694,9 @@ fn main() {
             top_p,
             repeat_penalty,
             seed,
+            gpu,
+            hailo: _hailo,
+            hef_dir: _hef_dir,
             tokenizer,
         } => {
             // Determine server URL: --server flag > config file > none
@@ -699,18 +737,31 @@ fn main() {
                         std::process::exit(1);
                     })
                 });
-                let ec = cfg.to_chat_engine_config(Some(&model));
+                let mut config = cfg.to_chat_engine_config(Some(&model));
+                config.max_tokens = cli_or_config(n_predict, 512, config.max_tokens);
+                config.temperature = cli_or_config_f32(temperature, 0.7, config.temperature);
+                config.top_k = cli_or_config(top_k, 40, config.top_k);
+                config.top_p = cli_or_config_f32(top_p, 0.9, config.top_p);
+                config.repeat_penalty = cli_or_config_f32(repeat_penalty, 1.1, config.repeat_penalty);
+                config.seed = seed.or(config.seed);
+                config.use_gpu = gpu || config.use_gpu;
+                config.tokenizer_path = tokenizer;
+                #[cfg(feature = "hailo")]
+                {
+                    if _hailo {
+                        let mut hc = llama_gguf::backend::hailo::HailoConfig::default();
+                        if let Some(ref dir) = _hef_dir {
+                            hc.hef_dir = Some(std::path::PathBuf::from(dir));
+                        }
+                        config.hailo_config = Some(hc);
+                        config.use_gpu = true;
+                    }
+                }
                 let system_prompt = system.or(cfg.chat.system_prompt.clone());
                 if let Err(e) = run_chat(
                     &resolve_model_path(&model, &cfg),
                     system_prompt.as_deref(),
-                    cli_or_config(n_predict, 512, ec.max_tokens),
-                    cli_or_config_f32(temperature, 0.7, ec.temperature),
-                    cli_or_config(top_k, 40, ec.top_k),
-                    cli_or_config_f32(top_p, 0.9, ec.top_p),
-                    cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
-                    seed.or(ec.seed),
-                    tokenizer,
+                    config,
                 ) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
@@ -881,6 +932,20 @@ fn main() {
         Commands::Cluster { config } => {
             run_cluster_status(&config);
         }
+        #[cfg(feature = "hailo")]
+        Commands::HailoInfo => {
+            match llama_gguf::backend::hailo::HailoContext::new() {
+                Ok(ctx) => {
+                    let info = ctx.device_info();
+                    println!("Hailo Devices: {}", info.num_devices);
+                    println!("Library Version: {}", info.library_version);
+                }
+                Err(e) => {
+                    eprintln!("Hailo not available: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -1011,39 +1076,34 @@ fn run_server(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_inference(
     model_path: &str,
     prompt: Option<&str>,
-    n_predict: usize,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    repeat_penalty: f32,
-    seed: Option<u64>,
-    use_gpu: bool,
-    tokenizer_path: Option<String>,
+    config: EngineConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::load(EngineConfig {
-        model_path: model_path.to_string(),
-        tokenizer_path,
-        temperature,
-        top_k,
-        top_p,
-        repeat_penalty,
-        max_tokens: n_predict,
-        seed,
-        use_gpu,
-        max_context_len: None,
-    })?;
+    if let Ok(gguf) = GgufFile::open(model_path) {
+        if let Some(arch_str) = gguf.data.get_string("general.architecture") {
+            let arch = llama_gguf::model::Architecture::from_gguf_str(arch_str);
+            if arch.is_encoder_only() {
+                eprintln!("Note: {} is an encoder-only model ({}). Running embeddings instead of text generation.",
+                    model_path.rsplit('/').next().unwrap_or(model_path), arch.as_str());
+                eprintln!("Use `llama-gguf embed` for embedding extraction.\n");
+                let text = prompt.unwrap_or("Hello");
+                return run_embed(model_path, text, "json");
+            }
+        }
+    }
+
+    let n_predict = config.max_tokens;
+    let mut engine_config = config;
+    engine_config.model_path = model_path.to_string();
+    let engine = Engine::load(engine_config)?;
 
     let raw_prompt = prompt.unwrap_or("Hello");
 
-    // Print the prompt before streaming the response
     print!("{}", raw_prompt);
     io::stdout().flush()?;
 
-    // Stream tokens as they are generated
     let mut count = 0;
     for token_result in engine.generate_streaming(raw_prompt, n_predict) {
         let text = token_result?;
@@ -1058,31 +1118,14 @@ fn run_inference(
     Ok(())
 }
 
-/// Interactive chat mode
-#[allow(clippy::too_many_arguments)]
 fn run_chat(
     model_path: &str,
     system_prompt: Option<&str>,
-    n_predict: usize,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    repeat_penalty: f32,
-    seed: Option<u64>,
-    tokenizer_path: Option<String>,
+    config: EngineConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::load(EngineConfig {
-        model_path: model_path.to_string(),
-        tokenizer_path,
-        temperature,
-        top_k,
-        top_p,
-        repeat_penalty,
-        max_tokens: n_predict,
-        seed,
-        use_gpu: false,
-        max_context_len: None,
-    })?;
+    let mut engine_config = config;
+    engine_config.model_path = model_path.to_string();
+    let engine = Engine::load(engine_config)?;
 
     let system_text = system_prompt.unwrap_or("You are a helpful AI assistant.");
     let mut chat = ChatEngine::new(engine, Some(system_text.to_string()));

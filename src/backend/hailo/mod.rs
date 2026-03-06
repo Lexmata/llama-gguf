@@ -11,6 +11,9 @@ use crate::tensor::{DType, Tensor};
 
 pub use config::{HailoConfig, HailoQuantization, HefManifest};
 
+#[cfg(feature = "hailo")]
+pub use context::HailoContext;
+
 pub struct HailoBackend {
     _config: HailoConfig,
 }
