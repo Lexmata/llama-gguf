@@ -73,6 +73,10 @@ enum Commands {
         #[arg(long)]
         gpu: bool,
 
+        /// Max context length for KV cache (reduces VRAM usage)
+        #[arg(long)]
+        ctx_len: Option<usize>,
+
         /// Path to external tokenizer (tokenizer.json or .gguf file)
         #[arg(long)]
         tokenizer: Option<String>,
@@ -627,6 +631,7 @@ fn main() {
             repeat_penalty,
             seed,
             gpu,
+            ctx_len,
             tokenizer,
         } => {
             // CLI args override config file values; clap defaults are used when
@@ -643,6 +648,7 @@ fn main() {
                 cli_or_config_f32(repeat_penalty, 1.1, ec.repeat_penalty),
                 seed.or(ec.seed),
                 gpu || ec.use_gpu,
+                ctx_len,
                 tokenizer,
             ) {
                 eprintln!("Error: {}", e);
@@ -1022,6 +1028,7 @@ fn run_inference(
     repeat_penalty: f32,
     seed: Option<u64>,
     use_gpu: bool,
+    max_context_len: Option<usize>,
     tokenizer_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::load(EngineConfig {
@@ -1034,7 +1041,7 @@ fn run_inference(
         max_tokens: n_predict,
         seed,
         use_gpu,
-        max_context_len: None,
+        max_context_len,
     })?;
 
     let raw_prompt = prompt.unwrap_or("Hello");

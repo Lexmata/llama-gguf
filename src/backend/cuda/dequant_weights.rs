@@ -303,11 +303,27 @@ pub fn upload_model_weights(
                     &format!("blk.{}.attn_gate.weight", i),
                     &dn.attn_gate.weight,
                 )?;
-                upload_weight(
-                    &mut store,
-                    &format!("blk.{}.ssm_ba.weight", i),
-                    &dn.ssm_ba.weight,
-                )?;
+                match &dn.ssm_ba {
+                    crate::model::deltanet::BetaAlphaProjection::Combined(linear) => {
+                        upload_weight(
+                            &mut store,
+                            &format!("blk.{}.ssm_ba.weight", i),
+                            &linear.weight,
+                        )?;
+                    }
+                    crate::model::deltanet::BetaAlphaProjection::Separate { beta, alpha } => {
+                        upload_weight(
+                            &mut store,
+                            &format!("blk.{}.ssm_beta.weight", i),
+                            &beta.weight,
+                        )?;
+                        upload_weight(
+                            &mut store,
+                            &format!("blk.{}.ssm_alpha.weight", i),
+                            &alpha.weight,
+                        )?;
+                    }
+                }
                 upload_weight(
                     &mut store,
                     &format!("blk.{}.ssm_out.weight", i),

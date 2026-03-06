@@ -67,6 +67,10 @@ pub struct GpuOnlyInference {
     dn_recurrent_out: Option<CudaSlice<f32>>,
     // DeltaNet config buffer on GPU: [num_v_heads, num_k_heads, head_v_dim, head_k_dim, kv_ratio, d_inner, qkv_dim]
     dn_config_gpu: Option<CudaSlice<i32>>,
+    // Whether DeltaNet uses separate beta/alpha projections (Qwen3.5) vs combined
+    dn_ba_separate: bool,
+    dn_beta_tmp: Option<CudaSlice<f32>>,
+    dn_alpha_tmp: Option<CudaSlice<f32>>,
     // MoE scratch buffers
     moe_hidden: CudaSlice<f32>,
     moe_expert_out: CudaSlice<f32>,
@@ -508,6 +512,9 @@ impl GpuOnlyInference {
         let mut dn_conv_out_buf = None;
         let mut dn_recurrent_out_buf = None;
         let mut dn_config_gpu_buf = None;
+        let mut dn_ba_separate = false;
+        let mut dn_beta_tmp_buf = None;
+        let mut dn_alpha_tmp_buf = None;
 
         if let Some(ref dn_cfg) = deltanet_config {
             for i in 0..model_config.num_layers {
@@ -525,6 +532,13 @@ impl GpuOnlyInference {
             dn_gate_z_buf = Some(alloc(dn_cfg.d_inner)?);
             let ba_size = dn_cfg.num_k_heads * 2 * (dn_cfg.num_v_heads / dn_cfg.num_k_heads.max(1));
             dn_ba_buf = Some(alloc(ba_size)?);
+
+            dn_ba_separate = weights.contains("blk.0.ssm_beta.weight");
+            if dn_ba_separate {
+                dn_beta_tmp_buf = Some(alloc(dn_cfg.num_v_heads)?);
+                dn_alpha_tmp_buf = Some(alloc(dn_cfg.num_v_heads)?);
+            }
+
             dn_conv_out_buf = Some(alloc(dn_cfg.qkv_dim)?);
             dn_recurrent_out_buf = Some(alloc(dn_cfg.d_inner)?);
 
@@ -595,6 +609,9 @@ impl GpuOnlyInference {
             dn_conv_out: dn_conv_out_buf,
             dn_recurrent_out: dn_recurrent_out_buf,
             dn_config_gpu: dn_config_gpu_buf,
+            dn_ba_separate,
+            dn_beta_tmp: dn_beta_tmp_buf,
+            dn_alpha_tmp: dn_alpha_tmp_buf,
             moe_hidden,
             moe_expert_out,
             moe_expert_gate,
@@ -1151,7 +1168,7 @@ impl GpuOnlyInference {
                     (
                         &self.attn_gate,
                         &self.attn_out,
-                        &mut self.attn_q_raw, // reuse as temp output
+                        &mut self.attn_q_raw,
                         total as i32,
                     ),
                 )
@@ -1159,8 +1176,14 @@ impl GpuOnlyInference {
             .map_err(|e| {
                 BackendError::OperationFailed(format!("attention_gate failed: {}", e))
             })?;
+            let src = self.attn_q_raw.try_slice(..total).ok_or_else(|| {
+                BackendError::OperationFailed("gate slice out of bounds".into())
+            })?;
+            let mut dst = self.attn_out.try_slice_mut(..total).ok_or_else(|| {
+                BackendError::OperationFailed("gate slice_mut out of bounds".into())
+            })?;
             self.device
-                .dtod_copy(&self.attn_q_raw, &mut self.attn_out)
+                .dtod_copy(&src, &mut dst)
                 .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
         }
 
@@ -1224,15 +1247,50 @@ impl GpuOnlyInference {
             .dn_ba
             .as_mut()
             .ok_or_else(|| BackendError::OperationFailed("No DeltaNet ba buffer".into()))?;
-        linear_gpu(
-            &self.kernels,
-            &self.weights,
-            &self.device,
-            &format!("{}.ssm_ba.weight", prefix),
-            None,
-            &self.hidden_norm,
-            dn_ba,
-        )?;
+
+        if self.dn_ba_separate {
+            let dn_beta = self.dn_beta_tmp.as_mut().ok_or_else(|| {
+                BackendError::OperationFailed("No DeltaNet beta buffer".into())
+            })?;
+            let dn_alpha = self.dn_alpha_tmp.as_mut().ok_or_else(|| {
+                BackendError::OperationFailed("No DeltaNet alpha buffer".into())
+            })?;
+            linear_gpu(
+                &self.kernels, &self.weights, &self.device,
+                &format!("{}.ssm_beta.weight", prefix), None,
+                &self.hidden_norm, dn_beta,
+            )?;
+            linear_gpu(
+                &self.kernels, &self.weights, &self.device,
+                &format!("{}.ssm_alpha.weight", prefix), None,
+                &self.hidden_norm, dn_alpha,
+            )?;
+
+            let beta_cpu = self.device.dtoh_sync_copy(dn_beta)
+                .map_err(|e| BackendError::OperationFailed(format!("beta download: {}", e)))?;
+            let alpha_cpu = self.device.dtoh_sync_copy(dn_alpha)
+                .map_err(|e| BackendError::OperationFailed(format!("alpha download: {}", e)))?;
+
+            let kv_ratio = dn_cfg.num_v_heads / dn_cfg.num_k_heads.max(1);
+            let mut ba_combined = vec![0.0f32; dn_cfg.num_k_heads * 2 * kv_ratio];
+            for kh in 0..dn_cfg.num_k_heads {
+                for r in 0..kv_ratio {
+                    let vh = kh * kv_ratio + r;
+                    let group_offset = kh * 2 * kv_ratio;
+                    ba_combined[group_offset + r] = beta_cpu[vh];
+                    ba_combined[group_offset + kv_ratio + r] = alpha_cpu[vh];
+                }
+            }
+
+            self.device.htod_sync_copy_into(&ba_combined, dn_ba)
+                .map_err(|e| BackendError::OperationFailed(format!("ba upload: {}", e)))?;
+        } else {
+            linear_gpu(
+                &self.kernels, &self.weights, &self.device,
+                &format!("{}.ssm_ba.weight", prefix), None,
+                &self.hidden_norm, dn_ba,
+            )?;
+        }
 
         // 4. Conv1d + SiLU on GPU
         let conv_state = self.dn_conv_states[layer_idx]
