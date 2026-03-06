@@ -12,6 +12,8 @@ pub mod tensor_parallel;
 pub mod metal;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
+#[cfg(feature = "hailo")]
+pub mod hailo;
 
 pub use error::BackendError;
 
@@ -240,4 +242,98 @@ pub trait Backend: Send + Sync {
 /// Get the default backend (CPU)
 pub fn default_backend() -> Box<dyn Backend> {
     Box::new(cpu::CpuBackend::new())
+}
+
+// =============================================================================
+// GPU-only inference abstraction
+// =============================================================================
+
+/// Trait for GPU-only inference engines that run the entire forward pass on GPU.
+///
+/// All GPU backends (CUDA, Vulkan, Metal, DX12) implement this trait with the
+/// same contract: consume a `LlamaModel`, upload all weights to VRAM, and
+/// provide token-level forward/prefill methods that return CPU-side logits.
+///
+/// Use [`GpuModelWrapper`] to adapt any `GpuInference` into a [`Model`].
+pub trait GpuInference: Send {
+    /// Run a single token through all layers, returning logit vector on CPU.
+    fn forward(&mut self, token_id: u32) -> BackendResult<Vec<f32>>;
+
+    /// Process a token through all layers (updating KV cache) without
+    /// computing output logits. Used for prompt prefill.
+    fn prefill_token(&mut self, token_id: u32) -> BackendResult<()>;
+
+    /// Reset all state (KV caches, position counter) for a new sequence.
+    fn reset(&mut self);
+
+    /// Current sequence position (number of tokens processed so far).
+    fn position(&self) -> usize;
+}
+
+/// Generic wrapper that adapts any [`GpuInference`] engine into a [`Model`].
+///
+/// This eliminates the duplicated `*GpuModelWrapper` structs that previously
+/// existed in each backend module with identical logic.
+pub struct GpuModelWrapper<T: GpuInference> {
+    gpu: std::sync::Mutex<T>,
+    config: crate::model::ModelConfig,
+    architecture: crate::model::Architecture,
+}
+
+impl<T: GpuInference> GpuModelWrapper<T> {
+    pub fn new(
+        gpu: T,
+        config: crate::model::ModelConfig,
+        architecture: crate::model::Architecture,
+    ) -> Self {
+        Self {
+            gpu: std::sync::Mutex::new(gpu),
+            config,
+            architecture,
+        }
+    }
+}
+
+impl<T: GpuInference + 'static> crate::model::Model for GpuModelWrapper<T> {
+    fn forward(
+        &self,
+        tokens: &[u32],
+        ctx: &mut crate::model::InferenceContext,
+    ) -> crate::model::ModelResult<crate::tensor::Tensor> {
+        let mut gpu = self.gpu.lock().map_err(|e| {
+            crate::model::ModelError::ConfigError(format!(
+                "GPU inference lock poisoned: {}", e
+            ))
+        })?;
+
+        if ctx.position == 0 && gpu.position() > 0 {
+            gpu.reset();
+        }
+
+        if tokens.is_empty() {
+            return Err(crate::model::ModelError::ConfigError(
+                "No tokens to process".into(),
+            ));
+        }
+
+        let last_idx = tokens.len() - 1;
+        for &token in &tokens[..last_idx] {
+            gpu.prefill_token(token)?;
+        }
+
+        let logits_vec = gpu.forward(tokens[last_idx])?;
+        ctx.position += tokens.len();
+        ctx.kv_cache.seq_len = ctx.position;
+
+        crate::tensor::Tensor::from_f32(&logits_vec, vec![logits_vec.len()])
+            .map_err(|e| e.into())
+    }
+
+    fn config(&self) -> &crate::model::ModelConfig {
+        &self.config
+    }
+
+    fn architecture(&self) -> crate::model::Architecture {
+        self.architecture
+    }
 }

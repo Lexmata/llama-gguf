@@ -143,6 +143,120 @@ impl RMSNorm {
     }
 }
 
+/// Layer Normalization (used by GPT-2, BLOOM, Falcon, etc.)
+#[derive(Debug)]
+pub struct LayerNorm {
+    /// Learned scale parameter [hidden_size]
+    pub weight: Tensor,
+    /// Learned bias parameter [hidden_size]
+    pub bias: Tensor,
+    /// Epsilon for numerical stability
+    pub eps: f32,
+    /// Hidden dimension
+    pub hidden_size: usize,
+}
+
+impl LayerNorm {
+    /// Create a new layer normalization layer
+    pub fn new(weight: Tensor, bias: Tensor, eps: f32) -> ModelResult<Self> {
+        if weight.ndim() != 1 {
+            return Err(ModelError::ConfigError("LayerNorm weight must be 1D".into()));
+        }
+        let hidden_size = weight.shape()[0];
+        Ok(Self { weight, bias, eps, hidden_size })
+    }
+
+    /// Forward pass: out = (x - mean(x)) / sqrt(var(x) + eps) * weight + bias
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        _backend: &dyn Backend,
+    ) -> BackendResult<()> {
+        let x_data = x.as_f32()?;
+        let out_data = out.as_f32_mut()?;
+        let w_data = self.weight.as_f32()?;
+        let b_data = self.bias.as_f32()?;
+        let n = self.hidden_size;
+
+        let mean: f32 = x_data[..n].iter().sum::<f32>() / n as f32;
+        let var: f32 = x_data[..n].iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+        let std_inv = 1.0 / (var + self.eps).sqrt();
+
+        for i in 0..n {
+            out_data[i] = (x_data[i] - mean) * std_inv * w_data[i] + b_data[i];
+        }
+        Ok(())
+    }
+}
+
+/// Unified normalization layer (RMSNorm or LayerNorm)
+#[derive(Debug)]
+pub enum NormLayer {
+    RMS(RMSNorm),
+    Layer(LayerNorm),
+}
+
+impl NormLayer {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        backend: &dyn Backend,
+    ) -> BackendResult<()> {
+        match self {
+            Self::RMS(norm) => norm.forward(x, out, backend),
+            Self::Layer(norm) => norm.forward(x, out, backend),
+        }
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        match self {
+            Self::RMS(n) => n.hidden_size,
+            Self::Layer(n) => n.hidden_size,
+        }
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        match self {
+            Self::RMS(n) => &n.weight,
+            Self::Layer(n) => &n.weight,
+        }
+    }
+
+    pub fn eps(&self) -> f32 {
+        match self {
+            Self::RMS(n) => n.eps,
+            Self::Layer(n) => n.eps,
+        }
+    }
+
+    pub fn as_rms(&self) -> Option<&RMSNorm> {
+        match self {
+            Self::RMS(n) => Some(n),
+            Self::Layer(_) => None,
+        }
+    }
+
+    pub fn as_layer_norm(&self) -> Option<&LayerNorm> {
+        match self {
+            Self::Layer(n) => Some(n),
+            Self::RMS(_) => None,
+        }
+    }
+
+    pub fn is_layer_norm(&self) -> bool {
+        matches!(self, Self::Layer(_))
+    }
+
+    pub fn bias(&self) -> Option<&Tensor> {
+        match self {
+            Self::Layer(n) => Some(&n.bias),
+            Self::RMS(_) => None,
+        }
+    }
+}
+
 /// Self-attention layer with Grouped Query Attention support
 #[derive(Debug)]
 pub struct Attention {
@@ -176,6 +290,11 @@ pub struct Attention {
     pub q_norm: Option<RMSNorm>,
     /// Optional per-head K normalization (Qwen3)
     pub k_norm: Option<RMSNorm>,
+    /// Attention logit softcap (Gemma2: 50.0, 0.0 = disabled)
+    pub attn_logit_softcap: f32,
+    /// If true, partial RoPE applies to the LAST rope_dims per head [nope|rope].
+    /// If false (default), partial RoPE applies to the FIRST rope_dims [rope|nope].
+    pub rope_partial_at_end: bool,
 }
 
 impl Attention {
@@ -220,6 +339,8 @@ impl Attention {
             has_attention_gate: false,
             q_norm: None,
             k_norm: None,
+            attn_logit_softcap: 0.0,
+            rope_partial_at_end: false,
         }
     }
 
@@ -255,13 +376,25 @@ impl Attention {
             has_attention_gate,
             q_norm: None,
             k_norm: None,
+            attn_logit_softcap: 0.0,
+            rope_partial_at_end: false,
         }
+    }
+
+    /// Set whether partial RoPE applies to the end of each head (Qwen3Next)
+    pub fn set_rope_partial_at_end(&mut self, at_end: bool) {
+        self.rope_partial_at_end = at_end;
     }
 
     /// Set QK normalization layers (used by Qwen3/Qwen3Moe)
     pub fn set_qk_norms(&mut self, q_norm: RMSNorm, k_norm: RMSNorm) {
         self.q_norm = Some(q_norm);
         self.k_norm = Some(k_norm);
+    }
+
+    /// Set attention logit softcap (Gemma2: 50.0, 0.0 = disabled)
+    pub fn set_attn_logit_softcap(&mut self, cap: f32) {
+        self.attn_logit_softcap = cap;
     }
 
     /// Forward pass with KV cache
@@ -373,10 +506,12 @@ impl Attention {
             }
         }
 
-        // Partial RoPE: rotate only the FIRST `rope_dims` dimensions per head.
-        // Per-head layout: [rope(rope_dims) | nope(kl - rope_dims)]
-        // This matches llama.cpp / ggml_rope which operates on the first n_rot dims.
+        // Partial RoPE: rotate only `rope_dims` dimensions per head.
+        // Two layouts:
+        //   rope_partial_at_end=true  (Qwen3Next): [nope | rope] - rotate LAST dims
+        //   rope_partial_at_end=false (Phi-2, etc): [rope | nope] - rotate FIRST dims
         if self.rope_dims > 0 && self.rope_dims < kl {
+            let rope_offset = if self.rope_partial_at_end { kl - self.rope_dims } else { 0 };
             let q_data = q_reshaped.as_f32()?.to_vec();
             let k_data = k_reshaped.as_f32()?.to_vec();
 
@@ -384,13 +519,13 @@ impl Attention {
             let mut k_rope = vec![0.0f32; self.num_kv_heads * self.rope_dims];
 
             for h in 0..self.num_heads {
-                let src = h * kl;
+                let src = h * kl + rope_offset;
                 let dst = h * self.rope_dims;
                 q_rope[dst..dst + self.rope_dims]
                     .copy_from_slice(&q_data[src..src + self.rope_dims]);
             }
             for h in 0..self.num_kv_heads {
-                let src = h * kl;
+                let src = h * kl + rope_offset;
                 let dst = h * self.rope_dims;
                 k_rope[dst..dst + self.rope_dims]
                     .copy_from_slice(&k_data[src..src + self.rope_dims]);
@@ -416,13 +551,13 @@ impl Attention {
             let k_out = k_reshaped.as_f32_mut()?;
 
             for h in 0..self.num_heads {
-                let dst = h * kl;
+                let dst = h * kl + rope_offset;
                 let src = h * self.rope_dims;
                 q_out[dst..dst + self.rope_dims]
                     .copy_from_slice(&q_rope_out[src..src + self.rope_dims]);
             }
             for h in 0..self.num_kv_heads {
-                let dst = h * kl;
+                let dst = h * kl + rope_offset;
                 let src = h * self.rope_dims;
                 k_out[dst..dst + self.rope_dims]
                     .copy_from_slice(&k_rope_out[src..src + self.rope_dims]);
@@ -467,14 +602,85 @@ impl Attention {
         // Compute attention
         let kv_len = pos + 1;
         let mut attn_out = Tensor::zeros(vec![self.num_heads, 1, vl], DType::F32);
-        backend.attention_cached(
-            &q_reshaped,
-            k_cache,
-            v_cache,
-            &mut attn_out,
-            self.scale,
-            kv_len,
-        )?;
+
+        if self.attn_logit_softcap > 0.0 {
+            // Custom attention with logit softcapping (Gemma2)
+            // score = cap * tanh(score / cap) before softmax
+            let cap = self.attn_logit_softcap;
+            let num_queries_per_kv = self.num_heads / self.num_kv_heads;
+            let max_seq_len = k_cache.shape()[1];
+
+            let q_data = q_reshaped.as_f32()?;
+            let k_data = k_cache.as_f32()?;
+            let v_data = v_cache.as_f32()?;
+            let out_data = attn_out.as_f32_mut()?;
+
+            let k_head_stride = max_seq_len * kl;
+            let v_head_stride = max_seq_len * vl;
+
+            for head in 0..self.num_heads {
+                let kv_head = head / num_queries_per_kv;
+                let q_offset = head * kl;
+                let q_vec = &q_data[q_offset..q_offset + kl];
+
+                let mut scores = vec![0.0f32; kv_len];
+                let k_base = kv_head * k_head_stride;
+                let v_base = kv_head * v_head_stride;
+
+                for (kv_pos, score) in scores.iter_mut().enumerate() {
+                    // Causal mask: only attend to positions <= current
+                    if kv_pos > pos {
+                        *score = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_offset = k_base + kv_pos * kl;
+                    let k_vec = &k_data[k_offset..k_offset + kl];
+                    let mut dot = 0.0f32;
+                    for d in 0..kl {
+                        dot += q_vec[d] * k_vec[d];
+                    }
+                    *score = dot * self.scale;
+                    if cap > 0.0 {
+                        *score = cap * (*score / cap).tanh();
+                    }
+                }
+
+                // Softmax
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_score).exp();
+                    sum += *s;
+                }
+                let inv_sum = 1.0 / sum;
+                for s in &mut scores {
+                    *s *= inv_sum;
+                }
+
+                // Weighted sum of values
+                let out_offset = head * vl;
+                let out_vec = &mut out_data[out_offset..out_offset + vl];
+                out_vec.fill(0.0);
+                for (kv_pos, &score_val) in scores.iter().enumerate() {
+                    if score_val > 1e-8 {
+                        let v_offset = v_base + kv_pos * vl;
+                        let v_vec = &v_data[v_offset..v_offset + vl];
+                        for d in 0..vl {
+                            out_vec[d] += score_val * v_vec[d];
+                        }
+                    }
+                }
+            }
+        } else {
+            backend.attention_cached(
+                &q_reshaped,
+                k_cache,
+                v_cache,
+                &mut attn_out,
+                self.scale,
+                kv_len,
+            )?;
+        }
 
         // Apply attention gate: output = sigmoid(gate) * attn_output
         let attn_flat = if let Some(ref gate) = gate_data {
@@ -556,71 +762,147 @@ impl FeedForward {
     }
 }
 
-/// FFN variant: either dense FFN or Mixture of Experts
+/// Feed-forward network WITHOUT gate projection (GPT-2, BLOOM, GPT-NeoX, etc.)
+/// FFN: out = down(act(up(x)))
+#[derive(Debug)]
+pub struct NoGateFeedForward {
+    /// Up projection [intermediate_size, hidden_size]
+    pub w_up: Linear,
+    /// Down projection [hidden_size, intermediate_size]
+    pub w_down: Linear,
+    /// Hidden dimension
+    pub hidden_size: usize,
+    /// Intermediate dimension
+    pub intermediate_size: usize,
+    /// Use GELU activation instead of SiLU
+    pub use_gelu: bool,
+}
+
+impl NoGateFeedForward {
+    pub fn new(w_up: Linear, w_down: Linear, use_gelu: bool) -> Self {
+        let hidden_size = w_down.out_features;
+        let intermediate_size = w_up.out_features;
+        Self { w_up, w_down, hidden_size, intermediate_size, use_gelu }
+    }
+
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        backend: &dyn Backend,
+    ) -> BackendResult<()> {
+        let mut up = Tensor::zeros(vec![self.intermediate_size], DType::F32);
+        self.w_up.forward(x, &mut up, backend)?;
+
+        {
+            let data = up.as_f32_mut()?;
+            if self.use_gelu {
+                for v in data.iter_mut() {
+                    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                    let x = *v;
+                    *v = 0.5 * x
+                        * (1.0 + (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh());
+                }
+            } else {
+                // SiLU: x * sigmoid(x)
+                for v in data.iter_mut() {
+                    *v = *v / (1.0 + (-*v).exp());
+                }
+            }
+        }
+
+        self.w_down.forward(&up, out, backend)?;
+        Ok(())
+    }
+}
+
+/// FFN variant: either dense FFN, non-gated FFN, Mixture of Experts, or none (Mamba)
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum FfnLayer {
-    /// Standard dense feed-forward network
+    /// Standard gated feed-forward network (LLaMA, Mistral, etc.)
     Dense(FeedForward),
+    /// Non-gated feed-forward network (GPT-2, BLOOM, GPT-NeoX, etc.)
+    NoGate(NoGateFeedForward),
     /// Mixture of Experts
     Moe(super::moe::MoeLayer),
+    /// No FFN (pure SSM layers like Mamba)
+    Identity,
 }
 
-/// Attention variant: full softmax attention or delta-net recurrent.
+/// Attention variant: full softmax attention, delta-net, or Mamba SSM.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum AttentionLayer {
     /// Standard multi-head softmax attention (with optional gating, partial RoPE)
     FullAttention(Attention),
-    /// Gated DeltaNet linear attention (SSM/recurrent)
+    /// Gated DeltaNet linear attention (SSM/recurrent) for Qwen3Next
     DeltaNet(Box<super::deltanet::DeltaNetLayer>),
+    /// Mamba v1 selective state space model
+    Mamba(Box<super::mamba::MambaLayer>),
 }
 
 /// Single transformer layer (decoder block)
 #[derive(Debug)]
 pub struct TransformerLayer {
     /// Attention normalization
-    pub attn_norm: RMSNorm,
+    pub attn_norm: NormLayer,
     /// Attention: either full softmax or delta-net recurrent
     pub attn_layer: AttentionLayer,
     /// Optional post-attention normalization (Qwen3Next)
-    pub post_attn_norm: Option<RMSNorm>,
+    pub post_attn_norm: Option<NormLayer>,
     /// FFN normalization
-    pub ffn_norm: RMSNorm,
-    /// Feed-forward network (dense or MoE)
+    pub ffn_norm: NormLayer,
+    /// Feed-forward network (dense, non-gated, or MoE)
     pub ffn_layer: FfnLayer,
+    /// Optional post-FFN normalization (Gemma2, Cohere2)
+    pub post_ffn_norm: Option<NormLayer>,
     /// Layer index
     pub layer_idx: usize,
+    /// Whether to use parallel residual (GPT-NeoX, GPT-J, StableLM):
+    /// h = x + attn(norm(x)) + ffn(norm(x))
+    pub use_parallel_residual: bool,
 }
 
 impl TransformerLayer {
-    /// Get the full attention layer if this is not a delta-net layer
+    /// Get the full attention layer if this is not a delta-net or Mamba layer
     pub fn attention(&self) -> Option<&Attention> {
         match &self.attn_layer {
             AttentionLayer::FullAttention(attn) => Some(attn),
-            AttentionLayer::DeltaNet(_) => None,
+            AttentionLayer::DeltaNet(_) | AttentionLayer::Mamba(_) => None,
         }
     }
 
-    /// Get the dense FFN layer if this is not an MoE layer
+    /// Get the dense FFN layer if this is not an MoE or NoGate layer
     pub fn ffn(&self) -> Option<&FeedForward> {
         match &self.ffn_layer {
             FfnLayer::Dense(ffn) => Some(ffn),
-            FfnLayer::Moe(_) => None,
+            FfnLayer::NoGate(_) | FfnLayer::Moe(_) | FfnLayer::Identity => None,
         }
     }
 
-    /// Get the MoE layer if this is not a dense FFN layer
+    /// Get the MoE layer if this is not a dense or NoGate FFN layer
     pub fn moe(&self) -> Option<&super::moe::MoeLayer> {
         match &self.ffn_layer {
-            FfnLayer::Dense(_) => None,
+            FfnLayer::Dense(_) | FfnLayer::NoGate(_) | FfnLayer::Identity => None,
             FfnLayer::Moe(moe) => Some(moe),
         }
     }
 
-    /// Whether this is a recurrent (delta-net) layer
+    /// Get the NoGate FFN layer if this is not a dense or MoE layer
+    pub fn no_gate_ffn(&self) -> Option<&NoGateFeedForward> {
+        match &self.ffn_layer {
+            FfnLayer::Dense(_) | FfnLayer::Moe(_) | FfnLayer::Identity => None,
+            FfnLayer::NoGate(ffn) => Some(ffn),
+        }
+    }
+
+    /// Whether this is a recurrent (delta-net or Mamba) layer
     pub fn is_recurrent(&self) -> bool {
-        matches!(&self.attn_layer, AttentionLayer::DeltaNet(_))
+        matches!(
+            &self.attn_layer,
+            AttentionLayer::DeltaNet(_) | AttentionLayer::Mamba(_)
+        )
     }
 
     /// Forward pass with residual connections.
@@ -639,14 +921,14 @@ impl TransformerLayer {
         freq_base: f32,
         freq_scale: f32,
         backend: &dyn Backend,
-        recurrent_state: Option<&mut super::deltanet::DeltaNetState>,
+        recurrent_state: Option<&mut super::deltanet::RecurrentLayerState>,
     ) -> ModelResult<Tensor> {
         let hidden_size = x.shape().last().copied().unwrap_or(0);
 
         let mut norm_out = Tensor::zeros(x.shape().to_vec(), DType::F32);
         self.attn_norm.forward(x, &mut norm_out, backend)?;
 
-        let mut attn_out = match &self.attn_layer {
+        let attn_out = match &self.attn_layer {
             AttentionLayer::FullAttention(attn) => {
                 attn.forward(&norm_out, k_cache, v_cache, pos, freq_base, freq_scale, backend)?
             }
@@ -656,51 +938,142 @@ impl TransformerLayer {
                         "DeltaNet layer requires recurrent state".into(),
                     )
                 })?;
-                dn.forward(&norm_out, state, backend)?
+                match state {
+                    super::deltanet::RecurrentLayerState::DeltaNet(ds) => {
+                        dn.forward(&norm_out, ds, backend)?
+                    }
+                    _ => {
+                        return Err(ModelError::ConfigError(
+                            "Expected DeltaNet state for DeltaNet layer".into(),
+                        ))
+                    }
+                }
+            }
+            AttentionLayer::Mamba(mb) => {
+                let state = recurrent_state.ok_or_else(|| {
+                    ModelError::ConfigError(
+                        "Mamba layer requires recurrent state".into(),
+                    )
+                })?;
+                match state {
+                    super::deltanet::RecurrentLayerState::Mamba(ms) => {
+                        mb.forward(&norm_out, ms, backend)?
+                    }
+                    _ => {
+                        return Err(ModelError::ConfigError(
+                            "Expected Mamba state for Mamba layer".into(),
+                        ))
+                    }
+                }
             }
         };
 
-        // In-place residual: attn_out += x (avoids allocating h)
-        {
-            let attn_data = attn_out.as_f32_mut()?;
-            let x_data = x.as_f32()?;
-            let x_start = if x.ndim() == 2 {
-                (x.shape()[0] - 1) * hidden_size
-            } else {
-                0
-            };
-            let x_slice = &x_data[x_start..x_start + hidden_size];
-            for (a, &xv) in attn_data.iter_mut().zip(x_slice.iter()) {
-                *a += xv;
-            }
-        }
-        let h = attn_out;
-
-        let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
-        if let Some(ref pan) = self.post_attn_norm {
-            pan.forward(&h, &mut ffn_norm_out, backend)?;
+        let x_data = x.as_f32()?;
+        let x_start = if x.ndim() == 2 {
+            (x.shape()[0] - 1) * hidden_size
         } else {
-            self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
-        }
-
-        let mut ffn_out = match &self.ffn_layer {
-            FfnLayer::Dense(ffn) => {
-                let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
-                ffn.forward(&ffn_norm_out, &mut out, backend)?;
-                out
-            }
-            FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+            0
         };
 
-        // In-place residual: ffn_out += h (avoids allocating final output tensor)
-        {
-            let ffn_data = ffn_out.as_f32_mut()?;
-            let h_data = h.as_f32()?;
-            for (f, &hv) in ffn_data.iter_mut().zip(h_data.iter()) {
-                *f += hv;
+        if matches!(self.ffn_layer, FfnLayer::Identity) {
+            // Pure SSM (Mamba): output = x + ssm(norm(x)), no FFN
+            let mut out = attn_out;
+            {
+                let out_data = out.as_f32_mut()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for (o, &xv) in out_data.iter_mut().zip(x_slice.iter()) {
+                    *o += xv;
+                }
             }
+            return Ok(out);
         }
 
-        Ok(ffn_out)
+        if self.use_parallel_residual {
+            // Parallel residual (GPT-NeoX, GPT-J, Phi-2, StableLM):
+            // output = x + attn(norm(x)) + ffn(norm(x))
+            // Both branches use the SAME norm_out (attn_norm applied to x).
+            let mut ffn_out = match &self.ffn_layer {
+                FfnLayer::Dense(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::NoGate(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::Moe(moe) => moe.forward(&norm_out, backend)?,
+                FfnLayer::Identity => unreachable!(),
+            };
+
+            // output = x + attn_out + ffn_out
+            {
+                let out_data = ffn_out.as_f32_mut()?;
+                let attn_data = attn_out.as_f32()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for i in 0..hidden_size {
+                    out_data[i] += attn_data[i] + x_slice[i];
+                }
+            }
+            Ok(ffn_out)
+        } else {
+            // Serial residual (LLaMA, Mistral, Qwen, Gemma, etc.):
+            // h = x + post_attn_norm?(attn(norm(x)))
+            // output = h + post_ffn_norm?(ffn(ffn_norm(h)))
+            let mut h = attn_out;
+
+            // Post-attention normalization (Gemma2, Cohere2): normalize
+            // attention output BEFORE adding residual
+            if let Some(ref pan) = self.post_attn_norm {
+                let mut normed = Tensor::zeros(vec![hidden_size], DType::F32);
+                pan.forward(&h, &mut normed, backend)?;
+                h = normed;
+            }
+
+            // Residual: h = x + (post_attn_normed) attn_out
+            {
+                let h_data = h.as_f32_mut()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for (a, &xv) in h_data.iter_mut().zip(x_slice.iter()) {
+                    *a += xv;
+                }
+            }
+
+            let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
+            self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
+
+            let mut ffn_out = match &self.ffn_layer {
+                FfnLayer::Dense(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::NoGate(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+                FfnLayer::Identity => unreachable!(),
+            };
+
+            if let Some(ref norm) = self.post_ffn_norm {
+                let mut normed = Tensor::zeros(vec![hidden_size], DType::F32);
+                norm.forward(&ffn_out, &mut normed, backend)?;
+                ffn_out = normed;
+            }
+
+            // In-place residual: ffn_out += h
+            {
+                let ffn_data = ffn_out.as_f32_mut()?;
+                let h_data = h.as_f32()?;
+                for (f, &hv) in ffn_data.iter_mut().zip(h_data.iter()) {
+                    *f += hv;
+                }
+            }
+
+            Ok(ffn_out)
+        }
     }
 }

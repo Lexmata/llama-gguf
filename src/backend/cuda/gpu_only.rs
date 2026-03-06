@@ -54,8 +54,8 @@ pub struct GpuOnlyInference {
     attn_q_proper: CudaSlice<f32>,
     attn_gate: CudaSlice<f32>,
     attn_out: CudaSlice<f32>,
-    // DeltaNet config
-    deltanet_config: Option<DeltaNetConfig>,
+    // Recurrent config (DeltaNet or Mamba)
+    deltanet_config: Option<crate::model::deltanet::RecurrentConfig>,
     // DeltaNet GPU state buffers (conv_state + ssm_state per DeltaNet layer)
     dn_conv_states: Vec<Option<CudaSlice<f32>>>,
     dn_ssm_states: Vec<Option<CudaSlice<f32>>>,
@@ -81,6 +81,10 @@ pub struct GpuOnlyInference {
     has_gpu_attention: Vec<bool>,
     // Per-layer flag: true if this layer is DeltaNet
     is_deltanet: Vec<bool>,
+    // Per-layer flag: true if this layer is Mamba SSM
+    is_mamba: Vec<bool>,
+    // Per-layer Mamba recurrent states (CPU-side, since Mamba is inherently sequential)
+    mamba_states: Vec<Option<crate::model::deltanet::RecurrentLayerState>>,
 }
 
 #[derive(Clone)]
@@ -128,6 +132,78 @@ fn rms_norm_gpu(
             )
     }
     .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
+}
+
+fn layer_norm_gpu(
+    kernels: &CudaKernels,
+    weights: &GpuWeightStore,
+    _device: &Arc<CudaDevice>,
+    hidden_size: usize,
+    norm_eps: f32,
+    weight_name: &str,
+    bias_name: &str,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+) -> BackendResult<()> {
+    let weight = weights
+        .get(weight_name)
+        .ok_or_else(|| BackendError::OperationFailed(format!("Missing {}", weight_name)))?;
+    let bias = weights
+        .get(bias_name)
+        .ok_or_else(|| BackendError::OperationFailed(format!("Missing {}", bias_name)))?;
+
+    let config = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+
+    unsafe {
+        kernels
+            .layer_norm_fused
+            .clone()
+            .launch(
+                config,
+                (
+                    x,
+                    &weight.data,
+                    &bias.data,
+                    out,
+                    norm_eps,
+                    hidden_size as i32,
+                ),
+            )
+    }
+    .map_err(|e| BackendError::OperationFailed(format!("{}", e)))
+}
+
+/// Dispatch to RMSNorm or LayerNorm depending on whether a bias weight exists
+fn norm_gpu(
+    kernels: &CudaKernels,
+    weights: &GpuWeightStore,
+    device: &Arc<CudaDevice>,
+    hidden_size: usize,
+    norm_eps: f32,
+    weight_name: &str,
+    bias_name: &str,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+) -> BackendResult<()> {
+    if weights.contains(bias_name) {
+        layer_norm_gpu(
+            kernels,
+            weights,
+            device,
+            hidden_size,
+            norm_eps,
+            weight_name,
+            bias_name,
+            x,
+            out,
+        )
+    } else {
+        rms_norm_gpu(kernels, weights, device, hidden_size, norm_eps, weight_name, x, out)
+    }
 }
 
 fn linear_gpu(
@@ -389,6 +465,25 @@ impl GpuOnlyInference {
             .map(|l| matches!(&l.attn_layer, AttentionLayer::DeltaNet(_)))
             .collect();
 
+        let is_mamba: Vec<bool> = layers
+            .iter()
+            .map(|l| matches!(&l.attn_layer, AttentionLayer::Mamba(_)))
+            .collect();
+
+        // Initialize Mamba recurrent states for CPU-side SSM computation
+        let mamba_states: Vec<Option<crate::model::deltanet::RecurrentLayerState>> = layers
+            .iter()
+            .map(|l| {
+                if let AttentionLayer::Mamba(mb) = &l.attn_layer {
+                    Some(crate::model::deltanet::RecurrentLayerState::Mamba(
+                        crate::model::mamba::MambaState::new(&mb.config),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Determine expert intermediate size from first MoE layer
         let expert_intermediate = layers
             .iter()
@@ -516,7 +611,12 @@ impl GpuOnlyInference {
         let mut dn_beta_tmp_buf = None;
         let mut dn_alpha_tmp_buf = None;
 
-        if let Some(ref dn_cfg) = deltanet_config {
+        // Extract DeltaNet config from the RecurrentConfig enum (if present)
+        let dn_cfg_opt = deltanet_config.as_ref().and_then(|rc| match rc {
+            crate::model::deltanet::RecurrentConfig::DeltaNet(c) => Some(c),
+            _ => None,
+        });
+        if let Some(dn_cfg) = dn_cfg_opt {
             for i in 0..model_config.num_layers {
                 if is_deltanet[i] {
                     let conv_len = (dn_cfg.conv_kernel - 1) * dn_cfg.qkv_dim;
@@ -567,11 +667,12 @@ impl GpuOnlyInference {
 
         let attn_count = has_gpu_attention.iter().filter(|&&x| x).count();
         let dn_count = is_deltanet.iter().filter(|&&x| x).count();
+        let mamba_count = is_mamba.iter().filter(|&&x| x).count();
         let moe_count = layers.iter().filter(|l| l.moe().is_some()).count();
         let vram_mb = weights.vram_usage() as f64 / (1024.0 * 1024.0);
         eprintln!(
-            "Full GPU inference ready: {:.1} MB VRAM, {} attn + {} DeltaNet + {} MoE layers",
-            vram_mb, attn_count, dn_count, moe_count,
+            "Full GPU inference ready: {:.1} MB VRAM, {} attn + {} DeltaNet + {} Mamba + {} MoE layers",
+            vram_mb, attn_count, dn_count, mamba_count, moe_count,
         );
 
         Ok(Self {
@@ -619,6 +720,8 @@ impl GpuOnlyInference {
             moe_expert_down,
             has_gpu_attention,
             is_deltanet,
+            is_mamba,
+            mamba_states,
         })
     }
 
@@ -634,14 +737,15 @@ impl GpuOnlyInference {
             self.process_layer(layer_idx)?;
         }
 
-        // Final norm
-        rms_norm_gpu(
+        // Final norm (RMSNorm or LayerNorm depending on architecture)
+        norm_gpu(
             &self.kernels,
             &self.weights,
             &self.device,
             self.config.hidden_size,
             self.config.norm_eps,
             "output_norm.weight",
+            "output_norm.bias",
             &self.hidden,
             &mut self.hidden_norm,
         )?;
@@ -732,6 +836,10 @@ impl GpuOnlyInference {
             let len = vc.len();
             let _ = self.device.htod_sync_copy_into(&vec![0.0f32; len], vc);
         }
+        // Reset Mamba states
+        for ms in self.mamba_states.iter_mut().flatten() {
+            ms.reset();
+        }
     }
 
     pub fn position(&self) -> usize {
@@ -753,29 +861,109 @@ impl GpuOnlyInference {
         let prefix = format!("blk.{}", layer_idx);
         let hidden_size = self.config.hidden_size;
 
-        // ---- Attention normalization (GPU) ----
-        rms_norm_gpu(
+        // ---- Attention normalization (RMSNorm or LayerNorm) ----
+        norm_gpu(
             &self.kernels,
             &self.weights,
             &self.device,
             hidden_size,
             self.config.norm_eps,
             &format!("{}.attn_norm.weight", prefix),
+            &format!("{}.attn_norm.bias", prefix),
             &self.hidden,
             &mut self.hidden_norm,
         )?;
 
-        // ---- Attention (GPU) / DeltaNet (GPU) ----
+        // ---- Attention (GPU) / DeltaNet (GPU) / Mamba (CPU fallback) ----
         if self.has_gpu_attention[layer_idx] {
             self.attention_gpu_forward(layer_idx)?;
         } else if self.is_deltanet[layer_idx] {
             self.deltanet_gpu_forward(layer_idx, &prefix)?;
+        } else if self.is_mamba[layer_idx] {
+            self.mamba_cpu_forward(layer_idx)?;
         } else {
             return Err(BackendError::OperationFailed(format!(
-                "Layer {} has no GPU attention or DeltaNet path",
+                "Layer {} has no GPU attention, DeltaNet, or Mamba path",
                 layer_idx
             )));
         }
+
+        // For Mamba (FfnLayer::Identity): output = x + ssm(norm(x)), no FFN
+        if matches!(self.layers[layer_idx].ffn_layer, FfnLayer::Identity) {
+            add_gpu(
+                &self.kernels,
+                hidden_size,
+                &self.residual,
+                &self.hidden_norm,
+                &mut self.hidden,
+            )?;
+            self.device
+                .dtod_copy(&self.hidden, &mut self.residual)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+            return Ok(());
+        }
+
+        // ---- Parallel residual (Phi-2, GPT-NeoX, GPT-J, StableLM) ----
+        if self.layers[layer_idx].use_parallel_residual {
+            // Both branches use the same norm_out; FFN uses hidden_norm (= norm(x))
+            // attn output is already in hidden_norm
+            // Save attn_output in residual temporarily
+            let mut attn_output_buf = vec![0.0f32; hidden_size];
+            self.device
+                .dtoh_sync_copy_into(&self.hidden_norm, &mut attn_output_buf)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+
+            // Re-normalize x for the FFN branch (same input as attention)
+            norm_gpu(
+                &self.kernels,
+                &self.weights,
+                &self.device,
+                hidden_size,
+                self.config.norm_eps,
+                &format!("{}.attn_norm.weight", prefix),
+                &format!("{}.attn_norm.bias", prefix),
+                &self.residual,
+                &mut self.hidden_norm,
+            )?;
+
+            // FFN on normalized input
+            match &self.layers[layer_idx].ffn_layer {
+                FfnLayer::Dense(_) => self.dense_ffn_gpu_forward(&prefix)?,
+                FfnLayer::NoGate(_) => self.nogate_ffn_gpu_forward(&prefix)?,
+                FfnLayer::Moe(_) => self.moe_gpu_forward(layer_idx)?,
+                FfnLayer::Identity => unreachable!(),
+            }
+
+            // output = x + attn_out + ffn_out
+            // hidden_norm now holds ffn_out, upload attn_output back
+            let attn_gpu = self
+                .device
+                .htod_sync_copy(&attn_output_buf)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+            // hidden = residual + hidden_norm (ffn_out) + attn_gpu
+            // Use ffn_down as scratch to avoid aliased borrow
+            add_gpu(
+                &self.kernels,
+                hidden_size,
+                &self.residual,
+                &self.hidden_norm,
+                &mut self.ffn_down,
+            )?;
+            add_gpu(
+                &self.kernels,
+                hidden_size,
+                &self.ffn_down,
+                &attn_gpu,
+                &mut self.hidden,
+            )?;
+            self.device
+                .dtod_copy(&self.hidden, &mut self.residual)
+                .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+
+            return Ok(());
+        }
+
+        // ---- Serial residual (LLaMA, Mistral, Qwen, etc.) ----
 
         // Add attention residual: hidden = residual + attn_output
         add_gpu(
@@ -790,30 +978,34 @@ impl GpuOnlyInference {
             .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
 
         // ---- FFN normalization ----
-        let ffn_norm_name = if self.layers[layer_idx].post_attn_norm.is_some() {
+        let ffn_norm_weight = if self.layers[layer_idx].post_attn_norm.is_some() {
             format!("{}.post_attention_norm.weight", prefix)
         } else {
             format!("{}.ffn_norm.weight", prefix)
         };
-        rms_norm_gpu(
+        let ffn_norm_bias = if self.layers[layer_idx].post_attn_norm.is_some() {
+            format!("{}.post_attention_norm.bias", prefix)
+        } else {
+            format!("{}.ffn_norm.bias", prefix)
+        };
+        norm_gpu(
             &self.kernels,
             &self.weights,
             &self.device,
             hidden_size,
             self.config.norm_eps,
-            &ffn_norm_name,
+            &ffn_norm_weight,
+            &ffn_norm_bias,
             &self.hidden,
             &mut self.hidden_norm,
         )?;
 
-        // ---- FFN (Dense GPU / MoE GPU) ----
+        // ---- FFN (Dense GPU / NoGate GPU / MoE GPU) ----
         match &self.layers[layer_idx].ffn_layer {
-            FfnLayer::Dense(_) => {
-                self.dense_ffn_gpu_forward(&prefix)?;
-            }
-            FfnLayer::Moe(_) => {
-                self.moe_gpu_forward(layer_idx)?;
-            }
+            FfnLayer::Dense(_) => self.dense_ffn_gpu_forward(&prefix)?,
+            FfnLayer::NoGate(_) => self.nogate_ffn_gpu_forward(&prefix)?,
+            FfnLayer::Moe(_) => self.moe_gpu_forward(layer_idx)?,
+            FfnLayer::Identity => unreachable!(),
         }
 
         // Add FFN residual
@@ -857,13 +1049,16 @@ impl GpuOnlyInference {
         let freq_scale = self.config.freq_scale;
         let pos = self.pos;
 
-        // 1. Q/K/V projections on GPU
+        // 1. Q/K/V projections on GPU (with optional biases for Phi-2, etc.)
+        let q_bias_name = format!("{}.attn_q.bias", prefix);
+        let k_bias_name = format!("{}.attn_k.bias", prefix);
+        let v_bias_name = format!("{}.attn_v.bias", prefix);
         linear_gpu(
             &self.kernels,
             &self.weights,
             &self.device,
             &format!("{}.attn_q.weight", prefix),
-            None,
+            if self.weights.contains(&q_bias_name) { Some(q_bias_name.as_str()) } else { None },
             &self.hidden_norm,
             &mut self.attn_q_raw,
         )?;
@@ -872,7 +1067,7 @@ impl GpuOnlyInference {
             &self.weights,
             &self.device,
             &format!("{}.attn_k.weight", prefix),
-            None,
+            if self.weights.contains(&k_bias_name) { Some(k_bias_name.as_str()) } else { None },
             &self.hidden_norm,
             &mut self.attn_k,
         )?;
@@ -881,7 +1076,7 @@ impl GpuOnlyInference {
             &self.weights,
             &self.device,
             &format!("{}.attn_v.weight", prefix),
-            None,
+            if self.weights.contains(&v_bias_name) { Some(v_bias_name.as_str()) } else { None },
             &self.hidden_norm,
             &mut self.attn_v,
         )?;
@@ -1206,11 +1401,10 @@ impl GpuOnlyInference {
     // -----------------------------------------------------------------------
 
     fn deltanet_gpu_forward(&mut self, layer_idx: usize, prefix: &str) -> BackendResult<()> {
-        let dn_cfg = self
-            .deltanet_config
-            .as_ref()
-            .ok_or_else(|| BackendError::OperationFailed("No DeltaNet config".into()))?
-            .clone();
+        let dn_cfg = match self.deltanet_config.as_ref() {
+            Some(crate::model::deltanet::RecurrentConfig::DeltaNet(c)) => c.clone(),
+            _ => return Err(BackendError::OperationFailed("No DeltaNet config".into())),
+        };
 
         // 1. QKV projection on GPU
         let dn_qkv = self
@@ -1452,6 +1646,114 @@ impl GpuOnlyInference {
             &self.ffn_down,
             &mut self.hidden_norm,
         )?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // NoGate FFN (Phi-2, GPT-NeoX, etc.): out = down(act(up(x)))
+    // -----------------------------------------------------------------------
+
+    fn nogate_ffn_gpu_forward(&mut self, prefix: &str) -> BackendResult<()> {
+        let up_bias = format!("{}.ffn_up.bias", prefix);
+        let down_bias = format!("{}.ffn_down.bias", prefix);
+
+        linear_gpu(
+            &self.kernels,
+            &self.weights,
+            &self.device,
+            &format!("{}.ffn_up.weight", prefix),
+            if self.weights.contains(&up_bias) { Some(up_bias.as_str()) } else { None },
+            &self.hidden_norm,
+            &mut self.ffn_up,
+        )?;
+
+        // Determine activation: GELU for Phi-2 etc., SiLU for others
+        let use_gelu = self.layers.iter().find_map(|l| l.no_gate_ffn()).map_or(false, |f| f.use_gelu);
+        if use_gelu {
+            let n = self.config.intermediate_size;
+            let config = LaunchConfig {
+                grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.kernels
+                    .gelu_inplace
+                    .clone()
+                    .launch(config, (&mut self.ffn_up, n as i32))
+            }
+            .map_err(|e| BackendError::OperationFailed(format!("gelu_inplace: {}", e)))?;
+        } else {
+            silu_gpu(
+                &self.kernels,
+                &self.device,
+                self.config.intermediate_size,
+                &mut self.ffn_up,
+            )?;
+        }
+
+        linear_gpu(
+            &self.kernels,
+            &self.weights,
+            &self.device,
+            &format!("{}.ffn_down.weight", prefix),
+            if self.weights.contains(&down_bias) { Some(down_bias.as_str()) } else { None },
+            &self.ffn_up,
+            &mut self.hidden_norm,
+        )?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Mamba SSM (CPU fallback — Mamba SSM is inherently sequential)
+    // -----------------------------------------------------------------------
+
+    fn mamba_cpu_forward(&mut self, layer_idx: usize) -> BackendResult<()> {
+        let hidden_size = self.config.hidden_size;
+
+        // Download normalized hidden state from GPU to CPU
+        let norm_data = self
+            .device
+            .dtoh_sync_copy(&self.hidden_norm)
+            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+        let norm_tensor = Tensor::from_f32(&norm_data, vec![hidden_size])
+            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+
+        // Run Mamba forward on CPU
+        let mamba_state = self.mamba_states[layer_idx]
+            .as_mut()
+            .ok_or_else(|| BackendError::OperationFailed("Missing Mamba state".into()))?;
+        let mb_state = match mamba_state {
+            crate::model::deltanet::RecurrentLayerState::Mamba(ms) => ms,
+            _ => {
+                return Err(BackendError::OperationFailed(
+                    "Expected Mamba state".into(),
+                ))
+            }
+        };
+
+        let mamba_layer = match &self.layers[layer_idx].attn_layer {
+            AttentionLayer::Mamba(mb) => mb,
+            _ => {
+                return Err(BackendError::OperationFailed(
+                    "Expected Mamba layer".into(),
+                ))
+            }
+        };
+
+        let output = mamba_layer
+            .forward(&norm_tensor, mb_state, &self.cpu_backend)
+            .map_err(|e| BackendError::OperationFailed(format!("Mamba forward: {}", e)))?;
+
+        // Upload result back to GPU
+        let out_data = output
+            .as_f32()
+            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
+        self.device
+            .htod_sync_copy_into(out_data, &mut self.hidden_norm)
+            .map_err(|e| BackendError::OperationFailed(format!("{}", e)))?;
 
         Ok(())
     }
@@ -1712,60 +2014,20 @@ impl GpuOnlyInference {
 }
 
 // ---------------------------------------------------------------------------
-// GpuModelWrapper: implements the Model trait using GpuOnlyInference
+// GpuInference trait implementation
 // ---------------------------------------------------------------------------
 
-use crate::model::{Architecture, InferenceContext, Model, ModelConfig, ModelError, ModelResult};
-use std::sync::Mutex;
-
-pub struct GpuModelWrapper {
-    gpu: Mutex<GpuOnlyInference>,
-    config: ModelConfig,
-    architecture: Architecture,
-}
-
-impl GpuModelWrapper {
-    pub fn new(gpu: GpuOnlyInference, config: ModelConfig, architecture: Architecture) -> Self {
-        Self {
-            gpu: Mutex::new(gpu),
-            config,
-            architecture,
-        }
+impl crate::backend::GpuInference for GpuOnlyInference {
+    fn forward(&mut self, token_id: u32) -> crate::backend::BackendResult<Vec<f32>> {
+        GpuOnlyInference::forward(self, token_id)
     }
-}
-
-impl Model for GpuModelWrapper {
-    fn forward(&self, tokens: &[u32], ctx: &mut InferenceContext) -> ModelResult<Tensor> {
-        let mut gpu = self.gpu.lock().map_err(|e| {
-            ModelError::ConfigError(format!("GPU inference lock poisoned: {}", e))
-        })?;
-
-        if ctx.position == 0 && gpu.position() > 0 {
-            gpu.reset();
-        }
-
-        if tokens.is_empty() {
-            return Err(ModelError::ConfigError("No tokens to process".into()));
-        }
-
-        let last_idx = tokens.len() - 1;
-        for &token in &tokens[..last_idx] {
-            gpu.prefill_token(token)?;
-        }
-
-        let logits_vec = gpu.forward(tokens[last_idx])?;
-
-        ctx.position += tokens.len();
-        ctx.kv_cache.seq_len = ctx.position;
-
-        Tensor::from_f32(&logits_vec, vec![logits_vec.len()]).map_err(|e| e.into())
+    fn prefill_token(&mut self, token_id: u32) -> crate::backend::BackendResult<()> {
+        GpuOnlyInference::prefill_token(self, token_id)
     }
-
-    fn config(&self) -> &ModelConfig {
-        &self.config
+    fn reset(&mut self) {
+        GpuOnlyInference::reset(self)
     }
-
-    fn architecture(&self) -> Architecture {
-        self.architecture
+    fn position(&self) -> usize {
+        GpuOnlyInference::position(self)
     }
 }

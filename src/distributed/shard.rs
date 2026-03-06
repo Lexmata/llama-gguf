@@ -14,7 +14,7 @@ use crate::model::{
     KVCache, ModelConfig, RopeConfig, RopeScalingType, RopeType,
 };
 use crate::model::layers::{
-    Attention, AttentionLayer, FeedForward, FfnLayer, Linear, RMSNorm, TransformerLayer,
+    Attention, AttentionLayer, FeedForward, FfnLayer, Linear, NormLayer, RMSNorm, TransformerLayer,
 };
 use crate::tensor::Tensor;
 
@@ -167,8 +167,10 @@ fn build_layer_from_tensors(
     let get_opt = |name: &str| -> Option<Tensor> { tensors.get(name).cloned() };
 
     // Attention norm
-    let attn_norm = RMSNorm::new(get("attn_norm.weight")?, config.norm_eps)
-        .map_err(|e| Status::internal(format!("failed to build attn_norm: {}", e)))?;
+    let attn_norm = NormLayer::RMS(
+        RMSNorm::new(get("attn_norm.weight")?, config.norm_eps)
+            .map_err(|e| Status::internal(format!("failed to build attn_norm: {}", e)))?,
+    );
 
     // Attention projections
     let wq = Linear::new(get("attn_q.weight")?, get_opt("attn_q.bias"))
@@ -193,8 +195,10 @@ fn build_layer_from_tensors(
     );
 
     // FFN norm
-    let ffn_norm = RMSNorm::new(get("ffn_norm.weight")?, config.norm_eps)
-        .map_err(|e| Status::internal(format!("failed to build ffn_norm: {}", e)))?;
+    let ffn_norm = NormLayer::RMS(
+        RMSNorm::new(get("ffn_norm.weight")?, config.norm_eps)
+            .map_err(|e| Status::internal(format!("failed to build ffn_norm: {}", e)))?,
+    );
 
     // Feed-forward
     let w_gate = Linear::new(get("ffn_gate.weight")?, None)
@@ -212,7 +216,9 @@ fn build_layer_from_tensors(
         post_attn_norm: None,
         ffn_norm,
         ffn_layer: FfnLayer::Dense(ffn),
+        post_ffn_norm: None,
         layer_idx,
+        use_parallel_residual: false,
     })
 }
 

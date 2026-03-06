@@ -493,6 +493,8 @@ impl Config {
             seed: self.generation.seed,
             use_gpu: self.model.gpu,
             max_context_len: None,
+            #[cfg(feature = "hailo")]
+            hailo_config: None,
         }
     }
 

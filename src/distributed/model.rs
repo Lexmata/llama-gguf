@@ -9,7 +9,7 @@ use crate::backend::Backend;
 use crate::model::{
     Architecture, InferenceContext, Model, ModelConfig, ModelError, ModelResult,
 };
-use crate::model::layers::{Linear, RMSNorm};
+use crate::model::layers::{Linear, NormLayer};
 use crate::tensor::{DType, Tensor};
 
 use super::pipeline::PipelineExecutor;
@@ -21,8 +21,8 @@ use super::pipeline::PipelineExecutor;
 pub struct DistributedModel {
     /// Token embedding table (kept on coordinator)
     token_embedding: Tensor,
-    /// Final RMS normalization (kept on coordinator)
-    norm: RMSNorm,
+    /// Final normalization (kept on coordinator)
+    norm: NormLayer,
     /// Output projection to vocab logits (kept on coordinator)
     output: Linear,
     /// Pipeline executor that chains forward passes across shards
@@ -42,7 +42,7 @@ impl DistributedModel {
     /// Create a new distributed model.
     pub fn new(
         token_embedding: Tensor,
-        norm: RMSNorm,
+        norm: NormLayer,
         output: Linear,
         pipeline: PipelineExecutor,
         config: ModelConfig,

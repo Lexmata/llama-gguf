@@ -167,6 +167,66 @@ __global__ void rms_norm_fused(const float* x, const float* weight,
     }
 }
 
+// Fused Layer Normalization — single kernel.
+// out[i] = (x[i] - mean) / sqrt(var + eps) * weight[i] + bias[i]
+__global__ void layer_norm_fused(const float* x, const float* weight,
+                                  const float* bias, float* out, float eps, int n) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    // Step 1: Compute mean
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += stride) {
+        local_sum += x[i];
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / (float)n;
+    __syncthreads();
+
+    // Step 2: Compute variance
+    float local_var = 0.0f;
+    for (int i = tid; i < n; i += stride) {
+        float d = x[i] - mean;
+        local_var += d * d;
+    }
+    sdata[tid] = local_var;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sdata[0] = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+    }
+    __syncthreads();
+
+    float inv_std = sdata[0];
+
+    // Step 3: Normalize and scale
+    for (int i = tid; i < n; i += stride) {
+        out[i] = (x[i] - mean) * inv_std * weight[i] + bias[i];
+    }
+}
+
+// GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+__global__ void gelu_inplace(float* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = data[idx];
+        data[idx] = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+    }
+}
+
 // ============================================================================
 // Softmax
 // ============================================================================
@@ -1529,6 +1589,10 @@ pub struct CudaKernels {
     pub rms_norm_scale: CudaFunction,
     // Normalization (fused single-pass)
     pub rms_norm_fused: CudaFunction,
+    pub layer_norm_fused: CudaFunction,
+
+    // Activations (in-place)
+    pub gelu_inplace: CudaFunction,
 
     // Softmax (legacy three-pass)
     pub softmax_max: CudaFunction,
@@ -1628,6 +1692,8 @@ impl CudaKernels {
                     "rms_norm_sum_sq",
                     "rms_norm_scale",
                     "rms_norm_fused",
+                    "layer_norm_fused",
+                    "gelu_inplace",
                     "softmax_max",
                     "softmax_exp_sum",
                     "softmax_div",
@@ -1702,6 +1768,18 @@ impl CudaKernels {
                 .get_func("llama_kernels", "rms_norm_fused")
                 .ok_or_else(|| {
                     BackendError::InitializationFailed("Kernel 'rms_norm_fused' not found".into())
+                })?,
+            layer_norm_fused: device
+                .get_func("llama_kernels", "layer_norm_fused")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'layer_norm_fused' not found".into(),
+                    )
+                })?,
+            gelu_inplace: device
+                .get_func("llama_kernels", "gelu_inplace")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed("Kernel 'gelu_inplace' not found".into())
                 })?,
             softmax_max: device
                 .get_func("llama_kernels", "softmax_max")
