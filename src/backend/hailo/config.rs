@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum HailoQuantization {
     Int8,
     Int4,
@@ -12,7 +12,7 @@ impl Default for HailoQuantization {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HailoConfig {
     pub hef_dir: Option<PathBuf>,
     pub auto_compile: bool,

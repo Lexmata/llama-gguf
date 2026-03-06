@@ -102,6 +102,11 @@ pub struct EngineConfig {
     /// Set this to a smaller value (e.g. 2048) to reduce VRAM usage.
     /// If `None` or `0`, uses the model's native `max_seq_len`.
     pub max_context_len: Option<usize>,
+
+    /// Optional Hailo accelerator configuration.
+    /// When set, enables Hailo NPU inference in the GPU selection chain.
+    #[cfg(feature = "hailo")]
+    pub hailo_config: Option<crate::backend::hailo::HailoConfig>,
 }
 
 impl Default for EngineConfig {
@@ -117,6 +122,8 @@ impl Default for EngineConfig {
             seed: None,
             use_gpu: false,
             max_context_len: None,
+            #[cfg(feature = "hailo")]
+            hailo_config: None,
         }
     }
 }
@@ -558,7 +565,7 @@ impl Engine {
                         tracing::info!(
                             "Using full GPU inference (attention + DeltaNet + MoE all on CUDA)"
                         );
-                        let wrapper = crate::backend::cuda::gpu_only::GpuModelWrapper::new(
+                        let wrapper = crate::backend::GpuModelWrapper::new(
                             gpu,
                             config.clone(),
                             architecture,
@@ -589,7 +596,7 @@ impl Engine {
                 ) {
                     Ok(gpu) => {
                         tracing::info!("Using full GPU inference on Vulkan");
-                        let wrapper = crate::backend::vulkan::gpu_only::VulkanGpuModelWrapper::new(
+                        let wrapper = crate::backend::GpuModelWrapper::new(
                             gpu,
                             config.clone(),
                             architecture,
@@ -620,7 +627,7 @@ impl Engine {
                 ) {
                     Ok(gpu) => {
                         tracing::info!("Using full GPU inference on Metal");
-                        let wrapper = crate::backend::metal::gpu_only::MetalGpuModelWrapper::new(
+                        let wrapper = crate::backend::GpuModelWrapper::new(
                             gpu,
                             config.clone(),
                             architecture,
@@ -651,7 +658,7 @@ impl Engine {
                 ) {
                     Ok(gpu) => {
                         tracing::info!("Using full GPU inference on DX12");
-                        let wrapper = crate::backend::dx12::gpu_only::Dx12GpuModelWrapper::new(
+                        let wrapper = crate::backend::GpuModelWrapper::new(
                             gpu,
                             config.clone(),
                             architecture,
@@ -669,6 +676,40 @@ impl Engine {
                 }
             } else {
                 tracing::info!("No DX12 device available");
+            }
+        }
+
+        #[cfg(feature = "hailo")]
+        {
+            if let Some(ref hailo_config) = engine_config.hailo_config {
+                if crate::backend::hailo::context::check_device_available().is_ok() {
+                    let architecture = model.architecture();
+                    match crate::backend::hailo::gpu_only::HailoGpuInference::from_model(
+                        model,
+                        gpu_seq_len,
+                        hailo_config.clone(),
+                    ) {
+                        Ok(gpu) => {
+                            tracing::info!("Using hybrid CPU+Hailo inference");
+                            let wrapper = crate::backend::GpuModelWrapper::new(
+                                gpu,
+                                config.clone(),
+                                architecture,
+                            );
+                            return (
+                                Arc::new(crate::backend::cpu::CpuBackend::new()),
+                                Box::new(wrapper),
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Error: Hailo inference init failed: {}", e);
+                            eprintln!("The model was consumed during init. Please restart without --hailo.");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    tracing::info!("No Hailo device available, falling back to CPU...");
+                }
             }
         }
 
