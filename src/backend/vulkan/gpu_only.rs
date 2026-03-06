@@ -151,6 +151,8 @@ struct InferenceConfig {
     freq_base: f32,
     freq_scale: f32,
     expert_intermediate: usize,
+    final_logit_softcap: f32,
+    is_gemma: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +218,7 @@ impl VulkanGpuInference {
             layers,
             norm,
             output,
-            _architecture,
+            architecture,
             _recurrent_mask,
             _deltanet_config,
         ) = model.into_parts();
@@ -235,7 +237,10 @@ impl VulkanGpuInference {
         }
 
         // Upload norm + output weights
-        weights.upload_f32(&ctx, "output_norm.weight", &norm.weight)?;
+        weights.upload_f32(&ctx, "output_norm.weight", norm.weight())?;
+        if let Some(bias) = norm.bias() {
+            weights.upload_f32(&ctx, "output_norm.bias", bias)?;
+        }
         weights.upload_auto(&ctx, "output.weight", &output.weight)?;
         if let Some(ref bias) = output.bias {
             weights.upload_f32(&ctx, "output.bias", bias)?;
@@ -267,6 +272,8 @@ impl VulkanGpuInference {
             freq_base: model_config.rope_config.freq_base,
             freq_scale: model_config.rope_config.freq_scale,
             expert_intermediate,
+            final_logit_softcap: model_config.final_logit_softcap,
+            is_gemma: architecture.is_gemma(),
         };
 
         // CPU embeddings
@@ -293,7 +300,7 @@ impl VulkanGpuInference {
         let residual = ctx.create_persistent_buffer(config.hidden_size)?;
         let ffn_gate = ctx.create_persistent_buffer(config.intermediate_size)?;
         let ffn_up = ctx.create_persistent_buffer(config.intermediate_size)?;
-        let ffn_down = ctx.create_persistent_buffer(config.hidden_size)?;
+        let ffn_down = ctx.create_persistent_buffer(config.intermediate_size)?;
         let logits = ctx.create_output_buffer(config.vocab_size)?;
         let dequant_scratch = ctx.create_persistent_buffer(dequant_scratch_floats)?;
 
@@ -337,7 +344,10 @@ impl VulkanGpuInference {
         let moe_expert_up = ctx.create_persistent_buffer(expert_intermediate)?;
         let moe_expert_down = ctx.create_persistent_buffer(config.hidden_size)?;
         let moe_expert_out = ctx.create_persistent_buffer(config.hidden_size)?;
-        let moe_temp = ctx.create_persistent_buffer(config.hidden_size)?;
+        let scratch_size = config.hidden_size
+            .max(config.intermediate_size)
+            .max(expert_intermediate);
+        let moe_temp = ctx.create_persistent_buffer(scratch_size)?;
 
         // RMS norm partial sums buffer
         let rms_max_workgroups = ((config.hidden_size + 255) / 256).max(1);
@@ -400,12 +410,21 @@ impl VulkanGpuInference {
         }
 
         // Final norm
-        self.rms_norm_gpu("output_norm.weight", &BufferRef::Hidden, &BufferRef::HiddenNorm)?;
+        self.norm_gpu("output_norm.weight", "output_norm.bias", &BufferRef::Hidden, &BufferRef::HiddenNorm)?;
 
         // Output projection
         self.linear_gpu("output.weight", None, &BufferRef::HiddenNorm, &BufferRef::Logits)?;
 
-        let logits = self.ctx.read_buffer(&self.logits)?;
+        let mut logits = self.ctx.read_buffer(&self.logits)?;
+
+        // Final logit softcapping (Gemma2): logits = cap * tanh(logits / cap)
+        if self.config.final_logit_softcap > 0.0 {
+            let cap = self.config.final_logit_softcap;
+            for v in logits.iter_mut() {
+                *v = cap * (*v / cap).tanh();
+            }
+        }
+
         self.pos += 1;
         Ok(logits)
     }
@@ -462,7 +481,16 @@ impl VulkanGpuInference {
     fn embed_token(&mut self, token_id: u32) -> BackendResult<()> {
         let hs = self.config.hidden_size;
         let offset = token_id as usize * hs;
-        self.ctx.write_to_buffer(&self.hidden, &self.cpu_embeddings[offset..offset + hs])
+        if self.config.is_gemma {
+            let scale = (hs as f32).sqrt();
+            let scaled: Vec<f32> = self.cpu_embeddings[offset..offset + hs]
+                .iter()
+                .map(|v| v * scale)
+                .collect();
+            self.ctx.write_to_buffer(&self.hidden, &scaled)
+        } else {
+            self.ctx.write_to_buffer(&self.hidden, &self.cpu_embeddings[offset..offset + hs])
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -471,15 +499,22 @@ impl VulkanGpuInference {
 
     fn process_layer(&mut self, layer_idx: usize) -> BackendResult<()> {
         let hs = self.config.hidden_size;
+        let is_parallel = self.layers[layer_idx].use_parallel_residual;
 
         // Attention norm
-        self.rms_norm_gpu(
+        self.norm_gpu(
             &format!("blk.{}.attn_norm.weight", layer_idx),
+            &format!("blk.{}.attn_norm.bias", layer_idx),
             &BufferRef::Hidden,
             &BufferRef::HiddenNorm,
         )?;
 
         // Attention
+        if matches!(&self.layers[layer_idx].attn_layer, AttentionLayer::Mamba(_)) {
+            return Err(BackendError::OperationFailed(
+                "Mamba SSM not yet supported on Vulkan GPU".into(),
+            ));
+        }
         if self.has_attention[layer_idx] {
             self.attention_forward(layer_idx)?;
         } else {
@@ -489,32 +524,94 @@ impl VulkanGpuInference {
             )));
         }
 
-        // Residual add: hidden = residual + hidden_norm (attn output)
-        self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
-        self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
-
-        // FFN norm
-        let ffn_norm_name = if self.layers[layer_idx].post_attn_norm.is_some() {
-            format!("blk.{}.post_attention_norm.weight", layer_idx)
-        } else {
-            format!("blk.{}.ffn_norm.weight", layer_idx)
-        };
-        self.rms_norm_gpu(&ffn_norm_name, &BufferRef::Hidden, &BufferRef::HiddenNorm)?;
-
-        // FFN
-        match &self.layers[layer_idx].ffn_layer {
-            FfnLayer::Dense(_) => self.dense_ffn_forward(layer_idx)?,
-            FfnLayer::NoGate(_) => {
-                return Err(BackendError::OperationFailed(
-                    "NoGate FFN not yet supported on Vulkan GPU".into(),
-                ));
-            }
-            FfnLayer::Moe(_) => self.moe_forward(layer_idx)?,
+        // Identity (Mamba): output = x + ssm(norm(x)), skip FFN
+        if matches!(&self.layers[layer_idx].ffn_layer, FfnLayer::Identity) {
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+            return Ok(());
         }
 
-        // FFN residual add
-        self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
-        self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+        if is_parallel {
+            // Parallel residual: output = x + attn(norm(x)) + ffn(norm(x))
+            // attn output is in hidden_norm; save it to ffn_down (scratch)
+            self.ctx.copy_buffer(&self.hidden_norm, &self.ffn_down, bytes_of_f32(hs))?;
+
+            // FFN uses the same norm output (still in hidden from before attn_norm)
+            // Re-run attn_norm since attention_forward overwrote hidden_norm
+            self.norm_gpu(
+                &format!("blk.{}.attn_norm.weight", layer_idx),
+                &format!("blk.{}.attn_norm.bias", layer_idx),
+                &BufferRef::Hidden,
+                &BufferRef::HiddenNorm,
+            )?;
+
+            // FFN
+            match &self.layers[layer_idx].ffn_layer {
+                FfnLayer::Identity => unreachable!(),
+                FfnLayer::Dense(_) => self.dense_ffn_forward(layer_idx)?,
+                FfnLayer::NoGate(ffn) => self.nogate_ffn_forward(layer_idx, ffn.use_gelu)?,
+                FfnLayer::Moe(_) => self.moe_forward(layer_idx)?,
+            }
+
+            // hidden = residual + attn_out (ffn_down) + ffn_out (hidden_norm)
+            // Step 1: temp = residual + attn_out
+            self.dispatch_add(&self.residual, &self.ffn_down, &self.hidden)?;
+            // Step 2: hidden = temp + ffn_out
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+        } else {
+            // Serial residual:
+            //   h = x + post_attn_norm?(attn(norm(x)))
+            //   output = h + post_ffn_norm?(ffn(ffn_norm(h)))
+
+            // Post-attention normalization (Gemma2, Cohere2): normalize
+            // attention output BEFORE adding residual
+            if self.layers[layer_idx].post_attn_norm.is_some() {
+                self.norm_gpu(
+                    &format!("blk.{}.post_attention_norm.weight", layer_idx),
+                    &format!("blk.{}.post_attention_norm.bias", layer_idx),
+                    &BufferRef::HiddenNorm,
+                    &BufferRef::FfnDown,
+                )?;
+                self.ctx.copy_buffer(&self.ffn_down, &self.hidden_norm, bytes_of_f32(hs))?;
+            }
+
+            // h = x + (post_attn_normed) attn_out
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+
+            // FFN norm (always ffn_norm, not post_attention_norm)
+            self.norm_gpu(
+                &format!("blk.{}.ffn_norm.weight", layer_idx),
+                &format!("blk.{}.ffn_norm.bias", layer_idx),
+                &BufferRef::Hidden,
+                &BufferRef::HiddenNorm,
+            )?;
+
+            // FFN
+            match &self.layers[layer_idx].ffn_layer {
+                FfnLayer::Identity => unreachable!(),
+                FfnLayer::Dense(_) => self.dense_ffn_forward(layer_idx)?,
+                FfnLayer::NoGate(ffn) => self.nogate_ffn_forward(layer_idx, ffn.use_gelu)?,
+                FfnLayer::Moe(_) => self.moe_forward(layer_idx)?,
+            }
+
+            // Post-FFN normalization (Gemma2): normalize FFN output before residual
+            if self.layers[layer_idx].post_ffn_norm.is_some() {
+                self.norm_gpu(
+                    &format!("blk.{}.post_ffw_norm.weight", layer_idx),
+                    &format!("blk.{}.post_ffw_norm.bias", layer_idx),
+                    &BufferRef::HiddenNorm,
+                    &BufferRef::FfnDown,
+                )?;
+                self.ctx.copy_buffer(&self.ffn_down, &self.hidden_norm, bytes_of_f32(hs))?;
+            }
+
+            // FFN residual add
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+        }
 
         Ok(())
     }
@@ -535,22 +632,37 @@ impl VulkanGpuInference {
         let scale = attn.scale;
         let use_neox = attn.use_neox_rope;
 
-        // Q/K/V projections
+        // Q/K/V projections (with optional biases for Phi-2, BERT, etc.)
+        let q_bias_name = format!("blk.{}.attn_q.bias", layer_idx);
+        let k_bias_name = format!("blk.{}.attn_k.bias", layer_idx);
+        let v_bias_name = format!("blk.{}.attn_v.bias", layer_idx);
         self.linear_gpu(
             &format!("blk.{}.attn_q.weight", layer_idx),
-            Some(&format!("blk.{}.attn_q.bias", layer_idx)),
+            if self.weights.contains(&q_bias_name) {
+                Some(q_bias_name.as_str())
+            } else {
+                None
+            },
             &BufferRef::HiddenNorm,
             &BufferRef::AttnQ,
         )?;
         self.linear_gpu(
             &format!("blk.{}.attn_k.weight", layer_idx),
-            Some(&format!("blk.{}.attn_k.bias", layer_idx)),
+            if self.weights.contains(&k_bias_name) {
+                Some(k_bias_name.as_str())
+            } else {
+                None
+            },
             &BufferRef::HiddenNorm,
             &BufferRef::AttnK,
         )?;
         self.linear_gpu(
             &format!("blk.{}.attn_v.weight", layer_idx),
-            Some(&format!("blk.{}.attn_v.bias", layer_idx)),
+            if self.weights.contains(&v_bias_name) {
+                Some(v_bias_name.as_str())
+            } else {
+                None
+            },
             &BufferRef::HiddenNorm,
             &BufferRef::AttnV,
         )?;
@@ -558,7 +670,8 @@ impl VulkanGpuInference {
         // RoPE on Q and K
         let num_q_heads = num_heads;
         let num_k_heads = num_kv_heads;
-        self.dispatch_rope(&self.attn_q, &self.attn_k, num_q_heads, num_k_heads, kl, self.pos, use_neox)?;
+        let rope_dims = attn.rope_dims;
+        self.dispatch_rope(&self.attn_q, &self.attn_k, num_q_heads, num_k_heads, kl, self.pos, use_neox, rope_dims)?;
 
         // Update KV cache from CPU: read Q/K tensors, write to cache at position
         let k_new = self.ctx.read_buffer_floats(&self.attn_k, num_kv_heads * kl)?;
@@ -587,14 +700,16 @@ impl VulkanGpuInference {
 
         // Attention cached
         let kv_len = self.pos + 1;
+        let softcap = attn.attn_logit_softcap;
         self.dispatch_attention_cached(
-            layer_idx, num_heads, num_kv_heads, kl, vl, kv_len, scale,
+            layer_idx, num_heads, num_kv_heads, kl, vl, kv_len, scale, softcap,
         )?;
 
         // Output projection: attn_out → hidden_norm
+        let wo_bias_name = format!("blk.{}.attn_output.bias", layer_idx);
         self.linear_gpu(
             &format!("blk.{}.attn_output.weight", layer_idx),
-            None,
+            if self.weights.contains(&wo_bias_name) { Some(wo_bias_name.as_str()) } else { None },
             &BufferRef::AttnOut,
             &BufferRef::HiddenNorm,
         )?;
@@ -637,6 +752,39 @@ impl VulkanGpuInference {
             &format!("{}.ffn_down.weight", prefix),
             None,
             &BufferRef::FfnDown,
+            &BufferRef::HiddenNorm,
+        )?;
+
+        Ok(())
+    }
+
+    fn nogate_ffn_forward(&mut self, layer_idx: usize, use_gelu: bool) -> BackendResult<()> {
+        let prefix = format!("blk.{}", layer_idx);
+        let inter = self.config.intermediate_size;
+
+        let up_bias_name = format!("{}.ffn_up.bias", prefix);
+        let down_bias_name = format!("{}.ffn_down.bias", prefix);
+
+        // up = hidden_norm @ W_up (+ bias)
+        self.linear_gpu(
+            &format!("{}.ffn_up.weight", prefix),
+            if self.weights.contains(&up_bias_name) { Some(up_bias_name.as_str()) } else { None },
+            &BufferRef::HiddenNorm,
+            &BufferRef::FfnUp,
+        )?;
+
+        // Activation: GELU or SiLU
+        if use_gelu {
+            self.dispatch_gelu(&self.ffn_up, inter)?;
+        } else {
+            self.dispatch_silu(&self.ffn_up, inter)?;
+        }
+
+        // down projection: ffn_up @ W_down (+ bias) → hidden_norm
+        self.linear_gpu(
+            &format!("{}.ffn_down.weight", prefix),
+            if self.weights.contains(&down_bias_name) { Some(down_bias_name.as_str()) } else { None },
+            &BufferRef::FfnUp,
             &BufferRef::HiddenNorm,
         )?;
 
@@ -792,6 +940,45 @@ impl VulkanGpuInference {
         Ok(())
     }
 
+    fn layer_norm_gpu(
+        &self,
+        weight_name: &str,
+        bias_name: &str,
+        input: &BufferRef,
+        output: &BufferRef,
+    ) -> BackendResult<()> {
+        let n = self.config.hidden_size;
+        let w = self.weights.get_f32(weight_name)
+            .ok_or_else(|| BackendError::OperationFailed(format!("Missing {}", weight_name)))?;
+        let b = self.weights.get_f32(bias_name)
+            .ok_or_else(|| BackendError::OperationFailed(format!("Missing {}", bias_name)))?;
+
+        let x_buf = self.resolve_buf(input);
+        let out_buf = self.resolve_buf(output);
+
+        let mut push = Vec::with_capacity(8);
+        push.extend_from_slice(&(n as i32).to_le_bytes());
+        push.extend_from_slice(&self.config.norm_eps.to_le_bytes());
+
+        // Single workgroup: entire vector processed by one group
+        self.ctx.dispatch("layer_norm", &[x_buf, &w.buffer, &b.buffer, out_buf], &push, (1, 1, 1))
+    }
+
+    /// Dispatch either RMSNorm or LayerNorm depending on whether a bias exists
+    fn norm_gpu(
+        &self,
+        weight_name: &str,
+        bias_name: &str,
+        input: &BufferRef,
+        output: &BufferRef,
+    ) -> BackendResult<()> {
+        if self.weights.contains(bias_name) {
+            self.layer_norm_gpu(weight_name, bias_name, input, output)
+        } else {
+            self.rms_norm_gpu(weight_name, input, output)
+        }
+    }
+
     fn linear_gpu(
         &self,
         weight_name: &str,
@@ -881,10 +1068,16 @@ impl VulkanGpuInference {
     }
 
     fn dispatch_silu(&self, buf: &GpuBuffer, n: usize) -> BackendResult<()> {
-        // silu writes to output buffer; use moe_temp as temp then copy back
         let push = (n as i32).to_le_bytes();
         let wg = VulkanContext::workgroup_count_1d(n, 256);
         self.ctx.dispatch("silu", &[buf, &self.moe_temp], &push, wg)?;
+        self.ctx.copy_buffer(&self.moe_temp, buf, bytes_of_f32(n))
+    }
+
+    fn dispatch_gelu(&self, buf: &GpuBuffer, n: usize) -> BackendResult<()> {
+        let push = (n as i32).to_le_bytes();
+        let wg = VulkanContext::workgroup_count_1d(n, 256);
+        self.ctx.dispatch("gelu", &[buf, &self.moe_temp], &push, wg)?;
         self.ctx.copy_buffer(&self.moe_temp, buf, bytes_of_f32(n))
     }
 
@@ -905,8 +1098,9 @@ impl VulkanGpuInference {
         head_dim: usize,
         pos: usize,
         use_neox: bool,
+        rope_dims: usize,
     ) -> BackendResult<()> {
-        let mut push = Vec::with_capacity(28);
+        let mut push = Vec::with_capacity(32);
         push.extend_from_slice(&(num_q_heads as i32).to_le_bytes());
         push.extend_from_slice(&(num_k_heads as i32).to_le_bytes());
         push.extend_from_slice(&(head_dim as i32).to_le_bytes());
@@ -914,6 +1108,7 @@ impl VulkanGpuInference {
         push.extend_from_slice(&self.config.freq_base.to_le_bytes());
         push.extend_from_slice(&self.config.freq_scale.to_le_bytes());
         push.extend_from_slice(&(if use_neox { 1i32 } else { 0i32 }).to_le_bytes());
+        push.extend_from_slice(&(rope_dims as i32).to_le_bytes());
 
         let max_heads = num_q_heads.max(num_k_heads);
         let wg = (max_heads as u32, 1, 1);
@@ -929,19 +1124,21 @@ impl VulkanGpuInference {
         _vl: usize,
         kv_len: usize,
         scale: f32,
+        softcap: f32,
     ) -> BackendResult<()> {
         let k_cache = self.k_caches[layer_idx].as_ref()
             .ok_or_else(|| BackendError::OperationFailed("Missing K cache".into()))?;
         let v_cache = self.v_caches[layer_idx].as_ref()
             .ok_or_else(|| BackendError::OperationFailed("Missing V cache".into()))?;
 
-        let mut push = Vec::with_capacity(24);
+        let mut push = Vec::with_capacity(28);
         push.extend_from_slice(&(num_heads as i32).to_le_bytes());
         push.extend_from_slice(&(num_kv_heads as i32).to_le_bytes());
         push.extend_from_slice(&(kv_len as i32).to_le_bytes());
         push.extend_from_slice(&(self.max_seq_len as i32).to_le_bytes());
         push.extend_from_slice(&(kl as i32).to_le_bytes());
         push.extend_from_slice(&scale.to_le_bytes());
+        push.extend_from_slice(&softcap.to_le_bytes());
 
         let wg = (num_heads as u32, 1, 1);
         self.ctx.dispatch(
@@ -1009,7 +1206,10 @@ fn upload_layer_weights(
     layer: &TransformerLayer,
 ) -> BackendResult<()> {
     // Attention norm
-    store.upload_f32(ctx, &format!("blk.{}.attn_norm.weight", i), &layer.attn_norm.weight)?;
+    store.upload_f32(ctx, &format!("blk.{}.attn_norm.weight", i), layer.attn_norm.weight())?;
+    if let Some(bias) = layer.attn_norm.bias() {
+        store.upload_f32(ctx, &format!("blk.{}.attn_norm.bias", i), bias)?;
+    }
 
     // Attention weights
     if let AttentionLayer::FullAttention(attn) = &layer.attn_layer {
@@ -1027,18 +1227,28 @@ fn upload_layer_weights(
         if let Some(ref bias) = attn.wv.bias {
             store.upload_f32(ctx, &format!("blk.{}.attn_v.bias", i), bias)?;
         }
+        if let Some(ref bias) = attn.wo.bias {
+            store.upload_f32(ctx, &format!("blk.{}.attn_output.bias", i), bias)?;
+        }
     }
 
     // Post-attention norm
     if let Some(ref norm) = layer.post_attn_norm {
-        store.upload_f32(ctx, &format!("blk.{}.post_attention_norm.weight", i), &norm.weight)?;
+        store.upload_f32(ctx, &format!("blk.{}.post_attention_norm.weight", i), norm.weight())?;
+        if let Some(bias) = norm.bias() {
+            store.upload_f32(ctx, &format!("blk.{}.post_attention_norm.bias", i), bias)?;
+        }
     }
 
     // FFN norm
-    store.upload_f32(ctx, &format!("blk.{}.ffn_norm.weight", i), &layer.ffn_norm.weight)?;
+    store.upload_f32(ctx, &format!("blk.{}.ffn_norm.weight", i), layer.ffn_norm.weight())?;
+    if let Some(bias) = layer.ffn_norm.bias() {
+        store.upload_f32(ctx, &format!("blk.{}.ffn_norm.bias", i), bias)?;
+    }
 
     // FFN weights
     match &layer.ffn_layer {
+        FfnLayer::Identity => {}
         FfnLayer::Dense(ffn) => {
             store.upload_auto(ctx, &format!("blk.{}.ffn_gate.weight", i), &ffn.w_gate.weight)?;
             store.upload_auto(ctx, &format!("blk.{}.ffn_up.weight", i), &ffn.w_up.weight)?;
@@ -1047,6 +1257,12 @@ fn upload_layer_weights(
         FfnLayer::NoGate(ffn) => {
             store.upload_auto(ctx, &format!("blk.{}.ffn_up.weight", i), &ffn.w_up.weight)?;
             store.upload_auto(ctx, &format!("blk.{}.ffn_down.weight", i), &ffn.w_down.weight)?;
+            if let Some(ref bias) = ffn.w_up.bias {
+                store.upload_f32(ctx, &format!("blk.{}.ffn_up.bias", i), bias)?;
+            }
+            if let Some(ref bias) = ffn.w_down.bias {
+                store.upload_f32(ctx, &format!("blk.{}.ffn_down.bias", i), bias)?;
+            }
         }
         FfnLayer::Moe(moe) => {
             store.upload_auto(ctx, &format!("blk.{}.ffn_gate_inp.weight", i), &moe.router.weight)?;
@@ -1062,67 +1278,32 @@ fn upload_layer_weights(
         }
     }
 
+    // Post-FFN norm (Gemma2)
+    if let Some(ref norm) = layer.post_ffn_norm {
+        store.upload_f32(ctx, &format!("blk.{}.post_ffw_norm.weight", i), norm.weight())?;
+        if let Some(bias) = norm.bias() {
+            store.upload_f32(ctx, &format!("blk.{}.post_ffw_norm.bias", i), bias)?;
+        }
+    }
+
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// GpuModelWrapper: implements Model trait
+// GpuInference trait implementation
 // ---------------------------------------------------------------------------
 
-use crate::model::{Architecture, InferenceContext, Model, ModelConfig, ModelError, ModelResult};
-use std::sync::Mutex;
-
-pub struct VulkanGpuModelWrapper {
-    gpu: Mutex<VulkanGpuInference>,
-    config: ModelConfig,
-    architecture: Architecture,
-}
-
-impl VulkanGpuModelWrapper {
-    pub fn new(
-        gpu: VulkanGpuInference,
-        config: ModelConfig,
-        architecture: Architecture,
-    ) -> Self {
-        Self {
-            gpu: Mutex::new(gpu),
-            config,
-            architecture,
-        }
+impl crate::backend::GpuInference for VulkanGpuInference {
+    fn forward(&mut self, token_id: u32) -> crate::backend::BackendResult<Vec<f32>> {
+        VulkanGpuInference::forward(self, token_id)
     }
-}
-
-impl Model for VulkanGpuModelWrapper {
-    fn forward(&self, tokens: &[u32], ctx: &mut InferenceContext) -> ModelResult<Tensor> {
-        let mut gpu = self.gpu.lock().map_err(|e| {
-            ModelError::ConfigError(format!("Vulkan GPU inference lock poisoned: {}", e))
-        })?;
-
-        if ctx.position == 0 && gpu.position() > 0 {
-            gpu.reset();
-        }
-
-        if tokens.is_empty() {
-            return Err(ModelError::ConfigError("No tokens to process".into()));
-        }
-
-        let last_idx = tokens.len() - 1;
-        for &token in &tokens[..last_idx] {
-            gpu.prefill_token(token)?;
-        }
-
-        let logits_vec = gpu.forward(tokens[last_idx])?;
-        ctx.position += tokens.len();
-        ctx.kv_cache.seq_len = ctx.position;
-
-        Tensor::from_f32(&logits_vec, vec![logits_vec.len()]).map_err(|e| e.into())
+    fn prefill_token(&mut self, token_id: u32) -> crate::backend::BackendResult<()> {
+        VulkanGpuInference::prefill_token(self, token_id)
     }
-
-    fn config(&self) -> &ModelConfig {
-        &self.config
+    fn reset(&mut self) {
+        VulkanGpuInference::reset(self)
     }
-
-    fn architecture(&self) -> Architecture {
-        self.architecture
+    fn position(&self) -> usize {
+        VulkanGpuInference::position(self)
     }
 }

@@ -14,8 +14,8 @@ use super::deltanet::{DeltaNetConfig, DeltaNetLayer};
 use super::mamba::{MambaConfig, MambaLayer};
 use super::error::{ModelError, ModelResult};
 use super::layers::{
-    Attention, AttentionLayer, FeedForward, FfnLayer, LayerNorm, Linear, NoGateFeedForward,
-    NormLayer, RMSNorm, TransformerLayer,
+    Attention, AttentionLayer, FeedForward, FfnLayer, LayerNorm, Linear, NormLayer,
+    NoGateFeedForward, RMSNorm, TransformerLayer,
 };
 use super::bert::{BertLayer, BertModel};
 use super::llama::LlamaModel;
@@ -130,7 +130,11 @@ impl ModelLoader {
 
         let max_seq_len = get_u32(&format!("{}.context_length", arch)).unwrap_or(2048) as usize;
 
-        let norm_eps = get_f32_or(&format!("{}.attention.layer_norm_rms_epsilon", arch), 1e-5);
+        let norm_eps = gguf
+            .data
+            .get_f32(&format!("{}.attention.layer_norm_rms_epsilon", arch))
+            .or_else(|| gguf.data.get_f32(&format!("{}.attention.layer_norm_epsilon", arch)))
+            .unwrap_or(1e-5);
 
         // Parse RoPE configuration
         let freq_base = get_f32_or(&format!("{}.rope.freq_base", arch), 10000.0);
@@ -147,7 +151,13 @@ impl ModelLoader {
             | Architecture::Qwen3Moe
             | Architecture::Qwen3Next
             | Architecture::GPTNeoX
-            | Architecture::Falcon => RopeType::NeoX,
+            | Architecture::Falcon
+            | Architecture::Phi
+            | Architecture::Phi2
+            | Architecture::Phi3
+            | Architecture::PhiMoe
+            | Architecture::GPTJ
+            | Architecture::StableLM => RopeType::NeoX,
             _ => RopeType::Normal,
         };
 
@@ -322,17 +332,22 @@ impl ModelLoader {
             );
         }
 
-        // Load final normalization
+        // Load final normalization (LayerNorm if bias exists, else RMSNorm)
         let norm_weight = self.apply_gemma_norm_weight_offset(self.load_tensor("output_norm.weight")?)?;
-        let norm = RMSNorm::new(norm_weight, self.config.norm_eps)?;
+        let norm = if let Some(bias) = self.try_load_tensor("output_norm.bias") {
+            NormLayer::Layer(LayerNorm::new(norm_weight, bias, self.config.norm_eps)?)
+        } else {
+            NormLayer::RMS(RMSNorm::new(norm_weight, self.config.norm_eps)?)
+        };
 
         // Load output projection (may be tied to embeddings)
+        let output_bias = self.try_load_tensor("output.bias");
         let output =
             if self.config.tie_word_embeddings || self.try_load_tensor("output.weight").is_none() {
-                Linear::new(token_embedding.clone(), None)?
+                Linear::new(token_embedding.clone(), output_bias)?
             } else {
                 let output_weight = self.load_tensor("output.weight")?;
-                Linear::new(output_weight, None)?
+                Linear::new(output_weight, output_bias)?
             };
 
         LlamaModel::new(
@@ -406,18 +421,11 @@ impl ModelLoader {
                         deq.as_f32()?.to_vec()
                     };
 
-                    let mut q_data = vec![0.0f32; hidden * q_size];
-                    let mut k_data = vec![0.0f32; hidden * k_size];
-                    let mut v_data = vec![0.0f32; hidden * v_size];
-                    for row in 0..hidden {
-                        let src = row * total;
-                        q_data[row * q_size..(row + 1) * q_size]
-                            .copy_from_slice(&qkv_f32[src..src + q_size]);
-                        k_data[row * k_size..(row + 1) * k_size]
-                            .copy_from_slice(&qkv_f32[src + q_size..src + q_size + k_size]);
-                        v_data[row * v_size..(row + 1) * v_size]
-                            .copy_from_slice(&qkv_f32[src + q_size + k_size..src + total]);
-                    }
+                    // GGUF layout: ne[0]=hidden (innermost), ne[1]=total (outer).
+                    // Q/K/V occupy contiguous rows: first q_size rows, then k_size, then v_size.
+                    let q_start = 0;
+                    let k_start_off = q_size * hidden;
+                    let v_start_off = (q_size + k_size) * hidden;
 
                     let qkv_bias = self.try_load_tensor(&format!("{}.attn_qkv.bias", prefix));
                     let (qb, kb, vb) = if let Some(ref b) = qkv_bias {
@@ -436,15 +444,15 @@ impl ModelLoader {
 
                     (
                         Linear::new(
-                            Tensor::from_f32(&q_data, vec![hidden, q_size])?,
+                            Tensor::from_f32(&qkv_f32[q_start..q_start + q_size * hidden], vec![hidden, q_size])?,
                             qb,
                         )?,
                         Linear::new(
-                            Tensor::from_f32(&k_data, vec![hidden, k_size])?,
+                            Tensor::from_f32(&qkv_f32[k_start_off..k_start_off + k_size * hidden], vec![hidden, k_size])?,
                             kb,
                         )?,
                         Linear::new(
-                            Tensor::from_f32(&v_data, vec![hidden, v_size])?,
+                            Tensor::from_f32(&qkv_f32[v_start_off..v_start_off + v_size * hidden], vec![hidden, v_size])?,
                             vb,
                         )?,
                     )
@@ -587,7 +595,14 @@ impl ModelLoader {
             .or_else(|| self.try_load_tensor(&format!("{}.norm.weight", prefix)))
             .ok_or_else(|| ModelError::MissingTensor(format!("{}.attn_norm.weight", prefix)))?;
         let attn_norm_weight = self.apply_gemma_norm_weight_offset(attn_norm_weight)?;
-        let attn_norm = RMSNorm::new(attn_norm_weight, self.config.norm_eps)?;
+        let attn_norm_bias = self
+            .try_load_tensor(&format!("{}.attn_norm.bias", prefix))
+            .or_else(|| self.try_load_tensor(&format!("{}.norm.bias", prefix)));
+        let attn_norm = if let Some(bias) = attn_norm_bias {
+            NormLayer::Layer(LayerNorm::new(attn_norm_weight, bias, self.config.norm_eps)?)
+        } else {
+            NormLayer::RMS(RMSNorm::new(attn_norm_weight, self.config.norm_eps)?)
+        };
 
         // Load attention based on available tensors
         let attn_layer = self.load_attention_layer(layer_idx)?;
@@ -597,46 +612,42 @@ impl ModelLoader {
             if let Some(w) = self.try_load_tensor(&format!("{}.post_attention_norm.weight", prefix))
             {
                 let w = self.apply_gemma_norm_weight_offset(w)?;
-                Some(RMSNorm::new(w, self.config.norm_eps)?)
+                let b = self.try_load_tensor(&format!("{}.post_attention_norm.bias", prefix));
+                Some(if let Some(bias) = b {
+                    NormLayer::Layer(LayerNorm::new(w, bias, self.config.norm_eps)?)
+                } else {
+                    NormLayer::RMS(RMSNorm::new(w, self.config.norm_eps)?)
+                })
             } else {
                 None
             };
 
         // FFN normalization
-        let ffn_norm_weight = self
-            .try_load_tensor(&format!("{}.ffn_norm.weight", prefix))
-            .ok_or_else(|| {
-                // Qwen3Next uses post_attention_norm for FFN norm role
-                if post_attn_norm.is_some() {
-                    // Create a dummy norm — layer forward won't use it in practice
-                    // because post_attn_norm already handled normalization
-                }
-                ModelError::MissingTensor(format!("{}.ffn_norm.weight", prefix))
-            });
+        let ffn_norm_weight = self.try_load_tensor(&format!("{}.ffn_norm.weight", prefix));
+        let ffn_norm_bias = self.try_load_tensor(&format!("{}.ffn_norm.bias", prefix));
 
-        let ffn_norm = match ffn_norm_weight {
-            Ok(w) => {
-                let w = self.apply_gemma_norm_weight_offset(w)?;
-                RMSNorm::new(w, self.config.norm_eps)?
+        let ffn_norm = if let Some(w) = ffn_norm_weight {
+            let w = self.apply_gemma_norm_weight_offset(w)?;
+            if let Some(bias) = ffn_norm_bias {
+                NormLayer::Layer(LayerNorm::new(w, bias, self.config.norm_eps)?)
+            } else {
+                NormLayer::RMS(RMSNorm::new(w, self.config.norm_eps)?)
             }
-            Err(_) => {
-                if post_attn_norm.is_some() || is_mamba || self.config.use_parallel_residual {
-                    // Parallel residual models (Phi-2, GPT-NeoX, GPT-J) share the
-                    // attention norm for both branches, so ffn_norm doesn't exist.
-                    // Mamba and post_attn_norm models also may lack a separate ffn_norm.
-                    // Create a unit-weight identity norm as placeholder.
-                    let hidden = self.config.hidden_size;
-                    RMSNorm::new(
-                        Tensor::from_f32(&vec![1.0f32; hidden], vec![hidden])?,
-                        self.config.norm_eps,
-                    )?
-                } else {
-                    return Err(ModelError::MissingTensor(format!(
-                        "{}.ffn_norm.weight",
-                        prefix
-                    )));
-                }
-            }
+        } else if post_attn_norm.is_some() || is_mamba || self.config.use_parallel_residual {
+            // Parallel residual models (Phi-2, GPT-NeoX, GPT-J) share the
+            // attention norm for both branches, so ffn_norm doesn't exist.
+            // Mamba and post_attn_norm models also may lack a separate ffn_norm.
+            // Create a unit-weight identity norm as placeholder.
+            let hidden = self.config.hidden_size;
+            NormLayer::RMS(RMSNorm::new(
+                Tensor::from_f32(&vec![1.0f32; hidden], vec![hidden])?,
+                self.config.norm_eps,
+            )?)
+        } else {
+            return Err(ModelError::MissingTensor(format!(
+                "{}.ffn_norm.weight",
+                prefix
+            )));
         };
 
         // Load FFN: MoE, dense, or dummy for pure Mamba without FFN
@@ -645,21 +656,7 @@ impl ModelLoader {
         } else if is_mamba
             && self.try_load_tensor(&format!("{}.ffn_up.weight", prefix)).is_none()
         {
-            // Pure Mamba without FFN: create identity-like dummy FFN (output = input)
-            let hidden = self.config.hidden_size;
-            let id_weight = Tensor::from_f32(
-                &(0..hidden * hidden)
-                    .map(|i| if i % (hidden + 1) == 0 { 1.0 } else { 0.0 })
-                    .collect::<Vec<_>>(),
-                vec![hidden, hidden],
-            )?;
-            let w_up = Linear::new(id_weight.clone(), None)?;
-            let w_down = Linear::new(id_weight, None)?;
-            FfnLayer::NoGate(NoGateFeedForward::new(
-                w_up,
-                w_down,
-                self.config.uses_gelu,
-            ))
+            FfnLayer::Identity
         } else if !self.config.has_ffn_gate {
             // No-gate FFN (GPT-2, BLOOM, GPT-NeoX, etc.)
             let w_up = Linear::new(
@@ -695,7 +692,12 @@ impl ModelLoader {
         let post_ffn_norm =
             if let Some(w) = self.try_load_tensor(&format!("{}.post_ffw_norm.weight", prefix)) {
                 let w = self.apply_gemma_norm_weight_offset(w)?;
-                Some(RMSNorm::new(w, self.config.norm_eps)?)
+                let b = self.try_load_tensor(&format!("{}.post_ffw_norm.bias", prefix));
+                Some(if let Some(bias) = b {
+                    NormLayer::Layer(LayerNorm::new(w, bias, self.config.norm_eps)?)
+                } else {
+                    NormLayer::RMS(RMSNorm::new(w, self.config.norm_eps)?)
+                })
             } else {
                 None
             };
@@ -805,6 +807,11 @@ impl ModelLoader {
             attention.set_attn_logit_softcap(self.config.attn_logit_softcap);
         }
 
+        // Qwen3Next uses [nope | rope] layout; all others use [rope | nope]
+        if matches!(self.architecture, Architecture::Qwen3Next) {
+            attention.set_rope_partial_at_end(true);
+        }
+
         Ok(attention)
     }
 
@@ -837,30 +844,25 @@ impl ModelLoader {
         if qkv_weight.dtype() == DType::F32 {
             let qkv_f32 = qkv_weight.as_f32()?;
 
-            // Split: data is laid out as [in_features, total_out] in row-major
-            // Each row has [Q_cols | K_cols | V_cols]
-            let mut q_data = vec![0.0f32; in_features * q_size];
-            let mut k_data = vec![0.0f32; in_features * k_size];
-            let mut v_data = vec![0.0f32; in_features * v_size];
+            // GGUF layout: ne[0]=in_features (innermost), ne[1]=total_out (outer).
+            // Data has total_out rows of in_features elements each.
+            // Q occupies the first q_size rows, K next k_size rows, V last v_size rows.
+            let q_start = 0;
+            let k_start = q_size * in_features;
+            let v_start = (q_size + k_size) * in_features;
 
-            for row in 0..in_features {
-                let src_base = row * total_out;
-                let q_dst = row * q_size;
-                let k_dst = row * k_size;
-                let v_dst = row * v_size;
-                q_data[q_dst..q_dst + q_size]
-                    .copy_from_slice(&qkv_f32[src_base..src_base + q_size]);
-                k_data[k_dst..k_dst + k_size].copy_from_slice(
-                    &qkv_f32[src_base + q_size..src_base + q_size + k_size],
-                );
-                v_data[v_dst..v_dst + v_size].copy_from_slice(
-                    &qkv_f32[src_base + q_size + k_size..src_base + total_out],
-                );
-            }
-
-            let q_tensor = Tensor::from_f32(&q_data, vec![in_features, q_size])?;
-            let k_tensor = Tensor::from_f32(&k_data, vec![in_features, k_size])?;
-            let v_tensor = Tensor::from_f32(&v_data, vec![in_features, v_size])?;
+            let q_tensor = Tensor::from_f32(
+                &qkv_f32[q_start..q_start + q_size * in_features],
+                vec![in_features, q_size],
+            )?;
+            let k_tensor = Tensor::from_f32(
+                &qkv_f32[k_start..k_start + k_size * in_features],
+                vec![in_features, k_size],
+            )?;
+            let v_tensor = Tensor::from_f32(
+                &qkv_f32[v_start..v_start + v_size * in_features],
+                vec![in_features, v_size],
+            )?;
 
             // Split bias if present
             let (q_bias, k_bias, v_bias) = if let Some(ref bias) = qkv_bias {
@@ -900,28 +902,23 @@ impl ModelLoader {
                 .map_err(|e| ModelError::ConfigError(format!("Failed to dequantize QKV: {}", e)))?;
             let qkv_f32 = dequant.as_f32()?;
 
-            let mut q_data = vec![0.0f32; in_features * q_size];
-            let mut k_data = vec![0.0f32; in_features * k_size];
-            let mut v_data = vec![0.0f32; in_features * v_size];
+            // Same contiguous split as the F32 path
+            let q_start = 0;
+            let k_start = q_size * in_features;
+            let v_start = (q_size + k_size) * in_features;
 
-            for row in 0..in_features {
-                let src_base = row * total_out;
-                let q_dst = row * q_size;
-                let k_dst = row * k_size;
-                let v_dst = row * v_size;
-                q_data[q_dst..q_dst + q_size]
-                    .copy_from_slice(&qkv_f32[src_base..src_base + q_size]);
-                k_data[k_dst..k_dst + k_size].copy_from_slice(
-                    &qkv_f32[src_base + q_size..src_base + q_size + k_size],
-                );
-                v_data[v_dst..v_dst + v_size].copy_from_slice(
-                    &qkv_f32[src_base + q_size + k_size..src_base + total_out],
-                );
-            }
-
-            let q_tensor = Tensor::from_f32(&q_data, vec![in_features, q_size])?;
-            let k_tensor = Tensor::from_f32(&k_data, vec![in_features, k_size])?;
-            let v_tensor = Tensor::from_f32(&v_data, vec![in_features, v_size])?;
+            let q_tensor = Tensor::from_f32(
+                &qkv_f32[q_start..q_start + q_size * in_features],
+                vec![in_features, q_size],
+            )?;
+            let k_tensor = Tensor::from_f32(
+                &qkv_f32[k_start..k_start + k_size * in_features],
+                vec![in_features, k_size],
+            )?;
+            let v_tensor = Tensor::from_f32(
+                &qkv_f32[v_start..v_start + v_size * in_features],
+                vec![in_features, v_size],
+            )?;
 
             let (q_bias, k_bias, v_bias) = if let Some(ref bias) = qkv_bias {
                 let b = bias.as_f32()?;

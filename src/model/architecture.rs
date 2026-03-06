@@ -573,6 +573,7 @@ impl Architecture {
                 | Self::Falcon
                 | Self::MPT
                 | Self::OPT
+                | Self::Phi2
                 | Self::Bert
                 | Self::ModernBert
                 | Self::NomicBert

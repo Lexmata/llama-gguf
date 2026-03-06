@@ -88,6 +88,7 @@ impl MetalContext {
             ("scale", "scale_f32"),
             ("silu", "silu_f32"),
             ("gelu", "gelu_f32"),
+            ("layer_norm", "layer_norm_f32"),
             ("softmax_max", "softmax_max_f32"),
             ("softmax_exp", "softmax_exp_f32"),
             ("softmax_div", "softmax_div_f32"),

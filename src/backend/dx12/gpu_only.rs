@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crate::backend::cpu::simd;
 use crate::backend::{BackendError, BackendResult};
 use crate::model::layers::{AttentionLayer, FfnLayer, TransformerLayer};
-use crate::model::LlamaModel;
+use crate::model::{Architecture, LlamaModel};
 use crate::tensor::{DType, Tensor};
 
 use super::context::{Dx12Context, GpuBuffer};
@@ -39,6 +39,8 @@ struct Dx12WeightStore {
     f32_weights: HashMap<String, WeightEntry>,
     quant_weights: HashMap<String, QuantEntry>,
     total_bytes: usize,
+    /// CPU cache for LayerNorm weights/biases (used by CPU fallback)
+    cpu_f32_cache: HashMap<String, Vec<f32>>,
 }
 
 impl Dx12WeightStore {
@@ -47,7 +49,16 @@ impl Dx12WeightStore {
             f32_weights: HashMap::new(),
             quant_weights: HashMap::new(),
             total_bytes: 0,
+            cpu_f32_cache: HashMap::new(),
         }
+    }
+
+    fn store_cpu_f32(&mut self, name: &str, data: Vec<f32>) {
+        self.cpu_f32_cache.insert(name.to_string(), data);
+    }
+
+    fn get_cpu_f32(&self, name: &str) -> Option<&Vec<f32>> {
+        self.cpu_f32_cache.get(name)
     }
 
     fn upload_f32(
@@ -133,6 +144,8 @@ struct InferenceConfig {
     freq_base: f32,
     freq_scale: f32,
     expert_intermediate: usize,
+    final_logit_softcap: f32,
+    is_gemma: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +207,7 @@ impl Dx12GpuInference {
             layers,
             norm,
             output,
-            _architecture,
+            architecture,
             _recurrent_mask,
             _deltanet_config,
         ) = model.into_parts();
@@ -211,7 +224,12 @@ impl Dx12GpuInference {
             upload_layer_weights(&ctx, &mut weights, i, layer)?;
         }
 
-        weights.upload_f32(&ctx, "output_norm.weight", &norm.weight)?;
+        weights.upload_f32(&ctx, "output_norm.weight", norm.weight())?;
+        if let Some(bias) = norm.bias() {
+            weights.store_cpu_f32("output_norm.weight", norm.weight().as_f32()?.to_vec());
+            weights.store_cpu_f32("output_norm.bias", bias.as_f32()?.to_vec());
+            weights.upload_f32(&ctx, "output_norm.bias", bias)?;
+        }
         weights.upload_auto(&ctx, "output.weight", &output.weight)?;
         if let Some(ref bias) = output.bias {
             weights.upload_f32(&ctx, "output.bias", bias)?;
@@ -243,6 +261,8 @@ impl Dx12GpuInference {
             freq_base: model_config.rope_config.freq_base,
             freq_scale: model_config.rope_config.freq_scale,
             expert_intermediate,
+            final_logit_softcap: model_config.final_logit_softcap,
+            is_gemma: architecture.is_gemma(),
         };
 
         let cpu_embeddings = if token_embedding.dtype() == DType::F32 {
@@ -267,7 +287,7 @@ impl Dx12GpuInference {
         let residual = ctx.create_persistent_buffer(config.hidden_size)?;
         let ffn_gate = ctx.create_persistent_buffer(config.intermediate_size)?;
         let ffn_up = ctx.create_persistent_buffer(config.intermediate_size)?;
-        let ffn_down = ctx.create_persistent_buffer(config.hidden_size)?;
+        let ffn_down = ctx.create_persistent_buffer(config.intermediate_size)?;
         let logits = ctx.create_persistent_buffer(config.vocab_size)?;
         let dequant_scratch = ctx.create_persistent_buffer(dequant_scratch_floats)?;
 
@@ -309,7 +329,10 @@ impl Dx12GpuInference {
         let moe_expert_up = ctx.create_persistent_buffer(expert_intermediate)?;
         let moe_expert_down = ctx.create_persistent_buffer(config.hidden_size)?;
         let moe_expert_out = ctx.create_persistent_buffer(config.hidden_size)?;
-        let moe_temp = ctx.create_persistent_buffer(config.hidden_size)?;
+        let scratch_size = config.hidden_size
+            .max(config.intermediate_size)
+            .max(expert_intermediate);
+        let moe_temp = ctx.create_persistent_buffer(scratch_size)?;
 
         let rms_max_workgroups = ((config.hidden_size + 255) / 256).max(1);
         let rms_partial_buf = ctx.create_persistent_buffer(rms_max_workgroups)?;
@@ -369,10 +392,19 @@ impl Dx12GpuInference {
             self.process_layer(layer_idx)?;
         }
 
-        self.rms_norm_gpu("output_norm.weight", BufRef::Hidden, BufRef::HiddenNorm)?;
+        self.norm_gpu("output_norm.weight", "output_norm.bias", BufRef::Hidden, BufRef::HiddenNorm)?;
         self.linear_gpu("output.weight", None, BufRef::HiddenNorm, BufRef::Logits)?;
 
-        let logits = self.ctx.read_persistent_buffer(&self.logits, self.config.vocab_size)?;
+        let mut logits = self.ctx.read_persistent_buffer(&self.logits, self.config.vocab_size)?;
+
+        // Final logit softcapping (Gemma2): logits = cap * tanh(logits / cap)
+        if self.config.final_logit_softcap > 0.0 {
+            let cap = self.config.final_logit_softcap;
+            for v in logits.iter_mut() {
+                *v = cap * (*v / cap).tanh();
+            }
+        }
+
         self.pos += 1;
         Ok(logits)
     }
@@ -429,7 +461,16 @@ impl Dx12GpuInference {
     fn embed_token(&mut self, token_id: u32) -> BackendResult<()> {
         let hs = self.config.hidden_size;
         let offset = token_id as usize * hs;
-        self.ctx.write_to_persistent_buffer(&self.hidden, &self.cpu_embeddings[offset..offset + hs])
+        if self.config.is_gemma {
+            let scale = (hs as f32).sqrt();
+            let scaled: Vec<f32> = self.cpu_embeddings[offset..offset + hs]
+                .iter()
+                .map(|v| v * scale)
+                .collect();
+            self.ctx.write_to_persistent_buffer(&self.hidden, &scaled)
+        } else {
+            self.ctx.write_to_persistent_buffer(&self.hidden, &self.cpu_embeddings[offset..offset + hs])
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -438,12 +479,21 @@ impl Dx12GpuInference {
 
     fn process_layer(&mut self, layer_idx: usize) -> BackendResult<()> {
         let hs = self.config.hidden_size;
+        let is_parallel = self.layers[layer_idx].use_parallel_residual;
 
-        self.rms_norm_gpu(
+        // Attention norm
+        self.norm_gpu(
             &format!("blk.{}.attn_norm.weight", layer_idx),
+            &format!("blk.{}.attn_norm.bias", layer_idx),
             BufRef::Hidden,
             BufRef::HiddenNorm,
         )?;
+
+        if matches!(self.layers[layer_idx].attn_layer, AttentionLayer::Mamba) {
+            return Err(BackendError::OperationFailed(
+                "Mamba SSM not yet supported on DX12 GPU".into(),
+            ));
+        }
 
         if self.has_attention[layer_idx] {
             self.attention_forward(layer_idx)?;
@@ -454,28 +504,87 @@ impl Dx12GpuInference {
             )));
         }
 
-        self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
-        self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
-
-        let ffn_norm_name = if self.layers[layer_idx].post_attn_norm.is_some() {
-            format!("blk.{}.post_attention_norm.weight", layer_idx)
-        } else {
-            format!("blk.{}.ffn_norm.weight", layer_idx)
-        };
-        self.rms_norm_gpu(&ffn_norm_name, BufRef::Hidden, BufRef::HiddenNorm)?;
-
-        match &self.layers[layer_idx].ffn_layer {
-            FfnLayer::Dense(_) => self.dense_ffn_forward(layer_idx)?,
-            FfnLayer::NoGate(_) => {
-                return Err(BackendError::OperationFailed(
-                    "NoGate FFN not yet supported on DX12 GPU".into(),
-                ));
-            }
-            FfnLayer::Moe(_) => self.moe_forward(layer_idx)?,
+        // Identity (Mamba): output = x + ssm(norm(x)), skip FFN
+        if matches!(&self.layers[layer_idx].ffn_layer, FfnLayer::Identity) {
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+            return Ok(());
         }
 
-        self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
-        self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+        if is_parallel {
+            // Parallel residual: output = x + attn(norm(x)) + ffn(norm(x))
+            // attn output is in hidden_norm; save it to ffn_down (scratch)
+            self.ctx.copy_buffer(&self.hidden_norm, &self.ffn_down, bytes_of_f32(hs))?;
+
+            // Re-run attn_norm since attention_forward overwrote hidden_norm
+            self.norm_gpu(
+                &format!("blk.{}.attn_norm.weight", layer_idx),
+                &format!("blk.{}.attn_norm.bias", layer_idx),
+                BufRef::Hidden,
+                BufRef::HiddenNorm,
+            )?;
+
+            // FFN
+            match &self.layers[layer_idx].ffn_layer {
+                FfnLayer::Identity => unreachable!(),
+                FfnLayer::Dense(_) => self.dense_ffn_forward(layer_idx)?,
+                FfnLayer::NoGate(ffn) => self.nogate_ffn_forward(layer_idx, ffn.use_gelu)?,
+                FfnLayer::Moe(_) => self.moe_forward(layer_idx)?,
+            }
+
+            // hidden = residual + attn_out (ffn_down) + ffn_out (hidden_norm)
+            self.dispatch_add(&self.residual, &self.ffn_down, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+        } else {
+            // Serial residual
+            // Post-attention normalization: normalize attention output BEFORE adding residual
+            if self.layers[layer_idx].post_attn_norm.is_some() {
+                self.norm_gpu(
+                    &format!("blk.{}.post_attention_norm.weight", layer_idx),
+                    &format!("blk.{}.post_attention_norm.bias", layer_idx),
+                    BufRef::HiddenNorm,
+                    BufRef::FfnDown,
+                )?;
+                self.ctx.copy_buffer(&self.ffn_down, &self.hidden_norm, bytes_of_f32(hs))?;
+            }
+
+            // h = x + (post_attn_normed) attn_out
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+
+            // FFN norm
+            self.norm_gpu(
+                &format!("blk.{}.ffn_norm.weight", layer_idx),
+                &format!("blk.{}.ffn_norm.bias", layer_idx),
+                BufRef::Hidden,
+                BufRef::HiddenNorm,
+            )?;
+
+            // FFN
+            match &self.layers[layer_idx].ffn_layer {
+                FfnLayer::Identity => unreachable!(),
+                FfnLayer::Dense(_) => self.dense_ffn_forward(layer_idx)?,
+                FfnLayer::NoGate(ffn) => self.nogate_ffn_forward(layer_idx, ffn.use_gelu)?,
+                FfnLayer::Moe(_) => self.moe_forward(layer_idx)?,
+            }
+
+            // Post-FFN normalization (Gemma2): normalize FFN output before residual
+            if self.layers[layer_idx].post_ffn_norm.is_some() {
+                self.norm_gpu(
+                    &format!("blk.{}.post_ffw_norm.weight", layer_idx),
+                    &format!("blk.{}.post_ffw_norm.bias", layer_idx),
+                    BufRef::HiddenNorm,
+                    BufRef::FfnDown,
+                )?;
+                self.ctx.copy_buffer(&self.ffn_down, &self.hidden_norm, bytes_of_f32(hs))?;
+            }
+
+            // FFN residual add
+            self.dispatch_add(&self.residual, &self.hidden_norm, &self.hidden)?;
+            self.ctx.copy_buffer(&self.hidden, &self.residual, bytes_of_f32(hs))?;
+        }
 
         Ok(())
     }
@@ -496,26 +605,34 @@ impl Dx12GpuInference {
         let scale = attn.scale;
         let use_neox = attn.use_neox_rope;
 
+        let q_bias_name = format!("blk.{}.attn_q.bias", layer_idx);
+        let k_bias_name = format!("blk.{}.attn_k.bias", layer_idx);
+        let v_bias_name = format!("blk.{}.attn_v.bias", layer_idx);
+        let q_bias = self.weights.contains(&q_bias_name).then_some(q_bias_name.as_str());
+        let k_bias = self.weights.contains(&k_bias_name).then_some(k_bias_name.as_str());
+        let v_bias = self.weights.contains(&v_bias_name).then_some(v_bias_name.as_str());
+
         self.linear_gpu(
             &format!("blk.{}.attn_q.weight", layer_idx),
-            Some(&format!("blk.{}.attn_q.bias", layer_idx)),
+            q_bias,
             BufRef::HiddenNorm,
             BufRef::AttnQ,
         )?;
         self.linear_gpu(
             &format!("blk.{}.attn_k.weight", layer_idx),
-            Some(&format!("blk.{}.attn_k.bias", layer_idx)),
+            k_bias,
             BufRef::HiddenNorm,
             BufRef::AttnK,
         )?;
         self.linear_gpu(
             &format!("blk.{}.attn_v.weight", layer_idx),
-            Some(&format!("blk.{}.attn_v.bias", layer_idx)),
+            v_bias,
             BufRef::HiddenNorm,
             BufRef::AttnV,
         )?;
 
-        self.dispatch_rope(num_heads, num_kv_heads, kl, self.pos, use_neox)?;
+        let rope_dims = attn.rope_dims;
+        self.dispatch_rope(num_heads, num_kv_heads, kl, self.pos, use_neox, rope_dims)?;
 
         // Read K/V from GPU, update KV caches
         let k_new = self.ctx.read_persistent_buffer(&self.attn_k, num_kv_heads * kl)?;
@@ -543,13 +660,15 @@ impl Dx12GpuInference {
         }
 
         let kv_len = self.pos + 1;
+        let softcap = attn.attn_logit_softcap;
         self.dispatch_attention_cached(
-            layer_idx, num_heads, num_kv_heads, kl, vl, kv_len, scale,
+            layer_idx, num_heads, num_kv_heads, kl, vl, kv_len, scale, softcap,
         )?;
 
+        let wo_bias_name = format!("blk.{}.attn_output.bias", layer_idx);
         self.linear_gpu(
             &format!("blk.{}.attn_output.weight", layer_idx),
-            None,
+            self.weights.contains(&wo_bias_name).then_some(wo_bias_name.as_str()),
             BufRef::AttnOut,
             BufRef::HiddenNorm,
         )?;
@@ -586,6 +705,38 @@ impl Dx12GpuInference {
             &format!("{}.ffn_down.weight", prefix),
             None,
             BufRef::FfnDown,
+            BufRef::HiddenNorm,
+        )?;
+
+        Ok(())
+    }
+
+    fn nogate_ffn_forward(&mut self, layer_idx: usize, use_gelu: bool) -> BackendResult<()> {
+        let prefix = format!("blk.{}", layer_idx);
+
+        let up_bias_name = format!("{}.ffn_up.bias", prefix);
+        let down_bias_name = format!("{}.ffn_down.bias", prefix);
+
+        // up = hidden_norm @ W_up (+ bias)
+        self.linear_gpu(
+            &format!("{}.ffn_up.weight", prefix),
+            self.weights.contains(&up_bias_name).then_some(up_bias_name.as_str()),
+            BufRef::HiddenNorm,
+            BufRef::FfnUp,
+        )?;
+
+        // Activation: GELU or SiLU
+        if use_gelu {
+            self.dispatch_gelu(&self.ffn_up, self.config.intermediate_size)?;
+        } else {
+            self.dispatch_silu(&self.ffn_up, self.config.intermediate_size)?;
+        }
+
+        // down projection: ffn_up @ W_down (+ bias) → hidden_norm
+        self.linear_gpu(
+            &format!("{}.ffn_down.weight", prefix),
+            self.weights.contains(&down_bias_name).then_some(down_bias_name.as_str()),
+            BufRef::FfnUp,
             BufRef::HiddenNorm,
         )?;
 
@@ -711,6 +862,54 @@ impl Dx12GpuInference {
     // -----------------------------------------------------------------------
     // Low-level dispatch helpers
     // -----------------------------------------------------------------------
+
+    /// Dispatch either RMSNorm or LayerNorm depending on whether a bias exists.
+    /// For DX12, LayerNorm uses a CPU fallback (read buffer, compute mean/var, write back)
+    /// since there is no LayerNorm shader yet.
+    fn norm_gpu(
+        &self,
+        weight_name: &str,
+        bias_name: &str,
+        input: BufRef,
+        output: BufRef,
+    ) -> BackendResult<()> {
+        if self.weights.contains(bias_name) {
+            self.layer_norm_cpu(weight_name, bias_name, input, output)
+        } else {
+            self.rms_norm_gpu(weight_name, input, output)
+        }
+    }
+
+    /// LayerNorm CPU fallback: read buffer from GPU, compute (x-mean)/std*weight+bias, write back.
+    /// Uses CPU-cached weight and bias from upload_layer_weights.
+    fn layer_norm_cpu(
+        &self,
+        weight_name: &str,
+        bias_name: &str,
+        input: BufRef,
+        output: BufRef,
+    ) -> BackendResult<()> {
+        let n = self.config.hidden_size;
+        let w_data = self.weights.get_cpu_f32(weight_name)
+            .ok_or_else(|| BackendError::OperationFailed(format!("Missing CPU cache for {}", weight_name)))?;
+        let b_data = self.weights.get_cpu_f32(bias_name)
+            .ok_or_else(|| BackendError::OperationFailed(format!("Missing CPU cache for {}", bias_name)))?;
+
+        let x_buf = self.resolve_buf(input);
+        let out_buf = self.resolve_buf(output);
+
+        let x_data = self.ctx.read_persistent_buffer(x_buf, n)?;
+
+        let mean: f32 = x_data.iter().sum::<f32>() / n as f32;
+        let var: f32 = x_data.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+        let std_inv = 1.0 / (var + self.config.norm_eps).sqrt();
+
+        let out_data: Vec<f32> = (0..n)
+            .map(|i| (x_data[i] - mean) * std_inv * w_data[i] + b_data[i])
+            .collect();
+
+        self.ctx.write_to_persistent_buffer(out_buf, &out_data)
+    }
 
     fn rms_norm_gpu(
         &self,
@@ -866,6 +1065,13 @@ impl Dx12GpuInference {
         self.ctx.copy_buffer(&self.moe_temp, buf, bytes_of_f32(n))
     }
 
+    fn dispatch_gelu(&self, buf: &GpuBuffer, n: usize) -> BackendResult<()> {
+        let root_constants = [n as u32];
+        let wg = Dx12Context::workgroup_count_1d(n, 256);
+        self.ctx.dispatch_persistent("gelu", &[buf, &self.moe_temp], &root_constants, wg)?;
+        self.ctx.copy_buffer(&self.moe_temp, buf, bytes_of_f32(n))
+    }
+
     fn dispatch_scale(&self, input: &GpuBuffer, scalar: f32, output: &GpuBuffer, n: usize) -> BackendResult<()> {
         let root_constants = [n as u32, scalar.to_bits()];
         let wg = Dx12Context::workgroup_count_1d(n, 256);
@@ -879,6 +1085,7 @@ impl Dx12GpuInference {
         head_dim: usize,
         pos: usize,
         use_neox: bool,
+        rope_dims: usize,
     ) -> BackendResult<()> {
         let root_constants = [
             num_q_heads as u32,
@@ -888,6 +1095,7 @@ impl Dx12GpuInference {
             self.config.freq_base.to_bits(),
             self.config.freq_scale.to_bits(),
             if use_neox { 1u32 } else { 0u32 },
+            rope_dims as u32,
         ];
 
         let max_heads = num_q_heads.max(num_k_heads);
@@ -904,6 +1112,7 @@ impl Dx12GpuInference {
         _vl: usize,
         kv_len: usize,
         scale: f32,
+        softcap: f32,
     ) -> BackendResult<()> {
         let k_cache = self.k_caches[layer_idx].as_ref()
             .ok_or_else(|| BackendError::OperationFailed("Missing K cache".into()))?;
@@ -917,6 +1126,7 @@ impl Dx12GpuInference {
             self.max_seq_len as u32,
             kl as u32,
             scale.to_bits(),
+            softcap.to_bits(),
         ];
 
         let wg = (num_heads as u32, 1, 1);
@@ -983,7 +1193,12 @@ fn upload_layer_weights(
     i: usize,
     layer: &TransformerLayer,
 ) -> BackendResult<()> {
-    store.upload_f32(ctx, &format!("blk.{}.attn_norm.weight", i), &layer.attn_norm.weight)?;
+    store.upload_f32(ctx, &format!("blk.{}.attn_norm.weight", i), layer.attn_norm.weight())?;
+    if let Some(bias) = layer.attn_norm.bias() {
+        store.store_cpu_f32(&format!("blk.{}.attn_norm.weight", i), layer.attn_norm.weight().as_f32()?.to_vec());
+        store.store_cpu_f32(&format!("blk.{}.attn_norm.bias", i), bias.as_f32()?.to_vec());
+        store.upload_f32(ctx, &format!("blk.{}.attn_norm.bias", i), bias)?;
+    }
 
     if let AttentionLayer::FullAttention(attn) = &layer.attn_layer {
         store.upload_auto(ctx, &format!("blk.{}.attn_q.weight", i), &attn.wq.weight)?;
@@ -1000,13 +1215,26 @@ fn upload_layer_weights(
         if let Some(ref bias) = attn.wv.bias {
             store.upload_f32(ctx, &format!("blk.{}.attn_v.bias", i), bias)?;
         }
+        if let Some(ref bias) = attn.wo.bias {
+            store.upload_f32(ctx, &format!("blk.{}.attn_output.bias", i), bias)?;
+        }
     }
 
     if let Some(ref norm) = layer.post_attn_norm {
-        store.upload_f32(ctx, &format!("blk.{}.post_attention_norm.weight", i), &norm.weight)?;
+        store.upload_f32(ctx, &format!("blk.{}.post_attention_norm.weight", i), norm.weight())?;
+        if let Some(bias) = norm.bias() {
+            store.store_cpu_f32(&format!("blk.{}.post_attention_norm.weight", i), norm.weight().as_f32()?.to_vec());
+            store.store_cpu_f32(&format!("blk.{}.post_attention_norm.bias", i), bias.as_f32()?.to_vec());
+            store.upload_f32(ctx, &format!("blk.{}.post_attention_norm.bias", i), bias)?;
+        }
     }
 
-    store.upload_f32(ctx, &format!("blk.{}.ffn_norm.weight", i), &layer.ffn_norm.weight)?;
+    store.upload_f32(ctx, &format!("blk.{}.ffn_norm.weight", i), layer.ffn_norm.weight())?;
+    if let Some(bias) = layer.ffn_norm.bias() {
+        store.store_cpu_f32(&format!("blk.{}.ffn_norm.weight", i), layer.ffn_norm.weight().as_f32()?.to_vec());
+        store.store_cpu_f32(&format!("blk.{}.ffn_norm.bias", i), bias.as_f32()?.to_vec());
+        store.upload_f32(ctx, &format!("blk.{}.ffn_norm.bias", i), bias)?;
+    }
 
     match &layer.ffn_layer {
         FfnLayer::Dense(ffn) => {
@@ -1017,6 +1245,12 @@ fn upload_layer_weights(
         FfnLayer::NoGate(ffn) => {
             store.upload_auto(ctx, &format!("blk.{}.ffn_up.weight", i), &ffn.w_up.weight)?;
             store.upload_auto(ctx, &format!("blk.{}.ffn_down.weight", i), &ffn.w_down.weight)?;
+            if let Some(ref bias) = ffn.w_up.bias {
+                store.upload_f32(ctx, &format!("blk.{}.ffn_up.bias", i), bias)?;
+            }
+            if let Some(ref bias) = ffn.w_down.bias {
+                store.upload_f32(ctx, &format!("blk.{}.ffn_down.bias", i), bias)?;
+            }
         }
         FfnLayer::Moe(moe) => {
             store.upload_auto(ctx, &format!("blk.{}.ffn_gate_inp.weight", i), &moe.router.weight)?;
@@ -1031,67 +1265,33 @@ fn upload_layer_weights(
         }
     }
 
+    if let Some(ref norm) = layer.post_ffn_norm {
+        store.upload_f32(ctx, &format!("blk.{}.post_ffw_norm.weight", i), norm.weight())?;
+        if let Some(bias) = norm.bias() {
+            store.store_cpu_f32(&format!("blk.{}.post_ffw_norm.weight", i), norm.weight().as_f32()?.to_vec());
+            store.store_cpu_f32(&format!("blk.{}.post_ffw_norm.bias", i), bias.as_f32()?.to_vec());
+            store.upload_f32(ctx, &format!("blk.{}.post_ffw_norm.bias", i), bias)?;
+        }
+    }
+
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// GpuModelWrapper: implements Model trait
+// GpuInference trait implementation
 // ---------------------------------------------------------------------------
 
-use crate::model::{Architecture, InferenceContext, Model, ModelConfig, ModelError, ModelResult};
-use std::sync::Mutex;
-
-pub struct Dx12GpuModelWrapper {
-    gpu: Mutex<Dx12GpuInference>,
-    config: ModelConfig,
-    architecture: Architecture,
-}
-
-impl Dx12GpuModelWrapper {
-    pub fn new(
-        gpu: Dx12GpuInference,
-        config: ModelConfig,
-        architecture: Architecture,
-    ) -> Self {
-        Self {
-            gpu: Mutex::new(gpu),
-            config,
-            architecture,
-        }
+impl crate::backend::GpuInference for Dx12GpuInference {
+    fn forward(&mut self, token_id: u32) -> crate::backend::BackendResult<Vec<f32>> {
+        Dx12GpuInference::forward(self, token_id)
     }
-}
-
-impl Model for Dx12GpuModelWrapper {
-    fn forward(&self, tokens: &[u32], ctx: &mut InferenceContext) -> ModelResult<Tensor> {
-        let mut gpu = self.gpu.lock().map_err(|e| {
-            ModelError::ConfigError(format!("DX12 GPU inference lock poisoned: {}", e))
-        })?;
-
-        if ctx.position == 0 && gpu.position() > 0 {
-            gpu.reset();
-        }
-
-        if tokens.is_empty() {
-            return Err(ModelError::ConfigError("No tokens to process".into()));
-        }
-
-        let last_idx = tokens.len() - 1;
-        for &token in &tokens[..last_idx] {
-            gpu.prefill_token(token)?;
-        }
-
-        let logits_vec = gpu.forward(tokens[last_idx])?;
-        ctx.position += tokens.len();
-        ctx.kv_cache.seq_len = ctx.position;
-
-        Tensor::from_f32(&logits_vec, vec![logits_vec.len()]).map_err(|e| e.into())
+    fn prefill_token(&mut self, token_id: u32) -> crate::backend::BackendResult<()> {
+        Dx12GpuInference::prefill_token(self, token_id)
     }
-
-    fn config(&self) -> &ModelConfig {
-        &self.config
+    fn reset(&mut self) {
+        Dx12GpuInference::reset(self)
     }
-
-    fn architecture(&self) -> Architecture {
-        self.architecture
+    fn position(&self) -> usize {
+        Dx12GpuInference::position(self)
     }
 }

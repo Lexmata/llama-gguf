@@ -143,6 +143,8 @@ impl MambaLayer {
         // dt = softplus(dt_raw @ ssm_dt + ssm_dt_bias) [d_inner]
         let dt = self.compute_dt(&dt_raw, backend)?;
 
+        
+
         // 5. Selective scan
         let a_data = self.ssm_a.as_f32()?;
         let d_data = self
@@ -155,9 +157,11 @@ impl MambaLayer {
         for d in 0..d_inner {
             let mut out_d = 0.0f32;
             for n in 0..d_state {
-                // A[d, n]: ssm_a is [d_state, d_inner], so A[d,n] = a_data[n * d_inner + d]
-                let a_dn = a_data[n * d_inner + d];
-                let decay = (a_dn * dt[d]).exp().min(1e10);
+                // ssm_a GGUF shape: ne[0]=d_state, ne[1]=d_inner
+                // GGUF stores -exp(A_log), i.e. already negative values.
+                // decay = exp(A * dt) where A < 0, so 0 < decay <= 1
+                let a_dn = a_data[d * d_state + n];
+                let decay = (a_dn * dt[d]).exp();
                 let idx = d * d_state + n;
                 state.ssm_state[idx] =
                     decay * state.ssm_state[idx] + b[n] * dt[d] * x_ssm[d];
@@ -201,14 +205,15 @@ impl MambaLayer {
             .unwrap_or(&[]);
 
         // Depthwise 1D causal convolution
-        // weight layout: [kernel_size, d_inner] -> conv_w[ki * d_inner + ch]
+        // GGUF weight shape: ne[0]=kernel_size, ne[1]=d_inner
+        // Data layout: d_inner rows of kernel_size elements -> conv_w[ch * ks + ki]
         let mut out = vec![0.0f32; d_inner];
         for ch in 0..d_inner {
             let mut sum = 0.0f32;
             for ki in 0..buf_len {
-                sum += state.conv_state[ki * d_inner + ch] * conv_w[ki * d_inner + ch];
+                sum += state.conv_state[ki * d_inner + ch] * conv_w[ch * ks + ki];
             }
-            sum += x[ch] * conv_w[(ks - 1) * d_inner + ch];
+            sum += x[ch] * conv_w[ch * ks + (ks - 1)];
             out[ch] = sum + conv_b.get(ch).copied().unwrap_or(0.0);
         }
 

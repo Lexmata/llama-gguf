@@ -7,7 +7,7 @@
 use std::ops::Range;
 
 use crate::model::{LlamaModel, Model, ModelLoader, RopeType};
-use crate::model::layers::{Linear, RMSNorm};
+use crate::model::layers::{Linear, NormLayer, RMSNorm};
 
 use super::config::ClusterConfig;
 use super::model::DistributedModel;
@@ -173,8 +173,10 @@ impl Coordinator {
 
         // Extract coordinator-local components (embedding, norm, output)
         let token_embedding = model.token_embedding().clone();
-        let norm = RMSNorm::new(model.norm().weight.clone(), model.norm().eps)
-            .map_err(DistributedError::Model)?;
+        let norm = NormLayer::RMS(
+            RMSNorm::new(model.norm().weight().clone(), model.norm().eps())
+                .map_err(DistributedError::Model)?,
+        );
         let output = Linear::new(model.output().weight.clone(), model.output().bias.clone())
             .map_err(DistributedError::Model)?;
 
@@ -207,7 +209,7 @@ impl Coordinator {
 
                 tensors.push(NamedTensor {
                     name: "attn_norm.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.attn_norm.weight)),
+                    tensor: Some(tensor_to_proto(layer.attn_norm.weight())),
                 });
 
                 if let Some(attn) = layer.attention() {
@@ -258,7 +260,7 @@ impl Coordinator {
 
                 tensors.push(NamedTensor {
                     name: "ffn_norm.weight".into(),
-                    tensor: Some(tensor_to_proto(&layer.ffn_norm.weight)),
+                    tensor: Some(tensor_to_proto(layer.ffn_norm.weight())),
                 });
 
                 if let Some(ffn) = layer.ffn() {

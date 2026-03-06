@@ -216,6 +216,45 @@ impl NormLayer {
             Self::Layer(n) => n.hidden_size,
         }
     }
+
+    pub fn weight(&self) -> &Tensor {
+        match self {
+            Self::RMS(n) => &n.weight,
+            Self::Layer(n) => &n.weight,
+        }
+    }
+
+    pub fn eps(&self) -> f32 {
+        match self {
+            Self::RMS(n) => n.eps,
+            Self::Layer(n) => n.eps,
+        }
+    }
+
+    pub fn as_rms(&self) -> Option<&RMSNorm> {
+        match self {
+            Self::RMS(n) => Some(n),
+            Self::Layer(_) => None,
+        }
+    }
+
+    pub fn as_layer_norm(&self) -> Option<&LayerNorm> {
+        match self {
+            Self::Layer(n) => Some(n),
+            Self::RMS(_) => None,
+        }
+    }
+
+    pub fn is_layer_norm(&self) -> bool {
+        matches!(self, Self::Layer(_))
+    }
+
+    pub fn bias(&self) -> Option<&Tensor> {
+        match self {
+            Self::Layer(n) => Some(&n.bias),
+            Self::RMS(_) => None,
+        }
+    }
 }
 
 /// Self-attention layer with Grouped Query Attention support
@@ -253,6 +292,9 @@ pub struct Attention {
     pub k_norm: Option<RMSNorm>,
     /// Attention logit softcap (Gemma2: 50.0, 0.0 = disabled)
     pub attn_logit_softcap: f32,
+    /// If true, partial RoPE applies to the LAST rope_dims per head [nope|rope].
+    /// If false (default), partial RoPE applies to the FIRST rope_dims [rope|nope].
+    pub rope_partial_at_end: bool,
 }
 
 impl Attention {
@@ -298,6 +340,7 @@ impl Attention {
             q_norm: None,
             k_norm: None,
             attn_logit_softcap: 0.0,
+            rope_partial_at_end: false,
         }
     }
 
@@ -334,7 +377,13 @@ impl Attention {
             q_norm: None,
             k_norm: None,
             attn_logit_softcap: 0.0,
+            rope_partial_at_end: false,
         }
+    }
+
+    /// Set whether partial RoPE applies to the end of each head (Qwen3Next)
+    pub fn set_rope_partial_at_end(&mut self, at_end: bool) {
+        self.rope_partial_at_end = at_end;
     }
 
     /// Set QK normalization layers (used by Qwen3/Qwen3Moe)
@@ -457,11 +506,12 @@ impl Attention {
             }
         }
 
-        // Partial RoPE: rotate only the LAST `rope_dims` dimensions per head.
-        // Per-head layout: [nope(kl - rope_dims) | rope(rope_dims)]
-        // This matches llama.cpp's Qwen3Next: Qnope = first dims, Qrope = last dims.
+        // Partial RoPE: rotate only `rope_dims` dimensions per head.
+        // Two layouts:
+        //   rope_partial_at_end=true  (Qwen3Next): [nope | rope] - rotate LAST dims
+        //   rope_partial_at_end=false (Phi-2, etc): [rope | nope] - rotate FIRST dims
         if self.rope_dims > 0 && self.rope_dims < kl {
-            let nope_dims = kl - self.rope_dims;
+            let rope_offset = if self.rope_partial_at_end { kl - self.rope_dims } else { 0 };
             let q_data = q_reshaped.as_f32()?.to_vec();
             let k_data = k_reshaped.as_f32()?.to_vec();
 
@@ -469,13 +519,13 @@ impl Attention {
             let mut k_rope = vec![0.0f32; self.num_kv_heads * self.rope_dims];
 
             for h in 0..self.num_heads {
-                let src = h * kl + nope_dims;
+                let src = h * kl + rope_offset;
                 let dst = h * self.rope_dims;
                 q_rope[dst..dst + self.rope_dims]
                     .copy_from_slice(&q_data[src..src + self.rope_dims]);
             }
             for h in 0..self.num_kv_heads {
-                let src = h * kl + nope_dims;
+                let src = h * kl + rope_offset;
                 let dst = h * self.rope_dims;
                 k_rope[dst..dst + self.rope_dims]
                     .copy_from_slice(&k_data[src..src + self.rope_dims]);
@@ -501,13 +551,13 @@ impl Attention {
             let k_out = k_reshaped.as_f32_mut()?;
 
             for h in 0..self.num_heads {
-                let dst = h * kl + nope_dims;
+                let dst = h * kl + rope_offset;
                 let src = h * self.rope_dims;
                 q_out[dst..dst + self.rope_dims]
                     .copy_from_slice(&q_rope_out[src..src + self.rope_dims]);
             }
             for h in 0..self.num_kv_heads {
-                let dst = h * kl + nope_dims;
+                let dst = h * kl + rope_offset;
                 let src = h * self.rope_dims;
                 k_out[dst..dst + self.rope_dims]
                     .copy_from_slice(&k_rope_out[src..src + self.rope_dims]);
@@ -766,7 +816,7 @@ impl NoGateFeedForward {
     }
 }
 
-/// FFN variant: either dense FFN, non-gated FFN, or Mixture of Experts
+/// FFN variant: either dense FFN, non-gated FFN, Mixture of Experts, or none (Mamba)
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum FfnLayer {
@@ -776,6 +826,8 @@ pub enum FfnLayer {
     NoGate(NoGateFeedForward),
     /// Mixture of Experts
     Moe(super::moe::MoeLayer),
+    /// No FFN (pure SSM layers like Mamba)
+    Identity,
 }
 
 /// Attention variant: full softmax attention, delta-net, or Mamba SSM.
@@ -794,17 +846,17 @@ pub enum AttentionLayer {
 #[derive(Debug)]
 pub struct TransformerLayer {
     /// Attention normalization
-    pub attn_norm: RMSNorm,
+    pub attn_norm: NormLayer,
     /// Attention: either full softmax or delta-net recurrent
     pub attn_layer: AttentionLayer,
     /// Optional post-attention normalization (Qwen3Next)
-    pub post_attn_norm: Option<RMSNorm>,
+    pub post_attn_norm: Option<NormLayer>,
     /// FFN normalization
-    pub ffn_norm: RMSNorm,
+    pub ffn_norm: NormLayer,
     /// Feed-forward network (dense, non-gated, or MoE)
     pub ffn_layer: FfnLayer,
     /// Optional post-FFN normalization (Gemma2, Cohere2)
-    pub post_ffn_norm: Option<RMSNorm>,
+    pub post_ffn_norm: Option<NormLayer>,
     /// Layer index
     pub layer_idx: usize,
     /// Whether to use parallel residual (GPT-NeoX, GPT-J, StableLM):
@@ -825,14 +877,14 @@ impl TransformerLayer {
     pub fn ffn(&self) -> Option<&FeedForward> {
         match &self.ffn_layer {
             FfnLayer::Dense(ffn) => Some(ffn),
-            FfnLayer::NoGate(_) | FfnLayer::Moe(_) => None,
+            FfnLayer::NoGate(_) | FfnLayer::Moe(_) | FfnLayer::Identity => None,
         }
     }
 
     /// Get the MoE layer if this is not a dense or NoGate FFN layer
     pub fn moe(&self) -> Option<&super::moe::MoeLayer> {
         match &self.ffn_layer {
-            FfnLayer::Dense(_) | FfnLayer::NoGate(_) => None,
+            FfnLayer::Dense(_) | FfnLayer::NoGate(_) | FfnLayer::Identity => None,
             FfnLayer::Moe(moe) => Some(moe),
         }
     }
@@ -840,7 +892,7 @@ impl TransformerLayer {
     /// Get the NoGate FFN layer if this is not a dense or MoE layer
     pub fn no_gate_ffn(&self) -> Option<&NoGateFeedForward> {
         match &self.ffn_layer {
-            FfnLayer::Dense(_) | FfnLayer::Moe(_) => None,
+            FfnLayer::Dense(_) | FfnLayer::Moe(_) | FfnLayer::Identity => None,
             FfnLayer::NoGate(ffn) => Some(ffn),
         }
     }
@@ -923,25 +975,36 @@ impl TransformerLayer {
             0
         };
 
-        if self.use_parallel_residual {
-            // Parallel residual (GPT-NeoX, GPT-J, StableLM):
-            // output = x + attn(norm(x)) + ffn(norm(x))
-            // Both branches use the same norm_out (computed from x)
-            let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
-            self.ffn_norm.forward(x, &mut ffn_norm_out, backend)?;
+        if matches!(self.ffn_layer, FfnLayer::Identity) {
+            // Pure SSM (Mamba): output = x + ssm(norm(x)), no FFN
+            let mut out = attn_out;
+            {
+                let out_data = out.as_f32_mut()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for (o, &xv) in out_data.iter_mut().zip(x_slice.iter()) {
+                    *o += xv;
+                }
+            }
+            return Ok(out);
+        }
 
+        if self.use_parallel_residual {
+            // Parallel residual (GPT-NeoX, GPT-J, Phi-2, StableLM):
+            // output = x + attn(norm(x)) + ffn(norm(x))
+            // Both branches use the SAME norm_out (attn_norm applied to x).
             let mut ffn_out = match &self.ffn_layer {
                 FfnLayer::Dense(ffn) => {
                     let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
-                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    ffn.forward(&norm_out, &mut out, backend)?;
                     out
                 }
                 FfnLayer::NoGate(ffn) => {
                     let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
-                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    ffn.forward(&norm_out, &mut out, backend)?;
                     out
                 }
-                FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+                FfnLayer::Moe(moe) => moe.forward(&norm_out, backend)?,
+                FfnLayer::Identity => unreachable!(),
             };
 
             // output = x + attn_out + ffn_out
@@ -992,6 +1055,7 @@ impl TransformerLayer {
                     out
                 }
                 FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+                FfnLayer::Identity => unreachable!(),
             };
 
             if let Some(ref norm) = self.post_ffn_norm {

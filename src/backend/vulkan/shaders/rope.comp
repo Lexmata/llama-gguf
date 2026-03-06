@@ -15,16 +15,18 @@ layout(push_constant) uniform Params {
     float freq_base;
     float freq_scale;
     int use_neox; // 0 = normal, 1 = NeoX style
+    int rope_dims; // number of dimensions to rotate (may be < head_dim for partial RoPE)
 };
 
 void main() {
     uint head_idx = gl_WorkGroupID.x;
     uint pair_idx = gl_LocalInvocationID.x;
 
-    if (pair_idx >= head_dim / 2) return;
+    int half_rope = rope_dims / 2;
+    if (pair_idx >= half_rope) return;
 
     // Compute frequency for this dimension pair
-    float freq = freq_scale / pow(freq_base, float(2 * pair_idx) / float(head_dim));
+    float freq = freq_scale / pow(freq_base, float(2 * pair_idx) / float(rope_dims));
     float angle = float(position) * freq;
     float cos_val = cos(angle);
     float sin_val = sin(angle);
@@ -34,9 +36,9 @@ void main() {
         uint base = head_idx * head_dim;
         uint i0, i1;
         if (use_neox != 0) {
-            // NeoX: first half + second half
+            // NeoX: first half + second half (within rope_dims region)
             i0 = base + pair_idx;
-            i1 = base + pair_idx + head_dim / 2;
+            i1 = base + pair_idx + half_rope;
         } else {
             // Normal: consecutive pairs
             i0 = base + 2 * pair_idx;
@@ -55,7 +57,7 @@ void main() {
         uint i0, i1;
         if (use_neox != 0) {
             i0 = base + pair_idx;
-            i1 = base + pair_idx + head_dim / 2;
+            i1 = base + pair_idx + half_rope;
         } else {
             i0 = base + 2 * pair_idx;
             i1 = base + 2 * pair_idx + 1;

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::model::layers::{Attention, FeedForward, FfnLayer, Linear, RMSNorm, TransformerLayer};
+use crate::model::layers::{Attention, FeedForward, FfnLayer, Linear, NormLayer, RMSNorm, TransformerLayer};
 use crate::model::{Architecture, LlamaModel, ModelConfig, RopeType};
 use crate::tensor::{DType, Tensor};
 
@@ -145,7 +145,7 @@ impl OnnxModelLoader {
 
         // Load final normalization
         let norm_weight = self.load_mapped_tensor(&name_map, "output_norm.weight")?;
-        let norm = RMSNorm::new(norm_weight, self.config.norm_eps)?;
+        let norm = NormLayer::RMS(RMSNorm::new(norm_weight, self.config.norm_eps)?);
 
         // Load output projection (may be tied to embeddings)
         let output =
@@ -179,7 +179,7 @@ impl OnnxModelLoader {
         // Attention normalization
         let attn_norm_weight =
             self.load_mapped_tensor(name_map, &format!("{}.attn_norm.weight", prefix))?;
-        let attn_norm = RMSNorm::new(attn_norm_weight, self.config.norm_eps)?;
+        let attn_norm = NormLayer::RMS(RMSNorm::new(attn_norm_weight, self.config.norm_eps)?);
 
         // Attention projections (with optional biases)
         let wq_bias = self.try_load_mapped_tensor(name_map, &format!("{}.attn_q.bias", prefix));
@@ -220,7 +220,7 @@ impl OnnxModelLoader {
         // FFN normalization
         let ffn_norm_weight =
             self.load_mapped_tensor(name_map, &format!("{}.ffn_norm.weight", prefix))?;
-        let ffn_norm = RMSNorm::new(ffn_norm_weight, self.config.norm_eps)?;
+        let ffn_norm = NormLayer::RMS(RMSNorm::new(ffn_norm_weight, self.config.norm_eps)?);
 
         // FFN projections
         let w_gate = Linear::new(

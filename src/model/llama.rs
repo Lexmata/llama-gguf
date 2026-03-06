@@ -15,7 +15,7 @@ use crate::tensor::{DType, Tensor};
 use super::config::ModelConfig;
 use super::deltanet::RecurrentConfig;
 use super::error::{ModelError, ModelResult};
-use super::layers::{Linear, RMSNorm, TransformerLayer};
+use super::layers::{Linear, NormLayer, TransformerLayer};
 use super::deltanet::DeltaNetConfig;
 use super::{Architecture, InferenceContext, Model};
 
@@ -27,8 +27,8 @@ pub struct LlamaModel {
     token_embedding: Tensor,
     /// Transformer layers
     layers: Vec<TransformerLayer>,
-    /// Final RMS normalization
-    norm: RMSNorm,
+    /// Final normalization (RMSNorm or LayerNorm depending on architecture)
+    norm: NormLayer,
     /// Output projection (may share weights with embedding)
     output: Linear,
     /// Model architecture variant
@@ -45,7 +45,7 @@ impl LlamaModel {
         config: ModelConfig,
         token_embedding: Tensor,
         layers: Vec<TransformerLayer>,
-        norm: RMSNorm,
+        norm: NormLayer,
         output: Linear,
         architecture: Architecture,
     ) -> ModelResult<Self> {
@@ -141,7 +141,7 @@ impl LlamaModel {
         ModelConfig,
         Tensor,
         Vec<TransformerLayer>,
-        RMSNorm,
+        NormLayer,
         Linear,
         Architecture,
         Vec<bool>,
@@ -160,7 +160,7 @@ impl LlamaModel {
     }
 
     /// Get final normalization layer
-    pub fn norm(&self) -> &RMSNorm {
+    pub fn norm(&self) -> &NormLayer {
         &self.norm
     }
 
@@ -317,11 +317,6 @@ impl Model for LlamaModel {
             }
         }
 
-        // Layer-first ordering: process ALL tokens through each layer before
-        // moving to the next. This keeps each layer's weight matrices hot in
-        // CPU cache across all tokens, dramatically reducing memory bandwidth
-        // during prefill (each ~32MB weight set is read once from RAM instead
-        // of once per token).
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             for (token_offset, hidden) in hiddens.iter_mut().enumerate() {
                 let current_pos = ctx.position + token_offset;

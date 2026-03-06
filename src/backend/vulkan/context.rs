@@ -256,6 +256,12 @@ impl VulkanContext {
                 4,
             ),
             (
+                "layer_norm",
+                include_bytes!(concat!(env!("OUT_DIR"), "/layer_norm.spv")),
+                4,
+                16,
+            ),
+            (
                 "softmax_max",
                 include_bytes!(concat!(env!("OUT_DIR"), "/softmax_max.spv")),
                 2,

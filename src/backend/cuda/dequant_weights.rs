@@ -246,7 +246,7 @@ pub fn upload_model_weights(
     layers: &[crate::model::TransformerLayer],
     embedding: &Tensor,
     output: &crate::model::layers::Linear,
-    norm: &crate::model::layers::RMSNorm,
+    norm: &crate::model::layers::NormLayer,
 ) -> BackendResult<GpuWeightStore> {
     use crate::model::layers::AttentionLayer;
 
@@ -292,6 +292,49 @@ pub fn upload_model_weights(
                     store.upload(&format!("blk.{}.attn_v.bias", i), bias)?;
                 }
             }
+            AttentionLayer::Mamba(mb) => {
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ssm_in.weight", i),
+                    &mb.ssm_in.weight,
+                )?;
+                if let Some(ref bias) = mb.ssm_in.bias {
+                    store.upload(&format!("blk.{}.ssm_in.bias", i), bias)?;
+                }
+                store.upload(
+                    &format!("blk.{}.ssm_conv1d.weight", i),
+                    &mb.ssm_conv1d_weight,
+                )?;
+                if let Some(ref bias) = mb.ssm_conv1d_bias {
+                    store.upload(&format!("blk.{}.ssm_conv1d.bias", i), bias)?;
+                }
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ssm_x.weight", i),
+                    &mb.ssm_x.weight,
+                )?;
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ssm_dt.weight", i),
+                    &mb.ssm_dt.weight,
+                )?;
+                store.upload(&format!("blk.{}.ssm_dt.bias", i), &mb.ssm_dt_bias)?;
+                store.upload(&format!("blk.{}.ssm_a", i), &mb.ssm_a)?;
+                if let Some(ref d) = mb.ssm_d {
+                    store.upload(&format!("blk.{}.ssm_d", i), d)?;
+                }
+                if let Some(ref norm) = mb.ssm_norm {
+                    store.upload(&format!("blk.{}.ssm_norm.weight", i), &norm.weight)?;
+                }
+                upload_weight(
+                    &mut store,
+                    &format!("blk.{}.ssm_out.weight", i),
+                    &mb.ssm_out.weight,
+                )?;
+                if let Some(ref bias) = mb.ssm_out.bias {
+                    store.upload(&format!("blk.{}.ssm_out.bias", i), bias)?;
+                }
+            }
             AttentionLayer::DeltaNet(dn) => {
                 upload_weight(
                     &mut store,
@@ -328,14 +371,23 @@ pub fn upload_model_weights(
 
         store.upload(
             &format!("blk.{}.attn_norm.weight", i),
-            &layer.attn_norm.weight,
+            layer.attn_norm.weight(),
         )?;
+        if let Some(bias) = layer.attn_norm.bias() {
+            store.upload(&format!("blk.{}.attn_norm.bias", i), bias)?;
+        }
 
         if let Some(ref pan) = layer.post_attn_norm {
             store.upload(
                 &format!("blk.{}.post_attention_norm.weight", i),
-                &pan.weight,
+                pan.weight(),
             )?;
+            if let Some(bias) = pan.bias() {
+                store.upload(
+                    &format!("blk.{}.post_attention_norm.bias", i),
+                    bias,
+                )?;
+            }
         }
 
         // Dense FFN weights
@@ -357,18 +409,24 @@ pub fn upload_model_weights(
             )?;
         }
 
-        // NoGate FFN weights (fnn_up, ffn_down only)
+        // NoGate FFN weights (ffn_up, ffn_down + biases)
         if let Some(ffn) = layer.no_gate_ffn() {
             upload_weight(
                 &mut store,
                 &format!("blk.{}.ffn_up.weight", i),
                 &ffn.w_up.weight,
             )?;
+            if let Some(ref bias) = ffn.w_up.bias {
+                store.upload(&format!("blk.{}.ffn_up.bias", i), bias)?;
+            }
             upload_weight(
                 &mut store,
                 &format!("blk.{}.ffn_down.weight", i),
                 &ffn.w_down.weight,
             )?;
+            if let Some(ref bias) = ffn.w_down.bias {
+                store.upload(&format!("blk.{}.ffn_down.bias", i), bias)?;
+            }
         }
 
         // MoE router + shared expert weights
@@ -399,13 +457,21 @@ pub fn upload_model_weights(
             }
         }
 
-        store.upload(
-            &format!("blk.{}.ffn_norm.weight", i),
-            &layer.ffn_norm.weight,
-        )?;
+        if !matches!(layer.ffn_layer, crate::model::layers::FfnLayer::Identity) {
+            store.upload(
+                &format!("blk.{}.ffn_norm.weight", i),
+                layer.ffn_norm.weight(),
+            )?;
+            if let Some(bias) = layer.ffn_norm.bias() {
+                store.upload(&format!("blk.{}.ffn_norm.bias", i), bias)?;
+            }
+        }
     }
 
-    store.upload("output_norm.weight", &norm.weight)?;
+    store.upload("output_norm.weight", norm.weight())?;
+    if let Some(bias) = norm.bias() {
+        store.upload("output_norm.bias", bias)?;
+    }
 
     upload_weight(&mut store, "output.weight", &output.weight)?;
     if let Some(ref bias) = output.bias {
