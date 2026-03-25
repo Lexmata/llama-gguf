@@ -232,7 +232,8 @@ impl ModelLoader {
                 | Architecture::Phi3
         );
 
-        // Parallel residual: attention and FFN both computed from norm(x), added to residual
+        // Parallel residual: attention and FFN both computed from norm(x), added to residual.
+        // Phi-3/Phi-4/PhiMoe use sequential residual (separate attn_norm + ffn_norm).
         let use_parallel_residual = matches!(
             architecture,
             Architecture::GPTNeoX
@@ -240,8 +241,6 @@ impl ModelLoader {
                 | Architecture::StableLM
                 | Architecture::Phi
                 | Architecture::Phi2
-                | Architecture::Phi3
-                | Architecture::PhiMoe
                 | Architecture::CodeShell
         );
 
