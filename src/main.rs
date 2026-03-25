@@ -88,6 +88,11 @@ enum Commands {
         /// Path to external tokenizer (tokenizer.json or .gguf file)
         #[arg(long)]
         tokenizer: Option<String>,
+
+        /// KV cache type: f32 (default), turboquant2 (2-bit MSE), turboquant3 (3-bit MSE),
+        /// turboquant2-qjl (2-bit with QJL correction), turboquant3-qjl (3-bit with QJL)
+        #[arg(long, default_value = "f32")]
+        kv_cache_type: String,
     },
 
     /// Interactive chat mode (local model or remote server)
@@ -143,6 +148,10 @@ enum Commands {
         /// Path to external tokenizer (tokenizer.json or .gguf file)
         #[arg(long)]
         tokenizer: Option<String>,
+
+        /// KV cache type: f32 (default), turboquant2, turboquant3, turboquant2-qjl, turboquant3-qjl
+        #[arg(long, default_value = "f32")]
+        kv_cache_type: String,
     },
 
     /// Start HTTP server with OpenAI-compatible API
@@ -659,8 +668,10 @@ fn main() {
             hailo: _hailo,
             hef_dir: _hef_dir,
             tokenizer,
+            kv_cache_type,
         } => {
             let mut config = cfg.to_engine_config(Some(&model));
+            config.kv_cache_type = llama_gguf::config::parse_kv_cache_type(&kv_cache_type);
             config.max_tokens = cli_or_config(n_predict, 128, config.max_tokens);
             config.temperature = cli_or_config_f32(temperature, 0.8, config.temperature);
             config.top_k = cli_or_config(top_k, 40, config.top_k);
@@ -704,6 +715,7 @@ fn main() {
             hailo: _hailo,
             hef_dir: _hef_dir,
             tokenizer,
+            kv_cache_type,
         } => {
             // Determine server URL: --server flag > config file > none
             let server_url = server.or_else(|| cfg.server.host_url());
@@ -752,6 +764,7 @@ fn main() {
                 config.seed = seed.or(config.seed);
                 config.use_gpu = gpu || config.use_gpu;
                 config.tokenizer_path = tokenizer;
+                config.kv_cache_type = llama_gguf::config::parse_kv_cache_type(&kv_cache_type);
                 #[cfg(feature = "hailo")]
                 {
                     if _hailo {

@@ -237,6 +237,31 @@ pub trait Backend: Send + Sync {
 
         self.attention(q, &k_contig, &v_contig, out, scale)
     }
+
+    /// Compute attention with TurboQuant-compressed KV cache.
+    ///
+    /// The default implementation delegates to the cache's own CPU path
+    /// (`TurboQuantKVCache::attention_layer`). GPU backends can override
+    /// this with fused kernels that operate on compressed data directly.
+    ///
+    /// # Arguments
+    /// * `queries` - Query tensor [num_heads * key_length] (flat, after RoPE)
+    /// * `tq_cache` - The TurboQuant KV cache
+    /// * `layer_idx` - Which transformer layer
+    /// * `num_heads` - Number of attention heads
+    /// * `scale` - Attention scale factor
+    ///
+    /// Returns a Vec<f32> of shape [num_heads * value_length].
+    fn attention_turboquant(
+        &self,
+        queries: &[f32],
+        tq_cache: &crate::model::kv_turboquant::TurboQuantKVCache,
+        layer_idx: usize,
+        num_heads: usize,
+        scale: f32,
+    ) -> BackendResult<Vec<f32>> {
+        Ok(tq_cache.attention_layer(layer_idx, queries, num_heads, scale))
+    }
 }
 
 /// Get the default backend (CPU)

@@ -107,6 +107,9 @@ pub struct EngineConfig {
     /// When set, enables Hailo NPU inference in the GPU selection chain.
     #[cfg(feature = "hailo")]
     pub hailo_config: Option<crate::backend::hailo::HailoConfig>,
+
+    /// KV cache type for memory-efficient inference.
+    pub kv_cache_type: crate::model::KVCacheType,
 }
 
 impl Default for EngineConfig {
@@ -124,6 +127,7 @@ impl Default for EngineConfig {
             max_context_len: None,
             #[cfg(feature = "hailo")]
             hailo_config: None,
+            kv_cache_type: crate::model::KVCacheType::F32,
         }
     }
 }
@@ -852,9 +856,22 @@ impl Engine {
     /// The prompt is automatically wrapped with the detected chat template
     /// unless it already contains chat formatting tokens.
     ///
+    /// Create an InferenceContext respecting the configured KV cache type.
+    pub fn create_inference_context(&self) -> InferenceContext {
+        if self.engine_config.kv_cache_type.is_turboquant() {
+            InferenceContext::new_with_cache_type(
+                &self.config,
+                self.backend.clone(),
+                self.engine_config.kv_cache_type,
+            )
+        } else {
+            self.model.create_context(self.backend.clone())
+        }
+    }
+
     /// Returns the generated text (not including the prompt).
     pub fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, EngineError> {
-        let mut ctx = self.model.create_context(self.backend.clone());
+        let mut ctx = self.create_inference_context();
         let mut sampler = Sampler::new(self.sampler_config.clone(), self.config.vocab_size);
 
         // Wrap prompt with chat template
@@ -926,7 +943,7 @@ impl Engine {
 
     /// Extract embeddings from text using the model.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
-        let mut ctx = self.model.create_context(self.backend.clone());
+        let mut ctx = self.create_inference_context();
         let embed_config = EmbeddingConfig::default();
         let extractor = EmbeddingExtractor::new(embed_config, &self.config);
         let embedding =
@@ -956,7 +973,7 @@ pub struct GenerationStream<'a> {
 
 impl<'a> GenerationStream<'a> {
     fn new(engine: &'a Engine, prompt: &str, max_tokens: usize) -> Self {
-        let ctx = engine.model.create_context(engine.backend.clone());
+        let ctx = engine.create_inference_context();
         let sampler = Sampler::new(engine.sampler_config.clone(), engine.config.vocab_size);
 
         let formatted = engine.chat_template.wrap_prompt(prompt);
@@ -1105,7 +1122,7 @@ pub struct ChatEngine {
 impl ChatEngine {
     /// Create a new chat engine from a loaded [`Engine`].
     pub fn new(engine: Engine, system_prompt: Option<String>) -> Self {
-        let ctx = engine.model.create_context(engine.backend.clone());
+        let ctx = engine.create_inference_context();
         let sampler = Sampler::new(engine.sampler_config.clone(), engine.config.vocab_size);
 
         Self {

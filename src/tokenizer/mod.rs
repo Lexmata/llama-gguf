@@ -1974,7 +1974,7 @@ mod tests {
 
     #[test]
     fn test_gpt2_unicode_to_byte_table() {
-        let table = build_gpt2_unicode_to_byte();
+        let (table, _) = build_gpt2_mappings();
         assert_eq!(table.len(), 256);
 
         // Printable ASCII maps to itself
@@ -1995,7 +1995,7 @@ mod tests {
 
     #[test]
     fn test_gpt2_decode_space_and_emoji() {
-        let table = build_gpt2_unicode_to_byte();
+        let (table, _) = build_gpt2_mappings();
 
         // "ĠHello" should decode to " Hello"
         let bytes: Vec<u8> = "ĠHello".chars().map(|c| table[&c]).collect();
@@ -2179,17 +2179,21 @@ mod tests {
                 "continuing_subword_prefix": "##",
                 "vocab": {
                     "[UNK]": 0,
-                    "un": 1,
-                    "##know": 2,
-                    "##n": 3,
-                    "unknown": 4,
-                    "the": 5,
-                    "##s": 6
+                    "[BOS]": 1,
+                    "[EOS]": 2,
+                    "un": 3,
+                    "##know": 4,
+                    "##n": 5,
+                    "unknown": 6,
+                    "the": 7,
+                    "##s": 8
                 }
             },
             "pre_tokenizer": { "type": "Whitespace" },
             "added_tokens": [
-                {"id": 0, "content": "[UNK]", "special": true}
+                {"id": 0, "content": "[UNK]", "special": true},
+                {"id": 1, "content": "[BOS]", "special": true},
+                {"id": 2, "content": "[EOS]", "special": true}
             ]
         }"###;
 
@@ -2197,15 +2201,15 @@ mod tests {
 
         // "unknown" is a direct vocabulary match
         let tokens = tok.encode("unknown", false).unwrap();
-        assert_eq!(tokens, vec![4]);
+        assert_eq!(tokens, vec![6]);
 
-        // "the" should encode to [5]
+        // "the" should encode to [7]
         let tokens = tok.encode("the", false).unwrap();
-        assert_eq!(tokens, vec![5]);
+        assert_eq!(tokens, vec![7]);
 
         // "thes" should split to "the" + "##s"
         let tokens = tok.encode("thes", false).unwrap();
-        assert_eq!(tokens, vec![5, 6]);
+        assert_eq!(tokens, vec![7, 8]);
     }
 
     #[test]
@@ -2216,6 +2220,8 @@ mod tests {
                 "unk_id": 0,
                 "vocab": [
                     ["<unk>", 0.0],
+                    ["<s>", 0.0],
+                    ["</s>", 0.0],
                     ["a", -1.0],
                     ["b", -1.0],
                     ["c", -1.0],
@@ -2226,7 +2232,9 @@ mod tests {
             },
             "pre_tokenizer": { "type": "Whitespace" },
             "added_tokens": [
-                {"id": 0, "content": "<unk>", "special": true}
+                {"id": 0, "content": "<unk>", "special": true},
+                {"id": 1, "content": "<s>", "special": true},
+                {"id": 2, "content": "</s>", "special": true}
             ]
         }"#;
 
@@ -2235,7 +2243,7 @@ mod tests {
         // "abc" should prefer the single token [abc] (score -0.1) over
         // [a,bc] (score -1.5) or [ab,c] (score -1.5) or [a,b,c] (score -3.0)
         let tokens = tok.encode("abc", false).unwrap();
-        assert_eq!(tokens, vec![6]); // id 6 = "abc"
+        assert_eq!(tokens, vec![8]); // id 8 = "abc"
     }
 
     #[test]
@@ -2244,14 +2252,17 @@ mod tests {
             "model": {
                 "type": "BPE",
                 "vocab": {
-                    "h": 0,
-                    "e": 1,
-                    "l": 2,
-                    "o": 3,
-                    "he": 4,
-                    "ll": 5,
-                    "hello": 6,
-                    " ": 7
+                    "<s>": 0,
+                    "</s>": 1,
+                    "h": 2,
+                    "e": 3,
+                    "l": 4,
+                    "o": 5,
+                    "he": 6,
+                    "ll": 7,
+                    "hell": 8,
+                    "hello": 9,
+                    " ": 10
                 },
                 "merges": [
                     "h e",
@@ -2264,16 +2275,19 @@ mod tests {
                 "type": "ByteLevel",
                 "add_prefix_space": false
             },
-            "added_tokens": []
+            "added_tokens": [
+                {"id": 0, "content": "<s>", "special": true},
+                {"id": 1, "content": "</s>", "special": true}
+            ]
         }"#;
 
         let tok = Tokenizer::from_hf_json_str(json).unwrap();
         assert_eq!(tok.tokenizer_type, TokenizerType::BPE);
         assert!(tok.pre_tokenizer.is_some());
 
-        // Should encode "hello" -> merge h+e=he, l+l=ll, he+ll=hell, hell+o=hello -> [6]
+        // Should encode "hello" -> merge h+e=he, l+l=ll, he+ll=hell, hell+o=hello -> [9]
         let tokens = tok.encode("hello", false).unwrap();
-        assert_eq!(tokens, vec![6]);
+        assert_eq!(tokens, vec![9]);
     }
 
     #[test]

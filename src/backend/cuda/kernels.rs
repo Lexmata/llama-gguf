@@ -1569,6 +1569,123 @@ __global__ void batched_linear(const float* x, const float* weight,
     }
 }
 
+// =========================================================================
+// TurboQuant: attention with compressed KV cache
+// =========================================================================
+
+// Compute attention scores between a full-precision query and 2-bit packed
+// quantized keys, then apply softmax and return weighted sum of dequantized
+// values. Each block handles one attention head.
+//
+// Keys are stored as packed 2-bit codebook indices (4 values per byte).
+// Values are stored identically. The codebook has 4 centroids.
+//
+// Dispatch: grid(num_heads), block(256)
+__global__ void turboquant_attention_2bit(
+    const float* q,                 // [num_heads * head_dim] — rotated query
+    const unsigned char* k_packed,  // [num_kv_heads * kv_len * packed_dim] — packed keys
+    const unsigned char* v_packed,  // [num_kv_heads * kv_len * packed_dim]
+    const float* k_centroids,       // [4] — codebook centroids for keys
+    const float* v_centroids,       // [4] — codebook centroids for values
+    const float* v_rotation_signs,  // [num_kv_heads * head_dim] — sign flip for inverse rotation
+    float* out,                     // [num_heads * head_dim]
+    int num_heads, int num_kv_heads,
+    int head_dim, int kv_len,
+    int packed_dim,                 // = (head_dim + 3) / 4
+    float scale
+) {
+    int head = blockIdx.x;
+    int tid = threadIdx.x;
+    int kv_head = head / (num_heads / num_kv_heads);
+
+    extern __shared__ float smem[];
+    float* scores = smem;                   // [kv_len]
+    float* value_accum = smem + kv_len;     // [head_dim]
+
+    const float* q_head = q + head * head_dim;
+    const unsigned char* k_base = k_packed + kv_head * kv_len * packed_dim;
+    const unsigned char* v_base = v_packed + kv_head * kv_len * packed_dim;
+
+    // Phase 1: compute attention scores
+    for (int pos = tid; pos < kv_len; pos += blockDim.x) {
+        const unsigned char* k_entry = k_base + pos * packed_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < packed_dim; d++) {
+            unsigned char packed = k_entry[d];
+            int base_d = d * 4;
+            if (base_d < head_dim) dot += q_head[base_d] * k_centroids[packed & 0x3];
+            if (base_d + 1 < head_dim) dot += q_head[base_d + 1] * k_centroids[(packed >> 2) & 0x3];
+            if (base_d + 2 < head_dim) dot += q_head[base_d + 2] * k_centroids[(packed >> 4) & 0x3];
+            if (base_d + 3 < head_dim) dot += q_head[base_d + 3] * k_centroids[(packed >> 6) & 0x3];
+        }
+        scores[pos] = dot * scale;
+    }
+    __syncthreads();
+
+    // Phase 2: online softmax (find max, compute exp, normalize)
+    float local_max = -1e30f;
+    for (int pos = tid; pos < kv_len; pos += blockDim.x) {
+        local_max = fmaxf(local_max, scores[pos]);
+    }
+    // Warp reduce max
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
+    if (tid % 32 == 0) smem[kv_len + head_dim + (tid / 32)] = local_max;
+    __syncthreads();
+    float global_max = -1e30f;
+    int num_warps_actual = (blockDim.x + 31) / 32;
+    for (int w = 0; w < num_warps_actual; w++)
+        global_max = fmaxf(global_max, smem[kv_len + head_dim + w]);
+
+    float local_sum = 0.0f;
+    for (int pos = tid; pos < kv_len; pos += blockDim.x) {
+        float e = expf(scores[pos] - global_max);
+        scores[pos] = e;
+        local_sum += e;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    if (tid % 32 == 0) smem[kv_len + head_dim + (tid / 32)] = local_sum;
+    __syncthreads();
+    float total_sum = 0.0f;
+    for (int w = 0; w < num_warps_actual; w++)
+        total_sum += smem[kv_len + head_dim + w];
+    float inv_sum = 1.0f / (total_sum + 1e-8f);
+
+    for (int pos = tid; pos < kv_len; pos += blockDim.x) {
+        scores[pos] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Phase 3: weighted sum of dequantized values
+    // Zero output accumulator
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        value_accum[d] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int pos = 0; pos < kv_len; pos++) {
+        float w = scores[pos];
+        if (w < 1e-8f) continue;
+        const unsigned char* v_entry = v_base + pos * packed_dim;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            int byte_idx = d / 4;
+            int bit_offset = (d % 4) * 2;
+            unsigned char packed = v_entry[byte_idx];
+            int idx = (packed >> bit_offset) & 0x3;
+            float deq_val = v_centroids[idx];
+            atomicAdd(&value_accum[d], w * deq_val);
+        }
+    }
+    __syncthreads();
+
+    // Write output (value_accum is in rotated space; for now, output directly)
+    float* out_head = out + head * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        out_head[d] = value_accum[d];
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -1639,6 +1756,9 @@ pub struct CudaKernels {
 
     // Flash Attention
     pub flash_attention_cached: CudaFunction,
+
+    // TurboQuant
+    pub turboquant_attention_2bit: CudaFunction,
 
     // Batched inference
     pub rope_batch: CudaFunction,
@@ -1721,6 +1841,7 @@ impl CudaKernels {
                     "mul_f16",
                     "rms_norm_f16",
                     "flash_attention_cached",
+                    "turboquant_attention_2bit",
                     "rope_batch",
                     "update_kv_cache_batch",
                     "batched_linear",
@@ -1932,6 +2053,13 @@ impl CudaKernels {
                 .ok_or_else(|| {
                     BackendError::InitializationFailed(
                         "Kernel 'flash_attention_cached' not found".into(),
+                    )
+                })?,
+            turboquant_attention_2bit: device
+                .get_func("llama_kernels", "turboquant_attention_2bit")
+                .ok_or_else(|| {
+                    BackendError::InitializationFailed(
+                        "Kernel 'turboquant_attention_2bit' not found".into(),
                     )
                 })?,
             rope_batch: device

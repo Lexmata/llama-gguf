@@ -12,6 +12,7 @@ mod architecture;
 pub mod cache;
 mod config;
 mod kv_quantized;
+pub mod kv_turboquant;
 pub mod deltanet;
 pub mod mamba;
 pub mod embeddings;
@@ -24,9 +25,12 @@ pub mod lora;
 pub mod moe;
 pub mod paged;
 pub mod speculative;
+pub mod turboquant;
 
 pub use architecture::Architecture;
 pub use kv_quantized::{KVCacheFormat, QuantizedKVCache};
+pub use kv_turboquant::TurboQuantKVCache;
+pub use turboquant::TurboQuantConfig;
 pub use cache::{
     CachedPrefix, PrefixId, PrefixSharing, PromptCache, PromptCacheConfig, PromptCacheStats,
 };
@@ -173,6 +177,47 @@ impl KVCache {
     }
 }
 
+/// Which KV cache implementation to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KVCacheType {
+    /// Standard f32 KV cache (default).
+    F32,
+    /// TurboQuant MSE: Hadamard rotation + scalar quantization (biased, lower overhead).
+    TurboQuantMSE { bits: u8 },
+    /// TurboQuant prod: MSE + QJL correction (unbiased, higher accuracy).
+    TurboQuantProd { bits: u8 },
+}
+
+impl Default for KVCacheType {
+    fn default() -> Self {
+        Self::F32
+    }
+}
+
+impl KVCacheType {
+    /// Convert to a `TurboQuantConfig` if this is a TurboQuant variant.
+    pub fn to_tq_config(&self, dim: usize) -> Option<TurboQuantConfig> {
+        match *self {
+            Self::F32 => None,
+            Self::TurboQuantMSE { bits } => Some(TurboQuantConfig {
+                bits,
+                use_qjl: false,
+                dim,
+            }),
+            Self::TurboQuantProd { bits } => Some(TurboQuantConfig {
+                bits,
+                use_qjl: true,
+                dim,
+            }),
+        }
+    }
+
+    /// Whether this is any TurboQuant variant.
+    pub fn is_turboquant(&self) -> bool {
+        !matches!(self, Self::F32)
+    }
+}
+
 /// Context for model inference
 pub struct InferenceContext {
     /// KV cache for attention
@@ -183,6 +228,8 @@ pub struct InferenceContext {
     pub position: usize,
     /// Recurrent state for delta-net layers (None if model has no SSM layers)
     pub recurrent_state: Option<RecurrentState>,
+    /// Optional TurboQuant-compressed KV cache (replaces f32 cache for attention)
+    pub tq_cache: Option<TurboQuantKVCache>,
 }
 
 impl InferenceContext {
@@ -198,6 +245,39 @@ impl InferenceContext {
             backend,
             position: 0,
             recurrent_state: None,
+            tq_cache: None,
+        }
+    }
+
+    /// Create inference context with a specific KV cache type.
+    pub fn new_with_cache_type(
+        config: &ModelConfig,
+        backend: Arc<dyn Backend>,
+        cache_type: KVCacheType,
+    ) -> Self {
+        let tq_cache = cache_type
+            .to_tq_config(config.key_length)
+            .map(|tq_config| {
+                TurboQuantKVCache::new(
+                    config.num_layers,
+                    config.num_kv_heads,
+                    config.max_seq_len,
+                    config.key_length,
+                    tq_config,
+                )
+            });
+
+        Self {
+            kv_cache: KVCache::new(
+                config.num_layers,
+                config.num_kv_heads,
+                config.max_seq_len,
+                config.key_length,
+            ),
+            backend,
+            position: 0,
+            recurrent_state: None,
+            tq_cache,
         }
     }
 
@@ -223,6 +303,7 @@ impl InferenceContext {
                 is_recurrent,
                 rc,
             )),
+            tq_cache: None,
         }
     }
 
@@ -233,6 +314,14 @@ impl InferenceContext {
         if let Some(ref mut rs) = self.recurrent_state {
             rs.reset();
         }
+        if let Some(ref mut tq) = self.tq_cache {
+            tq.reset();
+        }
+    }
+
+    /// Whether TurboQuant KV cache is active.
+    pub fn has_turboquant(&self) -> bool {
+        self.tq_cache.is_some()
     }
 }
 
@@ -267,5 +356,55 @@ pub trait Model: Send + Sync {
     /// Get maximum sequence length
     fn max_seq_len(&self) -> usize {
         self.config().max_seq_len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kv_cache_type_default() {
+        assert_eq!(KVCacheType::default(), KVCacheType::F32);
+    }
+
+    #[test]
+    fn test_kv_cache_type_is_turboquant() {
+        assert!(!KVCacheType::F32.is_turboquant());
+        assert!(KVCacheType::TurboQuantMSE { bits: 2 }.is_turboquant());
+        assert!(KVCacheType::TurboQuantProd { bits: 3 }.is_turboquant());
+    }
+
+    #[test]
+    fn test_kv_cache_type_to_tq_config() {
+        assert!(KVCacheType::F32.to_tq_config(64).is_none());
+
+        let cfg = KVCacheType::TurboQuantMSE { bits: 2 }
+            .to_tq_config(128)
+            .unwrap();
+        assert_eq!(cfg.bits, 2);
+        assert_eq!(cfg.dim, 128);
+        assert!(!cfg.use_qjl);
+
+        let cfg = KVCacheType::TurboQuantProd { bits: 3 }
+            .to_tq_config(64)
+            .unwrap();
+        assert_eq!(cfg.bits, 3);
+        assert_eq!(cfg.dim, 64);
+        assert!(cfg.use_qjl);
+    }
+
+    #[test]
+    fn test_kv_cache_type_serde_roundtrip() {
+        let types = [
+            KVCacheType::F32,
+            KVCacheType::TurboQuantMSE { bits: 2 },
+            KVCacheType::TurboQuantProd { bits: 3 },
+        ];
+        for ty in &types {
+            let json = serde_json::to_string(ty).unwrap();
+            let parsed: KVCacheType = serde_json::from_str(&json).unwrap();
+            assert_eq!(*ty, parsed);
+        }
     }
 }

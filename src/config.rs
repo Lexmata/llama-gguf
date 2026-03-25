@@ -121,6 +121,9 @@ pub struct ModelSection {
 
     /// Use GPU acceleration (CUDA/Metal/Vulkan).
     pub gpu: bool,
+
+    /// KV cache type: "f32", "turboquant2", "turboquant3", "turboquant2-qjl", "turboquant3-qjl".
+    pub kv_cache_type: String,
 }
 
 /// Generation and sampling parameters.
@@ -500,6 +503,7 @@ impl Config {
             max_context_len: None,
             #[cfg(feature = "hailo")]
             hailo_config: None,
+            kv_cache_type: parse_kv_cache_type(&self.model.kv_cache_type),
         }
     }
 
@@ -674,6 +678,7 @@ mod tests {
             model: ModelSection {
                 path: Some("/tmp/test.gguf".to_string()),
                 gpu: true,
+                ..Default::default()
             },
             generation: GenerationSection {
                 temperature: 0.5,
@@ -700,6 +705,7 @@ mod tests {
             model: ModelSection {
                 path: Some("/models/llama.gguf".to_string()),
                 gpu: true,
+                ..Default::default()
             },
             generation: GenerationSection {
                 temperature: 0.3,
@@ -779,12 +785,33 @@ temperature = 0.3
 
     #[test]
     fn test_example_config_parses() {
-        // The example config has comments, ensure the format is valid
-        // by checking it doesn't panic on generation
         let example = example_config();
         assert!(example.contains("[model]"));
         assert!(example.contains("[generation]"));
         assert!(example.contains("[chat]"));
         assert!(example.contains("[server]"));
+    }
+
+    #[test]
+    fn test_parse_kv_cache_type() {
+        use crate::model::KVCacheType;
+        assert_eq!(parse_kv_cache_type("f32"), KVCacheType::F32);
+        assert_eq!(parse_kv_cache_type("turboquant2"), KVCacheType::TurboQuantMSE { bits: 2 });
+        assert_eq!(parse_kv_cache_type("turboquant3"), KVCacheType::TurboQuantMSE { bits: 3 });
+        assert_eq!(parse_kv_cache_type("turboquant2-qjl"), KVCacheType::TurboQuantProd { bits: 2 });
+        assert_eq!(parse_kv_cache_type("turboquant3-qjl"), KVCacheType::TurboQuantProd { bits: 3 });
+        assert_eq!(parse_kv_cache_type(""), KVCacheType::F32);
+    }
+}
+
+/// Parse a KV cache type string into a `KVCacheType` enum.
+pub fn parse_kv_cache_type(s: &str) -> crate::model::KVCacheType {
+    use crate::model::KVCacheType;
+    match s.to_lowercase().as_str() {
+        "turboquant2" | "tq2" => KVCacheType::TurboQuantMSE { bits: 2 },
+        "turboquant3" | "tq3" => KVCacheType::TurboQuantMSE { bits: 3 },
+        "turboquant2-qjl" | "tq2-qjl" => KVCacheType::TurboQuantProd { bits: 2 },
+        "turboquant3-qjl" | "tq3-qjl" => KVCacheType::TurboQuantProd { bits: 3 },
+        _ => KVCacheType::F32,
     }
 }

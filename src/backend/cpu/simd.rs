@@ -1277,4 +1277,187 @@ mod tests {
         println!("AVX2: {}", has_avx2());
         println!("AVX-512: {}", has_avx512());
     }
+
+    #[test]
+    fn test_dot_sign_bits() {
+        let values: Vec<f32> = (0..128).map(|i| (i as f32) * 0.1).collect();
+        let mut bits = vec![0u64; 2];
+        for i in 0..128 {
+            if i % 2 == 0 {
+                bits[i / 64] |= 1u64 << (i % 64);
+            }
+        }
+        let result = dot_with_sign_bits_fast(&values, &bits, 128);
+        let mut expected = 0.0f32;
+        for i in 0..128 {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            expected += values[i] * sign;
+        }
+        assert!(
+            (result - expected).abs() < 1e-3,
+            "got {result}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_dot_sign_bits_fast_basic() {
+        let values = vec![1.0f32, 2.0, 3.0, 4.0];
+        let bits: Vec<u64> = vec![0b1010]; // bits: idx0=0(-1), idx1=1(+1), idx2=0(-1), idx3=1(+1)
+        let result = super::dot_with_sign_bits_fast(&values, &bits, 4);
+        let expected = -1.0 + 2.0 - 3.0 + 4.0; // 2.0
+        assert!(
+            (result - expected).abs() < 1e-5,
+            "got {result}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_dot_sign_bits_fast_all_ones() {
+        let n = 128;
+        let values: Vec<f32> = (0..n).map(|i| (i + 1) as f32).collect();
+        let bits: Vec<u64> = vec![u64::MAX; (n + 63) / 64];
+        let result = super::dot_with_sign_bits_fast(&values, &bits, n);
+        let expected: f32 = values.iter().sum();
+        assert!(
+            (result - expected).abs() < 1e-2,
+            "got {result}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_dot_sign_bits_fast_all_zeros() {
+        let n = 64;
+        let values: Vec<f32> = vec![1.0; n];
+        let bits: Vec<u64> = vec![0u64];
+        let result = super::dot_with_sign_bits_fast(&values, &bits, n);
+        let expected = -(n as f32);
+        assert!(
+            (result - expected).abs() < 1e-5,
+            "got {result}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_dot_sign_bits_fast_odd_count() {
+        let values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let bits: Vec<u64> = vec![0b1111111]; // all +1
+        let result = super::dot_with_sign_bits_fast(&values, &bits, 7);
+        let expected: f32 = values.iter().sum();
+        assert!(
+            (result - expected).abs() < 1e-5,
+            "got {result}, expected {expected}"
+        );
+    }
+}
+
+// =============================================================================
+// TurboQuant SIMD helpers
+// =============================================================================
+
+/// SIMD-optimized dot product between f32 values and packed sign bits.
+///
+/// Each bit in `bits` encodes +1 (set) or -1 (clear). This is the hot loop
+/// for QJL inner product estimation.
+pub fn dot_with_sign_bits_fast(values: &[f32], bits: &[u64], count: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            return unsafe { dot_sign_bits_avx2(values, bits, count) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { dot_sign_bits_neon(values, bits, count) };
+    }
+    #[allow(unreachable_code)]
+    dot_sign_bits_scalar(values, bits, count)
+}
+
+fn dot_sign_bits_scalar(values: &[f32], bits: &[u64], count: usize) -> f32 {
+    crate::model::turboquant::qjl::dot_with_sign_bits(values, bits, count)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_sign_bits_avx2(values: &[f32], bits: &[u64], count: usize) -> f32 {
+    let mut acc = _mm256_setzero_ps();
+    let mut scalar_tail = 0.0f32;
+    let mut pos = 0;
+
+    for &word in bits.iter() {
+        let remaining = count - pos;
+        if remaining == 0 {
+            break;
+        }
+        let n = remaining.min(64);
+        let mut bit_idx = 0;
+        while bit_idx + 8 <= n && pos + 8 <= count {
+            let v = _mm256_loadu_ps(values.as_ptr().add(pos));
+            let sign_vec = _mm256_set_ps(
+                if (word >> (bit_idx + 7)) & 1 == 1 { 1.0 } else { -1.0 },
+                if (word >> (bit_idx + 6)) & 1 == 1 { 1.0 } else { -1.0 },
+                if (word >> (bit_idx + 5)) & 1 == 1 { 1.0 } else { -1.0 },
+                if (word >> (bit_idx + 4)) & 1 == 1 { 1.0 } else { -1.0 },
+                if (word >> (bit_idx + 3)) & 1 == 1 { 1.0 } else { -1.0 },
+                if (word >> (bit_idx + 2)) & 1 == 1 { 1.0 } else { -1.0 },
+                if (word >> (bit_idx + 1)) & 1 == 1 { 1.0 } else { -1.0 },
+                if (word >> bit_idx) & 1 == 1 { 1.0 } else { -1.0 },
+            );
+            acc = _mm256_fmadd_ps(v, sign_vec, acc);
+            bit_idx += 8;
+            pos += 8;
+        }
+        // Scalar tail
+        while bit_idx < n && pos < count {
+            let sign = if (word >> bit_idx) & 1 == 1 { 1.0f32 } else { -1.0f32 };
+            scalar_tail += values[pos] * sign;
+            bit_idx += 1;
+            pos += 1;
+        }
+    }
+
+    // Horizontal sum
+    let mut sum_arr = [0.0f32; 8];
+    _mm256_storeu_ps(sum_arr.as_mut_ptr(), acc);
+    sum_arr.iter().sum::<f32>() + scalar_tail
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_sign_bits_neon(values: &[f32], bits: &[u64], count: usize) -> f32 {
+    let ones = vdupq_n_f32(1.0);
+    let neg_ones = vdupq_n_f32(-1.0);
+    let mut acc = vdupq_n_f32(0.0);
+    let mut pos = 0;
+
+    for &word in bits.iter() {
+        let remaining = count - pos;
+        if remaining == 0 {
+            break;
+        }
+        let n = remaining.min(64);
+        let mut bit_idx = 0;
+        while bit_idx + 4 <= n && pos + 4 <= count {
+            let v = vld1q_f32(values.as_ptr().add(pos));
+            let mask: [u32; 4] = [
+                if (word >> bit_idx) & 1 == 1 { 0xFFFFFFFF } else { 0 },
+                if (word >> (bit_idx + 1)) & 1 == 1 { 0xFFFFFFFF } else { 0 },
+                if (word >> (bit_idx + 2)) & 1 == 1 { 0xFFFFFFFF } else { 0 },
+                if (word >> (bit_idx + 3)) & 1 == 1 { 0xFFFFFFFF } else { 0 },
+            ];
+            let mask_v = vld1q_u32(mask.as_ptr());
+            let signs = vbslq_f32(mask_v, ones, neg_ones);
+            acc = vfmaq_f32(acc, v, signs);
+            bit_idx += 4;
+            pos += 4;
+        }
+        while bit_idx < n && pos < count {
+            let sign = if (word >> bit_idx) & 1 == 1 { 1.0f32 } else { -1.0f32 };
+            let sv = vdupq_n_f32(values[pos] * sign);
+            acc = vaddq_f32(acc, sv);
+            bit_idx += 1;
+            pos += 1;
+        }
+    }
+
+    vaddvq_f32(acc)
 }

@@ -702,6 +702,173 @@ impl Attention {
 
         Ok(out)
     }
+
+    /// Forward pass with TurboQuant-compressed KV cache.
+    ///
+    /// Same Q/K/V projection and RoPE as standard `forward`, but stores K/V
+    /// in compressed form and computes attention via the TurboQuant engine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_turboquant(
+        &self,
+        x: &Tensor,
+        tq_cache: &mut super::kv_turboquant::TurboQuantKVCache,
+        layer_idx: usize,
+        pos: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        backend: &dyn Backend,
+    ) -> ModelResult<Tensor> {
+        let hidden_size = x.shape().last().copied().unwrap_or(0);
+        let seq_len = if x.ndim() == 1 { 1 } else { x.shape()[0] };
+        let kl = self.key_length;
+        let vl = self.value_length;
+
+        let x_vec = if x.ndim() == 2 {
+            let x_data = x.as_f32()?;
+            let start = (seq_len - 1) * hidden_size;
+            Tensor::from_f32(&x_data[start..start + hidden_size], vec![hidden_size])?
+        } else {
+            x.clone()
+        };
+
+        let q_out_size = self.wq.out_features;
+        let mut q_raw = Tensor::zeros(vec![q_out_size], DType::F32);
+        let mut k = Tensor::zeros(vec![self.num_kv_heads * kl], DType::F32);
+        let mut v = Tensor::zeros(vec![self.num_kv_heads * vl], DType::F32);
+
+        self.wq.forward(&x_vec, &mut q_raw, backend)?;
+        self.wk.forward(&x_vec, &mut k, backend)?;
+        self.wv.forward(&x_vec, &mut v, backend)?;
+
+        let (q_proper_data, gate_data) = if self.has_attention_gate {
+            let raw = q_raw.as_f32()?;
+            let q_proper_len = self.num_heads * kl;
+            let gate_len = self.num_heads * vl;
+            if raw.len() >= q_proper_len + gate_len {
+                let per_head_total = kl + vl;
+                let mut q_buf = vec![0.0f32; q_proper_len];
+                let mut g_buf = vec![0.0f32; gate_len];
+                for h in 0..self.num_heads {
+                    let src = h * per_head_total;
+                    let q_dst = h * kl;
+                    let g_dst = h * vl;
+                    q_buf[q_dst..q_dst + kl].copy_from_slice(&raw[src..src + kl]);
+                    g_buf[g_dst..g_dst + vl].copy_from_slice(&raw[src + kl..src + kl + vl]);
+                }
+                (q_buf, Some(g_buf))
+            } else {
+                (raw.to_vec(), None)
+            }
+        } else {
+            (q_raw.as_f32()?.to_vec(), None)
+        };
+
+        let q_flat = Tensor::from_f32(&q_proper_data, vec![self.num_heads * kl])?;
+        let mut q_reshaped = q_flat.reshape(vec![self.num_heads, 1, kl])?;
+        let mut k_reshaped = k.reshape(vec![self.num_kv_heads, 1, kl])?;
+        let v_reshaped = v.reshape(vec![self.num_kv_heads, 1, vl])?;
+
+        // Per-head QK normalization
+        if let Some(ref q_norm) = self.q_norm {
+            let q_data = q_reshaped.as_f32()?.to_vec();
+            let q_out = q_reshaped.as_f32_mut()?;
+            let norm_w = q_norm.weight.as_f32()?;
+            let norm_dim = norm_w.len();
+            for h in 0..self.num_heads {
+                let offset = h * kl;
+                let head_slice = &q_data[offset..offset + kl];
+                let ss: f32 = head_slice[..norm_dim].iter().map(|x| x * x).sum::<f32>()
+                    / norm_dim as f32;
+                let rms = (ss + q_norm.eps).sqrt();
+                for d in 0..norm_dim.min(kl) {
+                    q_out[offset + d] = head_slice[d] / rms * norm_w[d];
+                }
+            }
+        }
+        if let Some(ref k_norm) = self.k_norm {
+            let k_data = k_reshaped.as_f32()?.to_vec();
+            let k_out = k_reshaped.as_f32_mut()?;
+            let norm_w = k_norm.weight.as_f32()?;
+            let norm_dim = norm_w.len();
+            for h in 0..self.num_kv_heads {
+                let offset = h * kl;
+                let head_slice = &k_data[offset..offset + kl];
+                let ss: f32 = head_slice[..norm_dim].iter().map(|x| x * x).sum::<f32>()
+                    / norm_dim as f32;
+                let rms = (ss + k_norm.eps).sqrt();
+                for d in 0..norm_dim.min(kl) {
+                    k_out[offset + d] = head_slice[d] / rms * norm_w[d];
+                }
+            }
+        }
+
+        // RoPE
+        if self.rope_dims > 0 && self.rope_dims < kl {
+            let rope_offset = if self.rope_partial_at_end { kl - self.rope_dims } else { 0 };
+            let q_data = q_reshaped.as_f32()?.to_vec();
+            let k_data = k_reshaped.as_f32()?.to_vec();
+            let mut q_rope = vec![0.0f32; self.num_heads * self.rope_dims];
+            let mut k_rope = vec![0.0f32; self.num_kv_heads * self.rope_dims];
+            for h in 0..self.num_heads {
+                let src = h * kl + rope_offset;
+                let dst = h * self.rope_dims;
+                q_rope[dst..dst + self.rope_dims].copy_from_slice(&q_data[src..src + self.rope_dims]);
+            }
+            for h in 0..self.num_kv_heads {
+                let src = h * kl + rope_offset;
+                let dst = h * self.rope_dims;
+                k_rope[dst..dst + self.rope_dims].copy_from_slice(&k_data[src..src + self.rope_dims]);
+            }
+            let mut q_rope_t = Tensor::from_f32(&q_rope, vec![self.num_heads, 1, self.rope_dims])?;
+            let mut k_rope_t = Tensor::from_f32(&k_rope, vec![self.num_kv_heads, 1, self.rope_dims])?;
+            backend.rope(&mut q_rope_t, &mut k_rope_t, pos, freq_base, freq_scale, self.use_neox_rope)?;
+            let q_rope_out = q_rope_t.as_f32()?;
+            let k_rope_out = k_rope_t.as_f32()?;
+            let q_out = q_reshaped.as_f32_mut()?;
+            let k_out = k_reshaped.as_f32_mut()?;
+            for h in 0..self.num_heads {
+                let dst = h * kl + rope_offset;
+                let src = h * self.rope_dims;
+                q_out[dst..dst + self.rope_dims].copy_from_slice(&q_rope_out[src..src + self.rope_dims]);
+            }
+            for h in 0..self.num_kv_heads {
+                let dst = h * kl + rope_offset;
+                let src = h * self.rope_dims;
+                k_out[dst..dst + self.rope_dims].copy_from_slice(&k_rope_out[src..src + self.rope_dims]);
+            }
+        } else {
+            backend.rope(&mut q_reshaped, &mut k_reshaped, pos, freq_base, freq_scale, self.use_neox_rope)?;
+        }
+
+        // Write K/V to TurboQuant cache (compressed)
+        let k_data = k_reshaped.as_f32()?;
+        let v_data = v_reshaped.as_f32()?;
+        tq_cache.write_kv(layer_idx, k_data, v_data);
+
+        // Compute attention via backend (allows GPU override)
+        let q_data = q_reshaped.as_f32()?;
+        let attn_flat = backend.attention_turboquant(
+            q_data, tq_cache, layer_idx, self.num_heads, self.scale,
+        )?;
+
+        // Apply attention gate if present
+        let attn_vec = if let Some(ref gate) = gate_data {
+            let total = self.num_heads * vl;
+            let mut gated = vec![0.0f32; total];
+            for i in 0..total {
+                let sigmoid_g = 1.0 / (1.0 + (-gate[i]).exp());
+                gated[i] = sigmoid_g * attn_flat[i];
+            }
+            gated
+        } else {
+            attn_flat
+        };
+
+        let attn_tensor = Tensor::from_f32(&attn_vec, vec![self.num_heads * vl])?;
+        let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+        self.wo.forward(&attn_tensor, &mut out, backend)?;
+        Ok(out)
+    }
 }
 
 /// Feed-forward network (MLP) layer
@@ -1073,6 +1240,152 @@ impl TransformerLayer {
                 }
             }
 
+            Ok(ffn_out)
+        }
+    }
+
+    /// Forward pass with TurboQuant KV cache instead of f32 tensors.
+    ///
+    /// Only applies to FullAttention layers; DeltaNet/Mamba layers don't
+    /// use KV caches and fall back to their normal path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tq(
+        &self,
+        x: &Tensor,
+        tq_cache: &mut super::kv_turboquant::TurboQuantKVCache,
+        _k_cache: &mut Tensor,
+        _v_cache: &mut Tensor,
+        pos: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        backend: &dyn Backend,
+        recurrent_state: Option<&mut super::deltanet::RecurrentLayerState>,
+    ) -> ModelResult<Tensor> {
+        let hidden_size = x.shape().last().copied().unwrap_or(0);
+
+        let mut norm_out = Tensor::zeros(x.shape().to_vec(), DType::F32);
+        self.attn_norm.forward(x, &mut norm_out, backend)?;
+
+        let attn_out = match &self.attn_layer {
+            AttentionLayer::FullAttention(attn) => {
+                attn.forward_turboquant(
+                    &norm_out, tq_cache, self.layer_idx,
+                    pos, freq_base, freq_scale, backend,
+                )?
+            }
+            AttentionLayer::DeltaNet(dn) => {
+                let state = recurrent_state.ok_or_else(|| {
+                    ModelError::ConfigError("DeltaNet layer requires recurrent state".into())
+                })?;
+                match state {
+                    super::deltanet::RecurrentLayerState::DeltaNet(ds) => {
+                        dn.forward(&norm_out, ds, backend)?
+                    }
+                    _ => return Err(ModelError::ConfigError(
+                        "Expected DeltaNet state for DeltaNet layer".into(),
+                    )),
+                }
+            }
+            AttentionLayer::Mamba(mb) => {
+                let state = recurrent_state.ok_or_else(|| {
+                    ModelError::ConfigError("Mamba layer requires recurrent state".into())
+                })?;
+                match state {
+                    super::deltanet::RecurrentLayerState::Mamba(ms) => {
+                        mb.forward(&norm_out, ms, backend)?
+                    }
+                    _ => return Err(ModelError::ConfigError(
+                        "Expected Mamba state for Mamba layer".into(),
+                    )),
+                }
+            }
+        };
+
+        let x_data = x.as_f32()?;
+        let x_start = if x.ndim() == 2 {
+            (x.shape()[0] - 1) * hidden_size
+        } else {
+            0
+        };
+
+        if matches!(self.ffn_layer, FfnLayer::Identity) {
+            let mut out = attn_out;
+            {
+                let out_data = out.as_f32_mut()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for (o, &xv) in out_data.iter_mut().zip(x_slice.iter()) {
+                    *o += xv;
+                }
+            }
+            return Ok(out);
+        }
+
+        if self.use_parallel_residual {
+            let mut ffn_out = match &self.ffn_layer {
+                FfnLayer::Dense(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::NoGate(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::Moe(moe) => moe.forward(&norm_out, backend)?,
+                FfnLayer::Identity => unreachable!(),
+            };
+            {
+                let out_data = ffn_out.as_f32_mut()?;
+                let attn_data = attn_out.as_f32()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for i in 0..hidden_size {
+                    out_data[i] += attn_data[i] + x_slice[i];
+                }
+            }
+            Ok(ffn_out)
+        } else {
+            let mut h = attn_out;
+            if let Some(ref pan) = self.post_attn_norm {
+                let mut normed = Tensor::zeros(vec![hidden_size], DType::F32);
+                pan.forward(&h, &mut normed, backend)?;
+                h = normed;
+            }
+            {
+                let h_data = h.as_f32_mut()?;
+                let x_slice = &x_data[x_start..x_start + hidden_size];
+                for (a, &xv) in h_data.iter_mut().zip(x_slice.iter()) {
+                    *a += xv;
+                }
+            }
+            let mut ffn_norm_out = Tensor::zeros(vec![hidden_size], DType::F32);
+            self.ffn_norm.forward(&h, &mut ffn_norm_out, backend)?;
+            let mut ffn_out = match &self.ffn_layer {
+                FfnLayer::Dense(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::NoGate(ffn) => {
+                    let mut out = Tensor::zeros(vec![hidden_size], DType::F32);
+                    ffn.forward(&ffn_norm_out, &mut out, backend)?;
+                    out
+                }
+                FfnLayer::Moe(moe) => moe.forward(&ffn_norm_out, backend)?,
+                FfnLayer::Identity => unreachable!(),
+            };
+            if let Some(ref norm) = self.post_ffn_norm {
+                let mut normed = Tensor::zeros(vec![hidden_size], DType::F32);
+                norm.forward(&ffn_out, &mut normed, backend)?;
+                ffn_out = normed;
+            }
+            {
+                let ffn_data = ffn_out.as_f32_mut()?;
+                let h_data = h.as_f32()?;
+                for (f, &hv) in ffn_data.iter_mut().zip(h_data.iter()) {
+                    *f += hv;
+                }
+            }
             Ok(ffn_out)
         }
     }
